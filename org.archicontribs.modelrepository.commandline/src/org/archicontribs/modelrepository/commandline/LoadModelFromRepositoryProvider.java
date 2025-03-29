@@ -17,6 +17,7 @@ import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
+import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.eclipse.osgi.util.NLS;
@@ -49,6 +50,7 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
     
     static final String OPTION_CLONE_MODEL = "modelrepository.cloneModel"; //$NON-NLS-1$
     static final String OPTION_LOAD_MODEL = "modelrepository.loadModel"; //$NON-NLS-1$
+    static final String OPTION_FIX_MODEL = "modelrepository.fixModel"; //$NON-NLS-1$
     static final String OPTION_USERNAME = "modelrepository.userName"; //$NON-NLS-1$
     static final String OPTION_PASSFILE = "modelrepository.passFile"; //$NON-NLS-1$
     static final String OPTION_SSH_IDENTITY_FILE = "modelrepository.identityFile"; //$NON-NLS-1$
@@ -148,7 +150,15 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
         
         // Load
         logMessage(NLS.bind(Messages.LoadModelFromRepositoryProvider_6, cloneFolder));
-        IArchimateModel model = loadModel(cloneFolder);
+        IArchimateModel model = null;
+        
+        if(commandLine.hasOption(OPTION_FIX_MODEL))
+        {
+        	model = loadAndFixModel(cloneFolder);
+        } else {
+            model = loadModel(cloneFolder);        	
+        }
+        
         logMessage(NLS.bind(Messages.LoadModelFromRepositoryProvider_7, model.getName()));
     }
     
@@ -169,6 +179,30 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
         return model;
     }
 
+    private IArchimateModel loadAndFixModel(File folder) throws IOException {
+    	IArchiRepository repo = new ArchiRepository(folder);
+
+    	// Create the model loader in headless mode so it wont do UI interactions
+        GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+        IArchimateModel model = loader.loadModel();
+        
+        if(model == null) {
+            throw new IOException(Messages.LoadModelFromRepositoryProvider_23);
+        }
+        
+        String restoredObjects = loader.getRestoredObjectsAsString();
+        if(restoredObjects != null )
+        {
+        	logMessage(Messages.LoadModelFromRepositoryProvider_24);
+        	logMessage(restoredObjects);
+        }
+                
+        CommandLineState.setModel(model);
+        
+        return model;
+    }
+
+    
     private char[] getPasswordFromFile(CommandLine commandLine) throws IOException {
         String path = commandLine.getOptionValue(OPTION_PASSFILE);
         if(StringUtils.isSet(path)) {
@@ -205,6 +239,13 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
                 .desc(NLS.bind(Messages.LoadModelFromRepositoryProvider_10, OPTION_CLONE_MODEL))
                 .build();
         options.addOption(option);
+
+        option = Option.builder()
+                .longOpt(OPTION_FIX_MODEL)
+                .desc(Messages.LoadModelFromRepositoryProvider_22)
+                .build();
+        options.addOption(option);
+       
         
         option = Option.builder()
                 .longOpt(OPTION_CLONE_MODEL)

@@ -15,6 +15,7 @@ import java.util.List;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter.UnresolvedObject;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.util.EcoreUtil;
+import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
@@ -24,6 +25,7 @@ import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.swt.custom.BusyIndicator;
 import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorReference;
 import org.eclipse.ui.PartInitException;
@@ -31,6 +33,7 @@ import org.eclipse.ui.PlatformUI;
 
 import com.archimatetool.editor.diagram.DiagramEditorInput;
 import com.archimatetool.editor.model.IEditorModelManager;
+import com.archimatetool.editor.model.ModelChecker;
 import com.archimatetool.editor.ui.services.EditorManager;
 import com.archimatetool.editor.utils.StringUtils;
 import com.archimatetool.model.IArchimateModel;
@@ -47,11 +50,18 @@ import com.archimatetool.model.util.ArchimateModelUtils;
 public class GraficoModelLoader {
     
     private IArchiRepository fRepository;
+    private boolean bHeadless;
     
     private List<IIdentifier> fRestoredObjects;
     
     public GraficoModelLoader(IArchiRepository repository) {
         fRepository = repository;
+        bHeadless = false;
+    }
+
+    public GraficoModelLoader(IArchiRepository repository, boolean headless ) {
+        fRepository = repository;
+        bHeadless = headless;
     }
     
     /**
@@ -68,14 +78,25 @@ public class GraficoModelLoader {
         IArchimateModel[] graficoModel = new IArchimateModel[1];
         IOException[] exception = new IOException[1];
         
-        BusyIndicator.showWhile(Display.getCurrent(), () -> {
+        // Support headless model by not opening dialogs and showing progress bars
+        if(!bHeadless)
+        {
+	        BusyIndicator.showWhile(Display.getCurrent(), () -> {
+	            try {
+	                graficoModel[0] = importer.importAsModel();
+	            }
+	            catch(IOException ex) {
+	                exception[0] = ex;
+	            }
+	        });
+        } else {
             try {
                 graficoModel[0] = importer.importAsModel();
             }
             catch(IOException ex) {
                 exception[0] = ex;
-            }
-        });
+            }        	
+        }
         
         if(exception[0] != null) {
             throw exception[0];
@@ -94,17 +115,28 @@ public class GraficoModelLoader {
             graficoModel[0] = restoreProblemObjects(unresolvedObjects);
         }
         
-        // Save it
-        IEditorModelManager.INSTANCE.saveModel(graficoModel[0]);
-        
-        // Close and re-open the corresponding model if it is already open
-        IArchimateModel model = fRepository.locateModel();
-        if(model != null) {
-            // Store ids of open diagrams
-            List<String> openModelIDs = getOpenDiagramModelIdentifiers(model); // Store ids of open diagrams
-            IEditorModelManager.INSTANCE.closeModel(model);
-            IEditorModelManager.INSTANCE.openModel(graficoModel[0]);
-            reopenEditors(graficoModel[0], openModelIDs);
+        if(!bHeadless)
+        {
+	        // Save it
+	        IEditorModelManager.INSTANCE.saveModel(graficoModel[0]);
+	        
+	        // Close and re-open the corresponding model if it is already open
+	        IArchimateModel model = fRepository.locateModel();
+	        if(model != null) {
+	            // Store ids of open diagrams
+	            List<String> openModelIDs = getOpenDiagramModelIdentifiers(model); // Store ids of open diagrams
+	            IEditorModelManager.INSTANCE.closeModel(model);
+	            IEditorModelManager.INSTANCE.openModel(graficoModel[0]);
+	            reopenEditors(graficoModel[0], openModelIDs);
+	        }
+        } else {
+        	// Just do the validation that the model is valid after the fix so it can be correctly exported again
+            ModelChecker checker = new ModelChecker(graficoModel[0]);
+            if(!checker.checkAll()) {
+            	String errorMessage = checker.buildMessageSummary();
+
+            	throw new IOException(errorMessage);
+            }
         }
         
         return graficoModel[0];
