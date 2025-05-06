@@ -47,7 +47,6 @@ public class CloneInputDialog extends TitleAreaDialog {
 
     public CloneInputDialog(Shell parentShell) {
         super(parentShell);
-        setTitle(Messages.CloneInputDialog_0);
     }
 
     @Override
@@ -60,6 +59,7 @@ public class CloneInputDialog extends TitleAreaDialog {
     protected Control createDialogArea(Composite parent) {
         setMessage(Messages.CloneInputDialog_1, IMessageProvider.INFORMATION);
         setTitleImage(IArchiImages.ImageFactory.getImage(IArchiImages.ECLIPSE_IMAGE_NEW_WIZARD));
+        setTitle(Messages.CloneInputDialog_0);
 
         Composite area = (Composite) super.createDialogArea(parent);
         Composite container = new Composite(area, SWT.NONE);
@@ -102,7 +102,7 @@ public class CloneInputDialog extends TitleAreaDialog {
         GridData gd = new GridData(GridData.FILL_HORIZONTAL);
         gd.horizontalSpan = 2;
         storeCredentialsButton.setLayoutData(gd);
-        storeCredentialsButton.setSelection(ModelRepositoryPlugin.INSTANCE.getPreferenceStore().getBoolean(IPreferenceConstants.PREFS_STORE_REPO_CREDENTIALS));
+        storeCredentialsButton.setSelection(ModelRepositoryPlugin.getInstance().getPreferenceStore().getBoolean(IPreferenceConstants.PREFS_STORE_REPO_CREDENTIALS));
     }
 
     @Override
