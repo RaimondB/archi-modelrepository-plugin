@@ -133,7 +133,8 @@ public class GraficoModelLoader {
         	// Just do the validation that the model is valid after the fix so it can be correctly exported again
             ModelChecker checker = new ModelChecker(graficoModel[0]);
             if(!checker.checkAll()) {
-            	String errorMessage = checker.buildMessageSummary();
+            	//String errorMessage = checker.buildMessageSummary(); Wait with this until PR accepted for Archi
+                String errorMessage = Messages.GraficoModelLoader_1 + String.join("\n", checker.getErrorMessages());
 
             	throw new IOException(errorMessage);
             }

@@ -11,6 +11,8 @@ public class Messages extends NLS {
     public static String ArchiRepository_1;
 
     public static String GraficoModelLoader_0;
+    
+    public static String GraficoModelLoader_1;
 
     static {
         // initialize resource bundle
