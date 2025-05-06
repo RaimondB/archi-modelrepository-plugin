@@ -30,13 +30,18 @@ public class ModelRepositoryPlugin extends AbstractUIPlugin {
 
     public static final String PLUGIN_ID = "org.archicontribs.modelrepository"; //$NON-NLS-1$
     
-    /**
-     * The shared instance
-     */
-    public static ModelRepositoryPlugin INSTANCE;
+    // The shared instance
+    private static ModelRepositoryPlugin instance;
     
+    /**
+     * @return the shared instance
+     */
+    public static ModelRepositoryPlugin getInstance() {
+        return instance;
+    }
+
     public ModelRepositoryPlugin() {
-        INSTANCE = this;
+        instance = this;
     }
 
     @Override
@@ -47,24 +52,18 @@ public class ModelRepositoryPlugin extends AbstractUIPlugin {
         ProxyAuthenticator.init();
     }
     
-    @Override
-    public void stop(BundleContext context) throws Exception {
-        super.stop(context);
-    }
-    
     /**
      * @return The File Location of this plugin
      */
     public File getPluginFolder() {
-        URL url = getBundle().getEntry("/"); //$NON-NLS-1$
         try {
-            url = FileLocator.resolve(url);
+            URL url = FileLocator.resolve(getBundle().getEntry("/")); //$NON-NLS-1$
+            return new File(url.getPath());
         }
         catch(IOException ex) {
             ex.printStackTrace();
+            return null;
         }
-        
-        return new File(url.getPath());
     }
     
     /**
@@ -88,6 +87,6 @@ public class ModelRepositoryPlugin extends AbstractUIPlugin {
     
     public void log(int severity, String message, Throwable ex) {
         getLog().log(
-                new Status(severity, INSTANCE.getBundle().getSymbolicName(), IStatus.OK, message, ex));
+                new Status(severity, getInstance().getBundle().getSymbolicName(), IStatus.OK, message, ex));
     }
 }
