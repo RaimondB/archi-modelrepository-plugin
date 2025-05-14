@@ -8,8 +8,10 @@ package org.archicontribs.modelrepository.grafico;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -99,22 +101,21 @@ public class GraficoModelExporter {
     /**
      * Export the IArchimateModel as Grafico files
      * @throws IOException
-     */
-    public void exportModel() throws IOException {
+     */    public void exportModel() throws IOException {
         // Define target folders for model and images
-        // Delete them and re-create them (remark: FileUtils.deleteFolder() does sanity checks)
         File modelFolder = new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER);
-        FileUtils.deleteFolder(modelFolder);
-        modelFolder.mkdirs();
-
         File imagesFolder = new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER);
-        FileUtils.deleteFolder(imagesFolder);
-        imagesFolder.mkdirs();
-
-        // Save model images (if any): this has to be done on original model (not a copy)
-        saveImages();
         
-        // Create ResourceSet
+        // Ensure directories exist
+        modelFolder.mkdirs();
+        imagesFolder.mkdirs();
+        
+        // Clear tracking sets
+        expectedFiles.clear();
+        writtenFiles.clear();
+        
+        // Save model images (if any): this has to be done on original model (not a copy)
+        saveImages();        // Create ResourceSet
         fResourceSet = new ResourceSetImpl();
         fResourceSet.getResourceFactoryRegistry().getExtensionToFactoryMap().put("*", new XMLResourceFactoryImpl()); //$NON-NLS-1$
         // Add a URIConverter that will be used to map full filenames to logical names
@@ -131,13 +132,21 @@ public class GraficoModelExporter {
         JobGroup jobgroup = new JobGroup("GraficoModelExporter", maxThreads, 1); //$NON-NLS-1$
         
         final ExceptionProgressMonitor pm = new ExceptionProgressMonitor();
-        
-        for(Resource resource : fResourceSet.getResources()) {
+          for(Resource resource : fResourceSet.getResources()) {
             Job job = new Job("Resource Save Job") { //$NON-NLS-1$
                 @Override
-                protected IStatus run(IProgressMonitor monitor) {
-                    try {
-                        resource.save(null);
+                protected IStatus run(IProgressMonitor monitor) {                    try {
+                        // Get the file for this resource
+                        URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+                        String filePath = uri.toFileString();
+                        File file = new File(filePath);
+                        
+                        // Only save if content has changed
+                        if (hasContentChanged(resource, file)) {
+                            file.getParentFile().mkdirs();
+                            resource.save(null);
+                            writtenFiles.add(file);
+                        }
                     }
                     catch(IOException ex) {
                         pm.catchException(ex);
@@ -152,6 +161,10 @@ public class GraficoModelExporter {
         
         try {
             jobgroup.join(0, pm);
+            
+            // Clean up obsolete files after all resources are saved
+            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
+            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
         }
         catch(OperationCanceledException | InterruptedException ex) {
             ex.printStackTrace();
@@ -215,12 +228,11 @@ public class GraficoModelExporter {
      * @param file
      * @param object
      * @throws IOException
-     */
-    private void createAndSaveResource(File file, EObject object) throws IOException {
-    	// Update the URIConverter
+     */    private void createAndSaveResource(File file, EObject object) throws IOException {
+        // Update the URIConverter
         // Map the logical name (filename) to the physical name (path+filename)
-    	// Folders must be declared with absolute path or else the 'folder.xml' file is not created
-    	// The model object must be declared with relative path or else concepts reference profiles through absolute path (which are gonna be different for each users)
+        // Folders must be declared with absolute path or else the 'folder.xml' file is not created
+        // The model object must be declared with relative path or else concepts reference profiles through absolute path (which are gonna be different for each users)
         URI key = (!(object instanceof IArchimateModel) && file.getName().equals(IGraficoConstants.FOLDER_XML)) ? URI.createFileURI(file.getAbsolutePath()) : URI.createFileURI(file.getName());
         URI value = URI.createFileURI(file.getAbsolutePath());
         fResourceSet.getURIConverter().getURIMap().put(key, value);
@@ -235,11 +247,10 @@ public class GraficoModelExporter {
         // Make the produced XML easy to read
         resource.getDefaultSaveOptions().put(XMLResource.OPTION_FORMATTED, Boolean.TRUE);
         resource.getDefaultSaveOptions().put(XMLResource.OPTION_LINE_WIDTH, Integer.valueOf(5));
-        
-        // Don't use encoded attribute. Needed to have proper references inside Diagrams
+          // Don't use encoded attribute. Needed to have proper references inside Diagrams
         resource.getDefaultSaveOptions().put(XMLResource.OPTION_USE_ENCODED_ATTRIBUTE_STYLE, Boolean.FALSE);
         
-        // Use cache
+        // Use cache for efficient saves
         resource.getDefaultSaveOptions().put(XMLResource.OPTION_CONFIGURATION_CACHE, Boolean.TRUE);
         
         // Use UNIX line endings to avoid EOL diffs
@@ -247,13 +258,15 @@ public class GraficoModelExporter {
 
         // Add the object to the resource
         resource.getContents().add(object);
+        
+        // Track this file as expected
+        expectedFiles.add(file);
     }
-    
-    /**
+      /**
      * Extract and save images used inside a model as separate image files
      */
     private void saveImages() throws IOException {
-        Set<String> added = new HashSet<>();
+        Set<String> processed = new HashSet<>();
 
         IArchiveManager archiveManager = (IArchiveManager)fModel.getAdapter(IArchiveManager.class);
         if(archiveManager == null) {
@@ -266,17 +279,76 @@ public class GraficoModelExporter {
                 IDiagramModelImageProvider imageProvider = (IDiagramModelImageProvider)eObject;
                 String imagePath = imageProvider.getImagePath();
                 
-                if(imagePath != null && !added.contains(imagePath)) {
-                    byte[] bytes = archiveManager.getBytesFromEntry(imagePath);
-                    if(bytes == null) {
+                if(imagePath != null && !processed.contains(imagePath)) {
+                    byte[] newBytes = archiveManager.getBytesFromEntry(imagePath);
+                    if(newBytes == null) {
                         throw new IOException("Could not get image bytes from image path: " + imagePath); //$NON-NLS-1$
                     }
                     
                     File file = new File(fLocalRepoFolder, imagePath);
-                    Files.write(file.toPath(), bytes, StandardOpenOption.CREATE);
-                    added.add(imagePath);
+                    expectedFiles.add(file);
+                    
+                    // Only write if different
+                    if (!file.exists() || !Arrays.equals(newBytes, Files.readAllBytes(file.toPath()))) {
+                        file.getParentFile().mkdirs();
+                        Files.write(file.toPath(), newBytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                        writtenFiles.add(file);
+                    }
+                    processed.add(imagePath);
                 }
             }
+        }
+    }
+      private Set<File> expectedFiles = new HashSet<>();
+    private Set<File> writtenFiles = new HashSet<>();
+    
+    /**
+     * Compare the contents of a resource with an existing file
+     * @return true if the contents are different or the file doesn't exist
+     */
+    private boolean hasContentChanged(Resource resource, File file) throws IOException {
+        if (!file.exists()) {
+            return true;
+        }
+        
+        // Save resource to a temporary byte array
+        java.io.ByteArrayOutputStream os = new java.io.ByteArrayOutputStream();
+        resource.save(os, null);
+        byte[] newContent = os.toByteArray();
+        
+        // Read existing file
+        byte[] existingContent = Files.readAllBytes(file.toPath());
+        
+        return !Arrays.equals(newContent, existingContent);
+    }
+    
+    /**
+     * Clean up any files that were not written in this export
+     */
+    private void cleanupObsoleteFiles(File folder) throws IOException {
+        if (!folder.exists()) {
+            return;
+        }
+        
+        File[] files = folder.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    cleanupObsoleteFiles(file);
+                    // Delete directory if empty
+                    if (file.exists() && file.list().length == 0) {
+                        file.delete();
+                    }
+                }
+                else if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
+                    file.delete();
+                }
+            }
+        }
+        
+        // Delete the folder if it's empty
+        if (folder.exists() && folder.list().length == 0) {
+            folder.delete();
         }
     }
 }
