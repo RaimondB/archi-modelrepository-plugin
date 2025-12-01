@@ -393,7 +393,19 @@ public class GraficoModelImporter {
 		folderList.add(FolderType.RELATIONS);
 		folderList.add(FolderType.DIAGRAMS);
 
-        progress.setWorkRemaining(folderList.size());
+        // Count total files across all folders for proportional progress
+        progress.subTask(Messages.GraficoModelImporter_6);
+        Map<FolderType, Integer> folderFileCounts = new ConcurrentHashMap<>();
+        int totalFiles = 0;
+        for (FolderType folderType : folderList) {
+            File typeFolder = new File(folder, folderType.toString());
+            int count = countFilesRecursively(typeFolder);
+            folderFileCounts.put(folderType, count);
+            totalFiles += count;
+        }
+        
+        // Use total file count for proportional progress, minimum 1 to avoid division by zero
+        progress.setWorkRemaining(Math.max(totalFiles, 1));
 
 		// Loop based on FolderType enumeration
 		for(FolderType folderType : folderList) {
@@ -402,7 +414,8 @@ public class GraficoModelImporter {
 		        return model;
 		    }
             progress.subTask(String.format(Messages.GraficoModelImporter_5, folderType.toString()));
-		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()), progress.split(1));
+            int folderFileCount = folderFileCounts.getOrDefault(folderType, 1);
+		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()), progress.split(folderFileCount));
 		    if(tmpFolder != null) {
 		        model.getFolders().add(tmpFolder);
 		    }
@@ -410,6 +423,29 @@ public class GraficoModelImporter {
 		
 		return model;
 	}
+    
+    /**
+     * Count files recursively in a folder (excluding folder.xml files).
+     * Used for calculating proportional progress.
+     */
+    private int countFilesRecursively(File folder) {
+        if (!folder.isDirectory()) {
+            return 0;
+        }
+        
+        int count = 0;
+        File[] contents = folder.listFiles();
+        if (contents != null) {
+            for (File file : contents) {
+                if (file.isDirectory()) {
+                    count += countFilesRecursively(file);
+                } else if (!file.getName().equals(IGraficoConstants.FOLDER_XML)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
 	
 	/**
 	 * Load each XML file to recreate original object
@@ -449,8 +485,14 @@ public class GraficoModelImporter {
             });
         }
         
-        int totalWork = filesToLoad.size() + foldersToLoad.size();
-        progress.setWorkRemaining(totalWork > 0 ? totalWork : 1);
+        // Calculate work units: files in this folder + estimated work for subfolders
+        // Subfolders will get their own proportional split from the parent's progress
+        int filesInThisFolder = filesToLoad.size();
+        int subfolderCount = foldersToLoad.size();
+        
+        // Set remaining work - files get 1 unit each, subfolders will be recursively split
+        // We use the file count from this level; subfolders handle their own counts
+        progress.setWorkRemaining(Math.max(filesInThisFolder + subfolderCount, 1));
         
         // Load files in parallel using ForkJoinPool (work-stealing, better for I/O-bound tasks)
         if (!filesToLoad.isEmpty()) {
@@ -512,8 +554,10 @@ public class GraficoModelImporter {
                     if (element != null) {
                         currentFolder.getElements().add(element);
                     }
-                    progress.worked(1);
                 }
+                
+                // Report progress once for all files in this folder (batch update)
+                progress.worked(filesInThisFolder);
             } finally {
                 executor.shutdown();
                 try {

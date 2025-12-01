@@ -42,7 +42,11 @@ implements IPreferenceConstants {
 		store.setDefault(PREFS_PROXY_PORT, 8088);
 		store.setDefault(PREFS_PROXY_HOST, "localhost");
 		
-		store.setDefault(PREFS_EXPORT_MAX_THREADS, 10);
+		// For many small files (< 4K), I/O is less bottleneck than overhead
+		// Use more threads to maximize throughput: CPU count, with a minimum of 2 and maximum of 8
+		int cpuCount = Runtime.getRuntime().availableProcessors();
+		int optimalThreads = Math.max(2, Math.min(8, cpuCount));
+		store.setDefault(PREFS_EXPORT_MAX_THREADS, optimalThreads);
 		
 		store.setDefault(PREFS_FETCH_IN_BACKGROUND, false);
 		store.setDefault(PREFS_FETCH_IN_BACKGROUND_INTERVAL, 60);

@@ -35,6 +35,8 @@ public class Messages extends NLS {
     public static String GraficoModelImporter_4;
     
     public static String GraficoModelImporter_5;
+    
+    public static String GraficoModelImporter_6;
 
     public static String GraficoModelLoader_0;
     
