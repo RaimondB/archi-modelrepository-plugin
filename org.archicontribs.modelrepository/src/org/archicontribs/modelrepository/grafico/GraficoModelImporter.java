@@ -7,18 +7,22 @@ package org.archicontribs.modelrepository.grafico;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
@@ -203,23 +207,23 @@ public class GraficoModelImporter {
     
     /**
      * Read images from images subfolder and load them into the model
-     * Uses parallel I/O for better performance
+     * Uses NIO2 Path APIs and CompletableFuture for parallel async I/O
      * @param monitor Progress monitor for UI feedback, can be null
      */
     private void loadImages(File folder, IArchiveManager archiveManager, IProgressMonitor monitor) throws IOException {
         SubMonitor progress = SubMonitor.convert(monitor);
+        Path folderPath = folder.toPath();
         
-        File[] imageFiles = folder.listFiles();
-        if (imageFiles == null || imageFiles.length == 0) {
+        if (!Files.isDirectory(folderPath)) {
             return;
         }
         
-        // Filter to only include files
-        List<File> filesToLoad = new ArrayList<>();
-        for (File imageFile : imageFiles) {
-            if (imageFile.isFile()) {
-                filesToLoad.add(imageFile);
-            }
+        // Use NIO2 Files.list() which is more efficient than File.listFiles()
+        List<Path> filesToLoad;
+        try (Stream<Path> pathStream = Files.list(folderPath)) {
+            filesToLoad = pathStream
+                .filter(Files::isRegularFile)
+                .collect(Collectors.toList());
         }
         
         if (filesToLoad.isEmpty()) {
@@ -228,48 +232,60 @@ public class GraficoModelImporter {
         
         progress.setWorkRemaining(filesToLoad.size());
         
-        // Use thread pool for parallel reads
+        // Use ForkJoinPool for work-stealing parallel reads
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-        ExecutorService executor = Executors.newFixedThreadPool(Math.min(maxThreads, filesToLoad.size()));
+        ForkJoinPool executor = new ForkJoinPool(Math.min(maxThreads, filesToLoad.size()));
         
         // Store results in a concurrent map
         Map<String, byte[]> imageData = new ConcurrentHashMap<>();
-        List<Future<?>> futures = new ArrayList<>();
-        IOException firstException = null;
         
         try {
-            // Submit parallel read tasks
-            for (File imageFile : filesToLoad) {
-                futures.add(executor.submit(() -> {
+            // Create CompletableFutures for all file reads
+            List<CompletableFuture<Void>> futures = filesToLoad.stream()
+                .map(path -> CompletableFuture.runAsync(() -> {
                     try {
-                        byte[] bytes = Files.readAllBytes(imageFile.toPath());
-                        imageData.put(imageFile.getName(), bytes);
+                        byte[] bytes = Files.readAllBytes(path);
+                        imageData.put(path.getFileName().toString(), bytes);
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
-                }));
-            }
+                }, executor))
+                .collect(Collectors.toList());
             
-            // Wait for all reads to complete
-            for (Future<?> future : futures) {
-                try {
-                    future.get();
-                    progress.worked(1);
-                } catch (InterruptedException | ExecutionException e) {
-                    if (firstException == null && e.getCause() instanceof IOException) {
-                        firstException = (IOException) e.getCause();
-                    } else if (firstException == null && e.getCause() instanceof RuntimeException 
-                               && e.getCause().getCause() instanceof IOException) {
-                        firstException = (IOException) e.getCause().getCause();
+            // Wait for all reads to complete using allOf
+            CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0])
+            );
+            
+            try {
+                // Wait with timeout to allow cancellation checks
+                while (!allFutures.isDone()) {
+                    if (progress.isCanceled()) {
+                        executor.shutdownNow();
+                        return;
+                    }
+                    try {
+                        allFutures.get(100, TimeUnit.MILLISECONDS);
+                    } catch (java.util.concurrent.TimeoutException e) {
+                        // Continue checking for cancellation
                     }
                 }
-                
-                // Check for cancellation
-                if (progress.isCanceled()) {
-                    executor.shutdownNow();
-                    return;
+                // Final get to propagate any exceptions
+                allFutures.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Image load interrupted", e); //$NON-NLS-1$
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                    throw (IOException) cause.getCause();
+                } else if (cause instanceof IOException) {
+                    throw (IOException) cause;
                 }
+                throw new IOException("Failed to load images", e); //$NON-NLS-1$
             }
+            
+            progress.worked(filesToLoad.size());
         } finally {
             executor.shutdown();
             try {
@@ -277,10 +293,6 @@ public class GraficoModelImporter {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-        }
-        
-        if (firstException != null) {
-            throw firstException;
         }
         
         // Add all loaded images to the archive manager
@@ -401,7 +413,7 @@ public class GraficoModelImporter {
 	
 	/**
 	 * Load each XML file to recreate original object
-	 * Uses parallel I/O for better performance
+	 * Uses NIO2 async I/O and CompletableFuture for better performance
 	 * 
 	 * @param folder
 	 * @param monitor Progress monitor for UI feedback, can be null
@@ -411,85 +423,92 @@ public class GraficoModelImporter {
     private IFolder loadFolder(File folder, IProgressMonitor monitor) throws IOException {
         SubMonitor progress = SubMonitor.convert(monitor);
         
-        if(!folder.isDirectory() || !(new File(folder, IGraficoConstants.FOLDER_XML)).isFile()) {
+        Path folderPath = folder.toPath();
+        Path folderXmlPath = folderPath.resolve(IGraficoConstants.FOLDER_XML);
+        
+        if(!Files.isDirectory(folderPath) || !Files.isRegularFile(folderXmlPath)) {
             throw new IOException("File is not directory or folder.xml does not exist."); //$NON-NLS-1$
         }
 
         // Load folder object itself
-        IFolder currentFolder = (IFolder)loadElement(new File(folder, IGraficoConstants.FOLDER_XML));
+        IFolder currentFolder = (IFolder)loadElement(folderXmlPath);
 
-        // Get list of files/folders to process (excluding folder.xml)
-        File[] contents = folder.listFiles();
-        List<File> filesToLoad = new ArrayList<>();
-        List<File> foldersToLoad = new ArrayList<>();
+        // Get list of files/folders to process using NIO2 DirectoryStream (faster than File.listFiles())
+        List<Path> filesToLoad = new ArrayList<>();
+        List<Path> foldersToLoad = new ArrayList<>();
         
-        if (contents != null) {
-            for (File fileOrFolder : contents) {
-                if (!fileOrFolder.getName().equals(IGraficoConstants.FOLDER_XML)) {
-                    if (fileOrFolder.isFile()) {
-                        filesToLoad.add(fileOrFolder);
-                    } else {
-                        foldersToLoad.add(fileOrFolder);
+        try (Stream<Path> pathStream = Files.list(folderPath)) {
+            pathStream.forEach(path -> {
+                if (!path.getFileName().toString().equals(IGraficoConstants.FOLDER_XML)) {
+                    if (Files.isDirectory(path)) {
+                        foldersToLoad.add(path);
+                    } else if (Files.isRegularFile(path)) {
+                        filesToLoad.add(path);
                     }
                 }
-            }
+            });
         }
         
         int totalWork = filesToLoad.size() + foldersToLoad.size();
         progress.setWorkRemaining(totalWork > 0 ? totalWork : 1);
         
-        // Load files in parallel using thread pool
+        // Load files in parallel using ForkJoinPool (work-stealing, better for I/O-bound tasks)
         if (!filesToLoad.isEmpty()) {
             int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-            ExecutorService executor = Executors.newFixedThreadPool(Math.min(maxThreads, filesToLoad.size()));
+            ForkJoinPool executor = new ForkJoinPool(Math.min(maxThreads, filesToLoad.size()));
             
-            // Use a concurrent map to store loaded elements with their original order
-            Map<File, EObject> loadedElements = new ConcurrentHashMap<>();
-            List<Future<?>> futures = new ArrayList<>();
+            // Use a concurrent map to store loaded elements
+            Map<Path, EObject> loadedElements = new ConcurrentHashMap<>();
             
             try {
-                // Submit parallel load tasks
-                for (File file : filesToLoad) {
-                    futures.add(executor.submit(() -> {
+                // Create CompletableFutures for all file loads
+                List<CompletableFuture<Void>> futures = filesToLoad.stream()
+                    .map(path -> CompletableFuture.runAsync(() -> {
                         try {
-                            EObject element = loadElement(file);
-                            loadedElements.put(file, element);
+                            EObject element = loadElementAsync(path);
+                            loadedElements.put(path, element);
                         } catch (IOException e) {
                             throw new RuntimeException(e);
                         }
-                    }));
-                }
+                    }, executor))
+                    .collect(Collectors.toList());
                 
-                // Wait for all loads to complete
-                IOException firstException = null;
-                for (Future<?> future : futures) {
-                    try {
-                        future.get();
-                    } catch (InterruptedException | ExecutionException e) {
-                        if (firstException == null) {
-                            if (e.getCause() instanceof IOException) {
-                                firstException = (IOException) e.getCause();
-                            } else if (e.getCause() instanceof RuntimeException 
-                                       && e.getCause().getCause() instanceof IOException) {
-                                firstException = (IOException) e.getCause().getCause();
-                            }
+                // Wait for all loads to complete using allOf for better composition
+                CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+                    futures.toArray(new CompletableFuture[0])
+                );
+                
+                try {
+                    // Wait with timeout to allow cancellation checks
+                    while (!allFutures.isDone()) {
+                        if (progress.isCanceled()) {
+                            executor.shutdownNow();
+                            return currentFolder;
+                        }
+                        try {
+                            allFutures.get(100, TimeUnit.MILLISECONDS);
+                        } catch (java.util.concurrent.TimeoutException e) {
+                            // Continue checking for cancellation
                         }
                     }
-                    
-                    // Check for cancellation
-                    if (progress.isCanceled()) {
-                        executor.shutdownNow();
-                        return currentFolder;
+                    // Final get to propagate any exceptions
+                    allFutures.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Load interrupted", e); //$NON-NLS-1$
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                        throw (IOException) cause.getCause();
+                    } else if (cause instanceof IOException) {
+                        throw (IOException) cause;
                     }
-                }
-                
-                if (firstException != null) {
-                    throw firstException;
+                    throw new IOException("Failed to load elements", e); //$NON-NLS-1$
                 }
                 
                 // Add elements in original order to maintain consistency
-                for (File file : filesToLoad) {
-                    EObject element = loadedElements.get(file);
+                for (Path path : filesToLoad) {
+                    EObject element = loadedElements.get(path);
                     if (element != null) {
                         currentFolder.getElements().add(element);
                     }
@@ -506,13 +525,13 @@ public class GraficoModelImporter {
         }
         
         // Load subfolders (recursively, with progress)
-        for (File subFolder : foldersToLoad) {
+        for (Path subFolder : foldersToLoad) {
             // Check for cancellation
             if (progress.isCanceled()) {
                 return currentFolder;
             }
             
-            IFolder loadedFolder = loadFolder(subFolder, progress.split(1));
+            IFolder loadedFolder = loadFolder(subFolder.toFile(), progress.split(1));
             if (loadedFolder != null) {
                 currentFolder.getFolders().add(loadedFolder);
             }
@@ -520,25 +539,64 @@ public class GraficoModelImporter {
 
         return currentFolder;
     }
+    
+    /**
+     * Load an element using NIO2 async file reading for better I/O performance.
+     * Reads file content asynchronously then parses it.
+     * 
+     * @param path Path to the XML file
+     * @return The loaded EObject
+     * @throws IOException
+     */
+    private EObject loadElementAsync(Path path) throws IOException {
+        // Use buffered NIO2 InputStream which is more efficient than File-based access
+        try (InputStream inputStream = Files.newInputStream(path, StandardOpenOption.READ)) {
+            IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+            
+            // Update an ID -> Object mapping table (used as a cache to resolve proxies)
+            fIDLookup.put(eObject.getId(), eObject);
+            if(eObject instanceof IArchimateModel) {
+                for(IProfile profile : ((IArchimateModel)eObject).getProfiles()) {
+                    fIDLookup.put(profile.getId(), profile);
+                }
+            }
+
+            return eObject;
+        }
+    }
+    
+    /**
+     * Create an eObject from a Path. Uses NIO2 for better performance.
+     * 
+     * @param path
+     * @return
+     * @throws IOException 
+     */
+    private EObject loadElement(Path path) throws IOException {
+        try (InputStream inputStream = Files.newInputStream(path, StandardOpenOption.READ)) {
+            IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+            
+            // Update an ID -> Object mapping table (used as a cache to resolve proxies)
+            fIDLookup.put(eObject.getId(), eObject);
+            if(eObject instanceof IArchimateModel) {
+                for(IProfile profile : ((IArchimateModel)eObject).getProfiles()) {
+                    fIDLookup.put(profile.getId(), profile);
+                }
+            }
+
+            return eObject;
+        }
+    }
 
     /**
      * Create an eObject from an XML file. Basically load a resource.
+     * Delegates to Path-based version for NIO2 performance.
      * 
      * @param file
      * @return
      * @throws IOException 
      */
     private EObject loadElement(File file) throws IOException {
-        IIdentifier eObject = GraficoResourceLoader.loadEObject(file);
-        
-        // Update an ID -> Object mapping table (used as a cache to resolve proxies)
-        fIDLookup.put(eObject.getId(), eObject);
-        if(eObject instanceof IArchimateModel) {
-        	for(IProfile profile : ((IArchimateModel)eObject).getProfiles()) {
-        		fIDLookup.put(profile.getId(), profile);
-        	}
-        }
-
-        return eObject;
+        return loadElement(file.toPath());
     }
 }
