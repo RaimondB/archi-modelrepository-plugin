@@ -401,7 +401,7 @@ public class GraficoModelImporter {
 		    if (progress.isCanceled()) {
 		        return model;
 		    }
-		    
+            progress.subTask(String.format(Messages.GraficoModelImporter_5, folderType.toString()));
 		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()), progress.split(1));
 		    if(tmpFolder != null) {
 		        model.getFolders().add(tmpFolder);
