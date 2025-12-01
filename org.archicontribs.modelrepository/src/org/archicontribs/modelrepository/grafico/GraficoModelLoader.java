@@ -8,14 +8,16 @@ package org.archicontribs.modelrepository.grafico;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter.UnresolvedObject;
+import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.util.EcoreUtil;
-import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
@@ -23,9 +25,6 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.treewalk.TreeWalk;
-import org.eclipse.swt.custom.BusyIndicator;
-import org.eclipse.swt.widgets.Display;
-import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorReference;
 import org.eclipse.ui.PartInitException;
@@ -81,14 +80,23 @@ public class GraficoModelLoader {
         // Support headless model by not opening dialogs and showing progress bars
         if(!bHeadless)
         {
-	        BusyIndicator.showWhile(Display.getCurrent(), () -> {
-	            try {
-	                graficoModel[0] = importer.importAsModel();
-	            }
-	            catch(IOException ex) {
-	                exception[0] = ex;
-	            }
-	        });
+            // Use ProgressMonitorDialog to show progress and keep UI responsive
+            try {
+                PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+                    @Override
+                    public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                        try {
+                            graficoModel[0] = importer.importAsModel(monitor);
+                        }
+                        catch(IOException ex) {
+                            exception[0] = ex;
+                        }
+                    }
+                });
+            }
+            catch(InvocationTargetException | InterruptedException ex) {
+                throw new IOException(ex.getMessage(), ex);
+            }
         } else {
             try {
                 graficoModel[0] = importer.importAsModel();

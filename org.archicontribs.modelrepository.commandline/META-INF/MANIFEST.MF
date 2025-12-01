@@ -6,7 +6,8 @@ Bundle-Localization: plugin
 Bundle-Version: 0.9.4.qualifier
 Bundle-Vendor: Archi
 Require-Bundle: com.archimatetool.commandline;bundle-version="4.9.0",
- org.archicontribs.modelrepository;bundle-version="0.9.4"
+ org.archicontribs.modelrepository;bundle-version="0.9.4",
+ com.archimatetool.model;bundle-version="4.9.0"
 Bundle-ActivationPolicy: lazy
 Bundle-RequiredExecutionEnvironment: JavaSE-21
 Automatic-Module-Name: org.archicontribs.modelrepository.commandline

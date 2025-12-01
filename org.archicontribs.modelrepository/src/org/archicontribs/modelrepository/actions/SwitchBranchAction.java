@@ -6,18 +6,22 @@
 package org.archicontribs.modelrepository.actions;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
+import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.swt.SWT;
 import org.eclipse.ui.IWorkbenchWindow;
+import org.eclipse.ui.PlatformUI;
 
 import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.model.IArchimateModel;
@@ -136,32 +140,75 @@ public class SwitchBranchAction extends AbstractModelAction {
     }
     
     protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
-        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
-            // If the branch is local just checkout
-            if(branchInfo.isLocal()) {
-                git.checkout().setName(branchInfo.getFullName()).call();
-            }
-            // If the branch is remote and has no local ref we need to create the local branch and switch to that
-            else if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
-                String branchName = branchInfo.getShortName();
-                
-                // Create local branch at point of remote branch ref
-                Ref ref = git.branchCreate()
-                        .setName(branchName)
-                        .setStartPoint(branchInfo.getFullName())
-                        .call();
-                
-                // checkout
-                git.checkout().setName(ref.getName()).call();
-            }
+        // First, perform Git operations with progress feedback
+        // (checkout can take a long time if many files differ between branches)
+        performGitCheckout(branchInfo);
+        
+        // Then reload the model - GraficoModelLoader has its own progress dialog
+        if(doReloadGrafico) {
+            new GraficoModelLoader(getRepository()).loadModel();
             
-            // Reload the model from the Grafico XML files
-            if(doReloadGrafico) {
-                new GraficoModelLoader(getRepository()).loadModel();
-                
-                // Save the checksum
-                getRepository().saveChecksum();
+            // Save the checksum
+            getRepository().saveChecksum();
+        }
+    }
+    
+    /**
+     * Perform the Git checkout operation with progress feedback
+     */
+    private void performGitCheckout(BranchInfo branchInfo) throws IOException, GitAPIException {
+        Exception[] exception = new Exception[1];
+        
+        try {
+            PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+                @Override
+                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                    monitor.beginTask(Messages.SwitchBranchAction_6, IProgressMonitor.UNKNOWN);
+                    
+                    try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
+                        // If the branch is local just checkout
+                        if(branchInfo.isLocal()) {
+                            monitor.subTask(Messages.SwitchBranchAction_7);
+                            git.checkout().setName(branchInfo.getFullName()).call();
+                        }
+                        // If the branch is remote and has no local ref we need to create the local branch and switch to that
+                        else if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
+                            String branchName = branchInfo.getShortName();
+                            
+                            // Create local branch at point of remote branch ref
+                            monitor.subTask(Messages.SwitchBranchAction_8);
+                            Ref ref = git.branchCreate()
+                                    .setName(branchName)
+                                    .setStartPoint(branchInfo.getFullName())
+                                    .call();
+                            
+                            // checkout
+                            monitor.subTask(Messages.SwitchBranchAction_7);
+                            git.checkout().setName(ref.getName()).call();
+                        }
+                    }
+                    catch(IOException | GitAPIException ex) {
+                        exception[0] = ex;
+                    }
+                    finally {
+                        monitor.done();
+                    }
+                }
+            });
+        }
+        catch(InvocationTargetException | InterruptedException ex) {
+            throw new IOException(ex);
+        }
+        
+        // Re-throw any exception from the progress runnable
+        if(exception[0] != null) {
+            if(exception[0] instanceof IOException) {
+                throw (IOException)exception[0];
             }
+            if(exception[0] instanceof GitAPIException) {
+                throw (GitAPIException)exception[0];
+            }
+            throw new IOException(exception[0]);
         }
     }
     

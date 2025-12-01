@@ -182,6 +182,16 @@ public class Messages extends NLS {
 
     public static String SwitchBranchAction_5;
 
+    public static String SwitchBranchAction_6;
+
+    public static String SwitchBranchAction_7;
+
+    public static String SwitchBranchAction_8;
+
+    public static String SwitchBranchAction_9;
+
+    public static String SwitchBranchAction_10;
+
     public static String UndoLastCommitAction_0;
 
     public static String UndoLastCommitAction_1;
