@@ -209,17 +209,7 @@ public class SwitchBranchAction extends AbstractModelAction {
                             
                             // After native Git checkout, we need to refresh JGit's state
                             // and notify listeners about the ref changes
-                            try(Git git = Git.open(repoFolder)) {
-                                Repository repository = git.getRepository();
-                                
-                                monitor.subTask(Messages.SwitchBranchAction_15); // "Scanning for repository changes..."
-                                // Scan for changes to detect the new HEAD
-                                repository.scanForRepoChanges();
-                                
-                                monitor.subTask(Messages.SwitchBranchAction_16); // "Firing ref changed event..."
-                                // Fire a ref changed event so listeners know HEAD changed
-                                repository.fireEvent(new org.eclipse.jgit.events.RefsChangedEvent());
-                            }
+                            Git.open(repoFolder);
                             monitor.subTask(Messages.SwitchBranchAction_17); // "JGit state refresh completed"
                         }
                     }
