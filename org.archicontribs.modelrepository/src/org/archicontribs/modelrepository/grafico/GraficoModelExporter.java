@@ -7,25 +7,28 @@ package org.archicontribs.modelrepository.grafico;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousFileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
-import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.core.runtime.IStatus;
-import org.eclipse.core.runtime.NullProgressMonitor;
-import org.eclipse.core.runtime.OperationCanceledException;
-import org.eclipse.core.runtime.Status;
-import org.eclipse.core.runtime.jobs.Job;
-import org.eclipse.core.runtime.jobs.JobGroup;
 import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.resource.Resource;
@@ -37,7 +40,6 @@ import org.eclipse.emf.ecore.xmi.XMLResource;
 import org.eclipse.emf.ecore.xmi.impl.XMLResourceFactoryImpl;
 
 import com.archimatetool.editor.model.IArchiveManager;
-import com.archimatetool.editor.utils.FileUtils;
 import com.archimatetool.model.FolderType;
 import com.archimatetool.model.IArchimateModel;
 import com.archimatetool.model.IDiagramModelImageProvider;
@@ -56,14 +58,19 @@ import com.archimatetool.model.IIdentifier;
  * @author Phillip Beauvoir
  */
 public class GraficoModelExporter {
-	
-    // Use a ProgressMonitor to cancel running Jobs and track Exception
-    private static class ExceptionProgressMonitor extends NullProgressMonitor {
-        IOException ex;
+    
+    /**
+     * Thread-safe holder for async write results
+     */
+    private static class AsyncWriteResult {
+        final File file;
+        final Future<Integer> future;
+        final AsynchronousFileChannel channel;
         
-        void catchException(IOException ex) {
-            this.ex = ex;
-            setCanceled(true); // Cancel running job on exception
+        AsyncWriteResult(File file, Future<Integer> future, AsynchronousFileChannel channel) {
+            this.file = file;
+            this.future = future;
+            this.channel = channel;
         }
     }
     
@@ -127,52 +134,113 @@ public class GraficoModelExporter {
         // Create directory structure and prepare all Resources
         createAndSaveResourceForFolder(copy, modelFolder);
 
-        // Now save all Resources
+        // Now save all Resources using async I/O for better performance on macOS
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-        JobGroup jobgroup = new JobGroup("GraficoModelExporter", maxThreads, 1); //$NON-NLS-1$
+        ExecutorService executor = Executors.newFixedThreadPool(maxThreads);
         
-        final ExceptionProgressMonitor pm = new ExceptionProgressMonitor();
-          for(Resource resource : fResourceSet.getResources()) {
-            Job job = new Job("Resource Save Job") { //$NON-NLS-1$
-                @Override
-                protected IStatus run(IProgressMonitor monitor) {                    try {
-                        // Get the file for this resource
-                        URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-                        String filePath = uri.toFileString();
-                        File file = new File(filePath);
-                        
-                        // Only save if content has changed
-                        if (hasContentChanged(resource, file)) {
-                            file.getParentFile().mkdirs();
-                            resource.save(null);
-                            writtenFiles.add(file);
-                        }
+        // Cache for file contents to avoid re-reading
+        Map<File, byte[]> existingContentCache = new ConcurrentHashMap<>();
+        
+        // Pre-read existing files in parallel for comparison
+        List<Future<?>> readFutures = new ArrayList<>();
+        for(Resource resource : fResourceSet.getResources()) {
+            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+            String filePath = uri.toFileString();
+            File file = new File(filePath);
+            
+            if (file.exists()) {
+                readFutures.add(executor.submit(() -> {
+                    try {
+                        existingContentCache.put(file, Files.readAllBytes(file.toPath()));
+                    } catch (IOException e) {
+                        // File might not exist or be readable, will be written anyway
                     }
-                    catch(IOException ex) {
-                        pm.catchException(ex);
-                    }
-                    return Status.OK_STATUS;
+                }));
+            }
+        }
+        
+        // Wait for all reads to complete
+        for (Future<?> future : readFutures) {
+            try {
+                future.get();
+            } catch (InterruptedException | ExecutionException e) {
+                // Continue with export
+            }
+        }
+        
+        // Collect async write operations
+        List<AsyncWriteResult> asyncWrites = new ArrayList<>();
+        IOException firstException = null;
+        
+        for(Resource resource : fResourceSet.getResources()) {
+            try {
+                // Get the file for this resource
+                URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+                String filePath = uri.toFileString();
+                File file = new File(filePath);
+                
+                // Serialize resource to byte array
+                java.io.ByteArrayOutputStream os = new java.io.ByteArrayOutputStream(4096);
+                resource.save(os, null);
+                byte[] newContent = os.toByteArray();
+                
+                // Only save if content has changed
+                byte[] existingContent = existingContentCache.get(file);
+                if (existingContent == null || !Arrays.equals(newContent, existingContent)) {
+                    file.getParentFile().mkdirs();
+                    
+                    // Use async file channel for non-blocking write
+                    Path path = file.toPath();
+                    AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                        path,
+                        EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
+                        executor
+                    );
+                    
+                    ByteBuffer buffer = ByteBuffer.wrap(newContent);
+                    Future<Integer> writeFuture = channel.write(buffer, 0);
+                    asyncWrites.add(new AsyncWriteResult(file, writeFuture, channel));
+                    writtenFiles.add(file);
                 }
-            };
-            
-            job.setJobGroup(jobgroup);
-            job.schedule();
+            } catch(IOException ex) {
+                if (firstException == null) {
+                    firstException = ex;
+                }
+            }
         }
         
+        // Wait for all async writes to complete and close channels
+        for (AsyncWriteResult writeResult : asyncWrites) {
+            try {
+                writeResult.future.get(); // Wait for write to complete
+            } catch (InterruptedException | ExecutionException e) {
+                if (firstException == null && e.getCause() instanceof IOException) {
+                    firstException = (IOException) e.getCause();
+                }
+            } finally {
+                try {
+                    writeResult.channel.close();
+                } catch (IOException e) {
+                    // Ignore close errors
+                }
+            }
+        }
+        
+        // Shutdown executor
+        executor.shutdown();
         try {
-            jobgroup.join(0, pm);
-            
-            // Clean up obsolete files after all resources are saved
-            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
-            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
+            executor.awaitTermination(60, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-        catch(OperationCanceledException | InterruptedException ex) {
-            ex.printStackTrace();
-        }
+        
+        // Clean up obsolete files after all resources are saved
+        cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
+        cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
         
         // Throw on any exception
-        if(pm.ex != null) {
-            throw pm.ex;
+        if(firstException != null) {
+            throw firstException;
         }
     }
     
@@ -264,14 +332,19 @@ public class GraficoModelExporter {
     }
       /**
      * Extract and save images used inside a model as separate image files
+     * Uses async I/O for better performance on macOS
      */
     private void saveImages() throws IOException {
         Set<String> processed = new HashSet<>();
+        List<AsyncWriteResult> asyncWrites = new ArrayList<>();
 
         IArchiveManager archiveManager = (IArchiveManager)fModel.getAdapter(IArchiveManager.class);
         if(archiveManager == null) {
             archiveManager = IArchiveManager.FACTORY.createArchiveManager(fModel);
         }
+        
+        // Collect all image data first
+        List<ImageWriteTask> imageTasks = new ArrayList<>();
         
         for(Iterator<EObject> iter = fModel.eAllContents(); iter.hasNext();) {
             EObject eObject = iter.next();
@@ -287,40 +360,93 @@ public class GraficoModelExporter {
                     
                     File file = new File(fLocalRepoFolder, imagePath);
                     expectedFiles.add(file);
-                    
-                    // Only write if different
-                    if (!file.exists() || !Arrays.equals(newBytes, Files.readAllBytes(file.toPath()))) {
-                        file.getParentFile().mkdirs();
-                        Files.write(file.toPath(), newBytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                        writtenFiles.add(file);
-                    }
+                    imageTasks.add(new ImageWriteTask(file, newBytes));
                     processed.add(imagePath);
                 }
             }
         }
-    }
-      private Set<File> expectedFiles = new HashSet<>();
-    private Set<File> writtenFiles = new HashSet<>();
-    
-    /**
-     * Compare the contents of a resource with an existing file
-     * @return true if the contents are different or the file doesn't exist
-     */
-    private boolean hasContentChanged(Resource resource, File file) throws IOException {
-        if (!file.exists()) {
-            return true;
+        
+        // Use thread pool for async writes
+        int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(maxThreads, imageTasks.size() + 1));
+        IOException firstException = null;
+        
+        try {
+            for (ImageWriteTask task : imageTasks) {
+                // Read existing content if file exists (for comparison)
+                byte[] existingContent = null;
+                if (task.file.exists()) {
+                    try {
+                        existingContent = Files.readAllBytes(task.file.toPath());
+                    } catch (IOException e) {
+                        // Will be overwritten anyway
+                    }
+                }
+                
+                // Only write if different
+                if (existingContent == null || !Arrays.equals(task.newBytes, existingContent)) {
+                    task.file.getParentFile().mkdirs();
+                    
+                    // Use async file channel for non-blocking write
+                    Path path = task.file.toPath();
+                    AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                        path,
+                        EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
+                        executor
+                    );
+                    
+                    ByteBuffer buffer = ByteBuffer.wrap(task.newBytes);
+                    Future<Integer> writeFuture = channel.write(buffer, 0);
+                    asyncWrites.add(new AsyncWriteResult(task.file, writeFuture, channel));
+                    writtenFiles.add(task.file);
+                }
+            }
+            
+            // Wait for all async writes to complete
+            for (AsyncWriteResult writeResult : asyncWrites) {
+                try {
+                    writeResult.future.get();
+                } catch (InterruptedException | ExecutionException e) {
+                    if (firstException == null && e.getCause() instanceof IOException) {
+                        firstException = (IOException) e.getCause();
+                    }
+                } finally {
+                    try {
+                        writeResult.channel.close();
+                    } catch (IOException e) {
+                        // Ignore close errors
+                    }
+                }
+            }
+        } finally {
+            executor.shutdown();
+            try {
+                executor.awaitTermination(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         
-        // Save resource to a temporary byte array
-        java.io.ByteArrayOutputStream os = new java.io.ByteArrayOutputStream();
-        resource.save(os, null);
-        byte[] newContent = os.toByteArray();
-        
-        // Read existing file
-        byte[] existingContent = Files.readAllBytes(file.toPath());
-        
-        return !Arrays.equals(newContent, existingContent);
+        if (firstException != null) {
+            throw firstException;
+        }
     }
+    
+    /**
+     * Helper class for image write tasks
+     */
+    private static class ImageWriteTask {
+        final File file;
+        final byte[] newBytes;
+        
+        ImageWriteTask(File file, byte[] newBytes) {
+            this.file = file;
+            this.newBytes = newBytes;
+        }
+    }
+    
+    private Set<File> expectedFiles = new HashSet<>();
+    private Set<File> writtenFiles = new HashSet<>();
     
     /**
      * Clean up any files that were not written in this export
