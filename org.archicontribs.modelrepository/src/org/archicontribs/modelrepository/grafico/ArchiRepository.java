@@ -380,7 +380,7 @@ public class ArchiRepository implements IArchiRepository {
                     try {
                         // Export
                         GraficoModelExporter exporter = new GraficoModelExporter(model, getLocalRepositoryFolder());
-                        exporter.exportModel();
+                        exporter.exportModel(pm);
                         
                         // Check lock file is deleted
                         checkDeleteLockFile();

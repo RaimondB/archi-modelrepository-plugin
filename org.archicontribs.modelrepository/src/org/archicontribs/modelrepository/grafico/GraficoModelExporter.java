@@ -29,6 +29,8 @@ import java.util.concurrent.TimeUnit;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.resource.Resource;
@@ -108,7 +110,20 @@ public class GraficoModelExporter {
     /**
      * Export the IArchimateModel as Grafico files
      * @throws IOException
-     */    public void exportModel() throws IOException {
+     */
+    public void exportModel() throws IOException {
+        exportModel(null);
+    }
+    
+    /**
+     * Export the IArchimateModel as Grafico files with progress monitoring
+     * @param monitor Progress monitor for UI feedback, can be null
+     * @throws IOException
+     */
+    public void exportModel(IProgressMonitor monitor) throws IOException {
+        // Use SubMonitor for easier progress reporting
+        SubMonitor progress = SubMonitor.convert(monitor, Messages.GraficoModelExporter_0, 100);
+        
         // Define target folders for model and images
         File modelFolder = new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER);
         File imagesFolder = new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER);
@@ -121,18 +136,35 @@ public class GraficoModelExporter {
         expectedFiles.clear();
         writtenFiles.clear();
         
+        // Check for cancellation
+        if (progress.isCanceled()) {
+            return;
+        }
+        
         // Save model images (if any): this has to be done on original model (not a copy)
-        saveImages();        // Create ResourceSet
+        progress.subTask(Messages.GraficoModelExporter_1);
+        saveImages(progress.split(10));
+        
+        // Create ResourceSet
         fResourceSet = new ResourceSetImpl();
         fResourceSet.getResourceFactoryRegistry().getExtensionToFactoryMap().put("*", new XMLResourceFactoryImpl()); //$NON-NLS-1$
         // Add a URIConverter that will be used to map full filenames to logical names
         fResourceSet.setURIConverter(new ExtensibleURIConverterImpl());
         
         // Now work on a copy
+        progress.subTask(Messages.GraficoModelExporter_2);
         IArchimateModel copy = EcoreUtil.copy(fModel);
+        progress.worked(5);
+        
+        // Check for cancellation
+        if (progress.isCanceled()) {
+            return;
+        }
         
         // Create directory structure and prepare all Resources
+        progress.subTask(Messages.GraficoModelExporter_3);
         createAndSaveResourceForFolder(copy, modelFolder);
+        progress.worked(10);
 
         // Now save all Resources using async I/O for better performance on macOS
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
@@ -142,6 +174,7 @@ public class GraficoModelExporter {
         Map<File, byte[]> existingContentCache = new ConcurrentHashMap<>();
         
         // Pre-read existing files in parallel for comparison
+        progress.subTask(Messages.GraficoModelExporter_4);
         List<Future<?>> readFutures = new ArrayList<>();
         for(Resource resource : fResourceSet.getResources()) {
             URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
@@ -167,12 +200,30 @@ public class GraficoModelExporter {
                 // Continue with export
             }
         }
+        progress.worked(15);
+        
+        // Check for cancellation
+        if (progress.isCanceled()) {
+            executor.shutdownNow();
+            return;
+        }
         
         // Collect async write operations
+        progress.subTask(Messages.GraficoModelExporter_5);
         List<AsyncWriteResult> asyncWrites = new ArrayList<>();
         IOException firstException = null;
         
+        int totalResources = fResourceSet.getResources().size();
+        SubMonitor writeProgress = progress.split(50);
+        writeProgress.setWorkRemaining(totalResources);
+        
         for(Resource resource : fResourceSet.getResources()) {
+            // Check for cancellation periodically
+            if (writeProgress.isCanceled()) {
+                executor.shutdownNow();
+                return;
+            }
+            
             try {
                 // Get the file for this resource
                 URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
@@ -207,6 +258,8 @@ public class GraficoModelExporter {
                     firstException = ex;
                 }
             }
+            
+            writeProgress.worked(1);
         }
         
         // Wait for all async writes to complete and close channels
@@ -235,8 +288,10 @@ public class GraficoModelExporter {
         }
         
         // Clean up obsolete files after all resources are saved
+        progress.subTask(Messages.GraficoModelExporter_6);
         cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
         cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
+        progress.worked(10);
         
         // Throw on any exception
         if(firstException != null) {
@@ -333,8 +388,11 @@ public class GraficoModelExporter {
       /**
      * Extract and save images used inside a model as separate image files
      * Uses async I/O for better performance on macOS
+     * @param monitor Progress monitor for UI feedback, can be null
      */
-    private void saveImages() throws IOException {
+    private void saveImages(IProgressMonitor monitor) throws IOException {
+        SubMonitor progress = SubMonitor.convert(monitor);
+        
         Set<String> processed = new HashSet<>();
         List<AsyncWriteResult> asyncWrites = new ArrayList<>();
 
@@ -366,6 +424,9 @@ public class GraficoModelExporter {
             }
         }
         
+        // Set work remaining based on number of images
+        progress.setWorkRemaining(imageTasks.size() + 1);
+        
         // Use thread pool for async writes
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
         ExecutorService executor = Executors.newFixedThreadPool(Math.min(maxThreads, imageTasks.size() + 1));
@@ -373,6 +434,12 @@ public class GraficoModelExporter {
         
         try {
             for (ImageWriteTask task : imageTasks) {
+                // Check for cancellation
+                if (progress.isCanceled()) {
+                    executor.shutdownNow();
+                    return;
+                }
+                
                 // Read existing content if file exists (for comparison)
                 byte[] existingContent = null;
                 if (task.file.exists()) {
@@ -400,6 +467,8 @@ public class GraficoModelExporter {
                     asyncWrites.add(new AsyncWriteResult(task.file, writeFuture, channel));
                     writtenFiles.add(task.file);
                 }
+                
+                progress.worked(1);
             }
             
             // Wait for all async writes to complete
