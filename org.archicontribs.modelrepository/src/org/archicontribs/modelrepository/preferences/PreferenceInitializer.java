@@ -45,7 +45,7 @@ implements IPreferenceConstants {
 		// For many small files (< 4K), I/O is less bottleneck than overhead
 		// Use more threads to maximize throughput: CPU count, with a minimum of 2 and maximum of 8
 		int cpuCount = Runtime.getRuntime().availableProcessors();
-		int optimalThreads = Math.max(2, Math.min(8, cpuCount));
+		int optimalThreads = Math.max(2, Math.min(12, cpuCount));
 		store.setDefault(PREFS_EXPORT_MAX_THREADS, optimalThreads);
 		
 		store.setDefault(PREFS_FETCH_IN_BACKGROUND, false);

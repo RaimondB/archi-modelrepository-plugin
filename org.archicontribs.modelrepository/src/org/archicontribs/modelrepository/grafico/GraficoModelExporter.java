@@ -17,18 +17,20 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
@@ -38,6 +40,7 @@ import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.resource.Resource;
 import org.eclipse.emf.ecore.resource.ResourceSet;
+import org.eclipse.osgi.util.NLS;
 import org.eclipse.emf.ecore.resource.impl.ExtensibleURIConverterImpl;
 import org.eclipse.emf.ecore.resource.impl.ResourceSetImpl;
 import org.eclipse.emf.ecore.util.EcoreUtil;
@@ -63,21 +66,6 @@ import com.archimatetool.model.IIdentifier;
  * @author Phillip Beauvoir
  */
 public class GraficoModelExporter {
-    
-    /**
-     * Thread-safe holder for async write results
-     */
-    private static class AsyncWriteResult {
-        final File file;
-        final Future<Integer> future;
-        final AsynchronousFileChannel channel;
-        
-        AsyncWriteResult(File file, Future<Integer> future, AsynchronousFileChannel channel) {
-            this.file = file;
-            this.future = future;
-            this.channel = channel;
-        }
-    }
     
 	/**
 	 * ResourceSet
@@ -170,22 +158,39 @@ public class GraficoModelExporter {
         progress.worked(10);
 
         // Now save all Resources using async I/O for better performance on macOS
+        // Use ForkJoinPool for work-stealing which is better for I/O-bound tasks with variable duration
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-        ExecutorService executor = Executors.newFixedThreadPool(maxThreads);
+        ForkJoinPool executor = new ForkJoinPool(maxThreads);
         
         // Cache for file content hashes (SHA-256) to avoid keeping full content in memory
         Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
         
         // Pre-compute hashes of existing files in parallel for comparison
-        progress.subTask(Messages.GraficoModelExporter_4);
-        List<Future<?>> readFutures = new ArrayList<>();
+        progress.subTask(NLS.bind(Messages.GraficoModelExporter_4, maxThreads));
+        
+        // Collect all files that need hashing first
+        List<File> filesToHash = new ArrayList<>();
         for(Resource resource : fResourceSet.getResources()) {
             URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
             String filePath = uri.toFileString();
             File file = new File(filePath);
-            
             if (file.exists()) {
-                readFutures.add(executor.submit(() -> {
+                filesToHash.add(file);
+            }
+        }
+        
+        // Batch files across threads to reduce scheduling overhead
+        // Each thread processes multiple files instead of one task per file
+        int batchSize = Math.max(1, (filesToHash.size() + maxThreads - 1) / maxThreads);
+        List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
+        
+        for (int i = 0; i < filesToHash.size(); i += batchSize) {
+            final int start = i;
+            final int end = Math.min(i + batchSize, filesToHash.size());
+            final List<File> batch = filesToHash.subList(start, end);
+            
+            hashFutures.add(CompletableFuture.runAsync(() -> {
+                for (File file : batch) {
                     try {
                         byte[] hash = computeFileHash(file);
                         if (hash != null) {
@@ -194,17 +199,15 @@ public class GraficoModelExporter {
                     } catch (IOException e) {
                         // File might not exist or be readable, will be written anyway
                     }
-                }));
-            }
+                }
+            }, executor));
         }
         
-        // Wait for all hash computations to complete
-        for (Future<?> future : readFutures) {
-            try {
-                future.get();
-            } catch (InterruptedException | ExecutionException e) {
-                // Continue with export
-            }
+        // Wait for all hash computations to complete using allOf (more efficient than checking one-by-one)
+        try {
+            CompletableFuture.allOf(hashFutures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            // Continue with export even if some hashes failed
         }
         progress.worked(15);
         
@@ -214,79 +217,88 @@ public class GraficoModelExporter {
             return;
         }
         
-        // Collect async write operations
-        progress.subTask(Messages.GraficoModelExporter_5);
-        List<AsyncWriteResult> asyncWrites = new ArrayList<>();
-        IOException firstException = null;
+        // Collect async write operations as CompletableFutures
+        // Each future handles its own byte array, allowing GC once write completes
+        progress.subTask(NLS.bind(Messages.GraficoModelExporter_5, maxThreads));
+        List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
         
         int totalResources = fResourceSet.getResources().size();
         SubMonitor writeProgress = progress.split(50);
         writeProgress.setWorkRemaining(totalResources);
         
-        for(Resource resource : fResourceSet.getResources()) {
-            // Check for cancellation periodically
-            if (writeProgress.isCanceled()) {
-                executor.shutdownNow();
-                return;
-            }
-            
-            try {
-                // Get the file for this resource
-                URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-                String filePath = uri.toFileString();
-                File file = new File(filePath);
-                
-                // Serialize resource to byte array
-                java.io.ByteArrayOutputStream os = new java.io.ByteArrayOutputStream(4096);
-                resource.save(os, null);
-                byte[] newContent = os.toByteArray();
-                
-                // Compare hash of new content with cached hash of existing file
-                byte[] existingHash = existingHashCache.get(file);
-                byte[] newHash = computeHash(newContent);
-                
-                // Only save if content has changed (hash mismatch or file doesn't exist)
-                if (existingHash == null || !Arrays.equals(newHash, existingHash)) {
-                    file.getParentFile().mkdirs();
-                    
-                    // Use async file channel for non-blocking write
-                    Path path = file.toPath();
-                    AsynchronousFileChannel channel = AsynchronousFileChannel.open(
-                        path,
-                        EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
-                        executor
-                    );
-                    
-                    ByteBuffer buffer = ByteBuffer.wrap(newContent);
-                    Future<Integer> writeFuture = channel.write(buffer, 0);
-                    asyncWrites.add(new AsyncWriteResult(file, writeFuture, channel));
-                    writtenFiles.add(file);
-                }
-            } catch(IOException ex) {
-                if (firstException == null) {
-                    firstException = ex;
-                }
-            }
-            
-            writeProgress.worked(1);
+        // Check for cancellation before starting
+        if (writeProgress.isCanceled()) {
+            executor.shutdownNow();
+            return;
         }
         
-        // Wait for all async writes to complete and close channels
-        for (AsyncWriteResult writeResult : asyncWrites) {
-            try {
-                writeResult.future.get(); // Wait for write to complete
-            } catch (InterruptedException | ExecutionException e) {
-                if (firstException == null && e.getCause() instanceof IOException) {
-                    firstException = (IOException) e.getCause();
+        // Collect all resources with their target files first (quick, sequential)
+        List<ResourceWriteTask> writeTasks = new ArrayList<>();
+        for(Resource resource : fResourceSet.getResources()) {
+            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+            String filePath = uri.toFileString();
+            File file = new File(filePath);
+            writeTasks.add(new ResourceWriteTask(resource, file, existingHashCache.get(file)));
+        }
+        
+        // Batch resources across threads - serialize AND write in parallel
+        int writeBatchSize = Math.max(1, (writeTasks.size() + maxThreads - 1) / maxThreads);
+        List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
+        java.util.concurrent.atomic.AtomicInteger completed = new java.util.concurrent.atomic.AtomicInteger(0);
+        
+        for (int i = 0; i < writeTasks.size(); i += writeBatchSize) {
+            final int start = i;
+            final int end = Math.min(i + writeBatchSize, writeTasks.size());
+            final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
+            
+            writeFutures.add(CompletableFuture.runAsync(() -> {
+                for (ResourceWriteTask task : batch) {
+                    try {
+                        // Serialize resource to byte array (CPU-intensive, now parallel!)
+                        java.io.ByteArrayOutputStream os = new java.io.ByteArrayOutputStream(4096);
+                        task.resource.save(os, null);
+                        byte[] newContent = os.toByteArray();
+                        
+                        // Compare hash of new content with cached hash of existing file
+                        byte[] newHash = computeHash(newContent);
+                        
+                        // Only save if content has changed (hash mismatch or file doesn't exist)
+                        if (task.existingHash == null || !Arrays.equals(newHash, task.existingHash)) {
+                            task.file.getParentFile().mkdirs();
+                            writtenFiles.add(task.file);
+                            
+                            // Write file synchronously within the batch (simpler, still parallel across batches)
+                            Files.write(task.file.toPath(), newContent, 
+                                StandardOpenOption.CREATE, 
+                                StandardOpenOption.WRITE, 
+                                StandardOpenOption.TRUNCATE_EXISTING);
+                        }
+                        // newContent goes out of scope here, eligible for GC
+                    } catch(IOException ex) {
+                        exceptions.add(ex);
+                    }
+                    
+                    // Update progress periodically
+                    int done = completed.incrementAndGet();
+                    if (done % 100 == 0) {
+                        writeProgress.worked(100);
+                    }
                 }
-            } finally {
-                try {
-                    writeResult.channel.close();
-                } catch (IOException e) {
-                    // Ignore close errors
-                }
+            }, executor));
+        }
+        
+        // Wait for all writes to complete
+        try {
+            CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                exceptions.add((IOException) cause.getCause());
             }
         }
+        
+        // Update remaining progress
+        writeProgress.worked(totalResources % 100);
         
         // Shutdown executor
         executor.shutdown();
@@ -303,8 +315,8 @@ public class GraficoModelExporter {
         progress.worked(10);
         
         // Throw on any exception
-        if(firstException != null) {
-            throw firstException;
+        if(!exceptions.isEmpty()) {
+            throw exceptions.get(0);
         }
     }
     
@@ -403,99 +415,107 @@ public class GraficoModelExporter {
         SubMonitor progress = SubMonitor.convert(monitor);
         
         Set<String> processed = new HashSet<>();
-        List<AsyncWriteResult> asyncWrites = new ArrayList<>();
+        List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
+        List<IOException> exceptions = new ArrayList<>();
 
         IArchiveManager archiveManager = (IArchiveManager)fModel.getAdapter(IArchiveManager.class);
         if(archiveManager == null) {
             archiveManager = IArchiveManager.FACTORY.createArchiveManager(fModel);
         }
         
-        // Collect all image data first
-        List<ImageWriteTask> imageTasks = new ArrayList<>();
-        
+        // Count images for progress
+        int imageCount = 0;
         for(Iterator<EObject> iter = fModel.eAllContents(); iter.hasNext();) {
             EObject eObject = iter.next();
             if(eObject instanceof IDiagramModelImageProvider) {
                 IDiagramModelImageProvider imageProvider = (IDiagramModelImageProvider)eObject;
-                String imagePath = imageProvider.getImagePath();
-                
-                if(imagePath != null && !processed.contains(imagePath)) {
-                    byte[] newBytes = archiveManager.getBytesFromEntry(imagePath);
-                    if(newBytes == null) {
-                        throw new IOException("Could not get image bytes from image path: " + imagePath); //$NON-NLS-1$
-                    }
-                    
-                    File file = new File(fLocalRepoFolder, imagePath);
-                    expectedFiles.add(file);
-                    imageTasks.add(new ImageWriteTask(file, newBytes));
-                    processed.add(imagePath);
+                if(imageProvider.getImagePath() != null) {
+                    imageCount++;
                 }
             }
         }
         
         // Set work remaining based on number of images
-        progress.setWorkRemaining(imageTasks.size() + 1);
+        progress.setWorkRemaining(imageCount + 1);
         
-        // Use thread pool for async writes
+        // Use ForkJoinPool for work-stealing which is better for I/O-bound tasks with variable duration
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-        ExecutorService executor = Executors.newFixedThreadPool(Math.min(maxThreads, imageTasks.size() + 1));
-        IOException firstException = null;
+        ForkJoinPool executor = new ForkJoinPool(Math.min(maxThreads, imageCount + 1));
         
         try {
-            for (ImageWriteTask task : imageTasks) {
-                // Check for cancellation
-                if (progress.isCanceled()) {
-                    executor.shutdownNow();
-                    return;
-                }
-                
-                // Compute hash of existing file if it exists (for comparison)
-                byte[] existingHash = null;
-                if (task.file.exists()) {
-                    try {
-                        existingHash = computeFileHash(task.file);
-                    } catch (IOException e) {
-                        // Will be overwritten anyway
+            for(Iterator<EObject> iter = fModel.eAllContents(); iter.hasNext();) {
+                EObject eObject = iter.next();
+                if(eObject instanceof IDiagramModelImageProvider) {
+                    IDiagramModelImageProvider imageProvider = (IDiagramModelImageProvider)eObject;
+                    String imagePath = imageProvider.getImagePath();
+                    
+                    if(imagePath != null && !processed.contains(imagePath)) {
+                        processed.add(imagePath);
+                        
+                        // Check for cancellation
+                        if (progress.isCanceled()) {
+                            executor.shutdownNow();
+                            return;
+                        }
+                        
+                        byte[] newBytes = archiveManager.getBytesFromEntry(imagePath);
+                        if(newBytes == null) {
+                            throw new IOException("Could not get image bytes from image path: " + imagePath); //$NON-NLS-1$
+                        }
+                        
+                        File file = new File(fLocalRepoFolder, imagePath);
+                        expectedFiles.add(file);
+                        
+                        // Compute hash of existing file if it exists (for comparison)
+                        byte[] existingHash = null;
+                        if (file.exists()) {
+                            try {
+                                existingHash = computeFileHash(file);
+                            } catch (IOException e) {
+                                // Will be overwritten anyway
+                            }
+                        }
+                        
+                        // Compare with hash of new content
+                        byte[] newHash = computeHash(newBytes);
+                        
+                        // Only write if different (hash mismatch or file doesn't exist)
+                        if (existingHash == null || !Arrays.equals(newHash, existingHash)) {
+                            file.getParentFile().mkdirs();
+                            writtenFiles.add(file);
+                            
+                            // Create a CompletableFuture that writes the file
+                            // The newBytes reference is captured but will be eligible for GC once the future completes
+                            final File targetFile = file;
+                            final byte[] contentToWrite = newBytes;
+                            
+                            writeFutures.add(CompletableFuture.runAsync(() -> {
+                                try (AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                                        targetFile.toPath(),
+                                        EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
+                                        executor)) {
+                                    ByteBuffer buffer = ByteBuffer.wrap(contentToWrite);
+                                    channel.write(buffer, 0).get();
+                                } catch (IOException | InterruptedException | ExecutionException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            }, executor));
+                        }
+                        // If not writing, newBytes goes out of scope here and can be GC'd immediately
+                        
+                        progress.worked(1);
                     }
                 }
-                
-                // Compare with hash of new content
-                byte[] newHash = computeHash(task.newBytes);
-                
-                // Only write if different (hash mismatch or file doesn't exist)
-                if (existingHash == null || !Arrays.equals(newHash, existingHash)) {
-                    task.file.getParentFile().mkdirs();
-                    
-                    // Use async file channel for non-blocking write
-                    Path path = task.file.toPath();
-                    AsynchronousFileChannel channel = AsynchronousFileChannel.open(
-                        path,
-                        EnumSet.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
-                        executor
-                    );
-                    
-                    ByteBuffer buffer = ByteBuffer.wrap(task.newBytes);
-                    Future<Integer> writeFuture = channel.write(buffer, 0);
-                    asyncWrites.add(new AsyncWriteResult(task.file, writeFuture, channel));
-                    writtenFiles.add(task.file);
-                }
-                
-                progress.worked(1);
             }
             
             // Wait for all async writes to complete
-            for (AsyncWriteResult writeResult : asyncWrites) {
+            if (!writeFutures.isEmpty()) {
                 try {
-                    writeResult.future.get();
-                } catch (InterruptedException | ExecutionException e) {
-                    if (firstException == null && e.getCause() instanceof IOException) {
-                        firstException = (IOException) e.getCause();
-                    }
-                } finally {
-                    try {
-                        writeResult.channel.close();
-                    } catch (IOException e) {
-                        // Ignore close errors
+                    CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0])).join();
+                } catch (Exception e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                        exceptions.add((IOException) cause.getCause());
                     }
                 }
             }
@@ -508,26 +528,28 @@ public class GraficoModelExporter {
             }
         }
         
-        if (firstException != null) {
-            throw firstException;
+        if (!exceptions.isEmpty()) {
+            throw exceptions.get(0);
         }
     }
     
     /**
-     * Helper class for image write tasks
+     * Helper class for batching resource write tasks
      */
-    private static class ImageWriteTask {
+    private static class ResourceWriteTask {
+        final Resource resource;
         final File file;
-        final byte[] newBytes;
+        final byte[] existingHash;
         
-        ImageWriteTask(File file, byte[] newBytes) {
+        ResourceWriteTask(Resource resource, File file, byte[] existingHash) {
+            this.resource = resource;
             this.file = file;
-            this.newBytes = newBytes;
+            this.existingHash = existingHash;
         }
     }
     
     private Set<File> expectedFiles = new HashSet<>();
-    private Set<File> writtenFiles = new HashSet<>();
+    private Set<File> writtenFiles = Collections.synchronizedSet(new HashSet<>());
     
     /**
      * Clean up any files that were not written in this export
@@ -569,8 +591,9 @@ public class GraficoModelExporter {
     private byte[] computeFileHash(File file) throws IOException {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256"); //$NON-NLS-1$
-            try (InputStream is = Files.newInputStream(file.toPath())) {
-                byte[] buffer = new byte[8192];
+            // Use larger buffer (64KB) for better disk I/O throughput
+            try (InputStream is = new java.io.BufferedInputStream(Files.newInputStream(file.toPath()), 65536)) {
+                byte[] buffer = new byte[65536];
                 int bytesRead;
                 while ((bytesRead = is.read(buffer)) != -1) {
                     digest.update(buffer, 0, bytesRead);
