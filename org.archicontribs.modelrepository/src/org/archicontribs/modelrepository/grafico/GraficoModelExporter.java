@@ -7,11 +7,14 @@ package org.archicontribs.modelrepository.grafico;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -170,10 +173,10 @@ public class GraficoModelExporter {
         int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
         ExecutorService executor = Executors.newFixedThreadPool(maxThreads);
         
-        // Cache for file contents to avoid re-reading
-        Map<File, byte[]> existingContentCache = new ConcurrentHashMap<>();
+        // Cache for file content hashes (SHA-256) to avoid keeping full content in memory
+        Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
         
-        // Pre-read existing files in parallel for comparison
+        // Pre-compute hashes of existing files in parallel for comparison
         progress.subTask(Messages.GraficoModelExporter_4);
         List<Future<?>> readFutures = new ArrayList<>();
         for(Resource resource : fResourceSet.getResources()) {
@@ -184,7 +187,10 @@ public class GraficoModelExporter {
             if (file.exists()) {
                 readFutures.add(executor.submit(() -> {
                     try {
-                        existingContentCache.put(file, Files.readAllBytes(file.toPath()));
+                        byte[] hash = computeFileHash(file);
+                        if (hash != null) {
+                            existingHashCache.put(file, hash);
+                        }
                     } catch (IOException e) {
                         // File might not exist or be readable, will be written anyway
                     }
@@ -192,7 +198,7 @@ public class GraficoModelExporter {
             }
         }
         
-        // Wait for all reads to complete
+        // Wait for all hash computations to complete
         for (Future<?> future : readFutures) {
             try {
                 future.get();
@@ -235,9 +241,12 @@ public class GraficoModelExporter {
                 resource.save(os, null);
                 byte[] newContent = os.toByteArray();
                 
-                // Only save if content has changed
-                byte[] existingContent = existingContentCache.get(file);
-                if (existingContent == null || !Arrays.equals(newContent, existingContent)) {
+                // Compare hash of new content with cached hash of existing file
+                byte[] existingHash = existingHashCache.get(file);
+                byte[] newHash = computeHash(newContent);
+                
+                // Only save if content has changed (hash mismatch or file doesn't exist)
+                if (existingHash == null || !Arrays.equals(newHash, existingHash)) {
                     file.getParentFile().mkdirs();
                     
                     // Use async file channel for non-blocking write
@@ -440,18 +449,21 @@ public class GraficoModelExporter {
                     return;
                 }
                 
-                // Read existing content if file exists (for comparison)
-                byte[] existingContent = null;
+                // Compute hash of existing file if it exists (for comparison)
+                byte[] existingHash = null;
                 if (task.file.exists()) {
                     try {
-                        existingContent = Files.readAllBytes(task.file.toPath());
+                        existingHash = computeFileHash(task.file);
                     } catch (IOException e) {
                         // Will be overwritten anyway
                     }
                 }
                 
-                // Only write if different
-                if (existingContent == null || !Arrays.equals(task.newBytes, existingContent)) {
+                // Compare with hash of new content
+                byte[] newHash = computeHash(task.newBytes);
+                
+                // Only write if different (hash mismatch or file doesn't exist)
+                if (existingHash == null || !Arrays.equals(newHash, existingHash)) {
                     task.file.getParentFile().mkdirs();
                     
                     // Use async file channel for non-blocking write
@@ -544,6 +556,46 @@ public class GraficoModelExporter {
         // Delete the folder if it's empty
         if (folder.exists() && folder.list().length == 0) {
             folder.delete();
+        }
+    }
+    
+    /**
+     * Compute SHA-256 hash of a file using streaming to avoid loading entire file into memory.
+     * 
+     * @param file The file to hash
+     * @return The SHA-256 hash as byte array, or null if hashing fails
+     * @throws IOException if file cannot be read
+     */
+    private byte[] computeFileHash(File file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256"); //$NON-NLS-1$
+            try (InputStream is = Files.newInputStream(file.toPath())) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = is.read(buffer)) != -1) {
+                    digest.update(buffer, 0, bytesRead);
+                }
+            }
+            return digest.digest();
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is always available in Java, this should never happen
+            throw new RuntimeException("SHA-256 algorithm not available", e); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Compute SHA-256 hash of a byte array.
+     * 
+     * @param data The data to hash
+     * @return The SHA-256 hash as byte array
+     */
+    private byte[] computeHash(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256"); //$NON-NLS-1$
+            return digest.digest(data);
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 is always available in Java, this should never happen
+            throw new RuntimeException("SHA-256 algorithm not available", e); //$NON-NLS-1$
         }
     }
 }
