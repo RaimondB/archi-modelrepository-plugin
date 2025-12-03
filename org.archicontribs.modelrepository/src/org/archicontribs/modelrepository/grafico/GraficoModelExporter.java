@@ -386,11 +386,10 @@ public class GraficoModelExporter {
             return;
         }
         
-        // Process tasks in parallel batches using ForkJoinPool for CPU-bound work
-        int cpuThreads = Runtime.getRuntime().availableProcessors();
-        ForkJoinPool cpuExecutor = new ForkJoinPool(cpuThreads);
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        final int totalTasks = tasks.size();
+        // PHASE 1: Create all directories in parallel using virtual threads (I/O-bound)
+        // This is the only parallelizable part - directory creation has no synchronization needs
+        ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        List<CompletableFuture<Void>> dirFutures = new ArrayList<>();
         
         try {
             for (int i = 0; i < tasks.size(); i += BATCH_SIZE) {
@@ -398,40 +397,37 @@ public class GraficoModelExporter {
                 final int end = Math.min(i + BATCH_SIZE, tasks.size());
                 final List<ResourceCreationTask> batch = tasks.subList(start, end);
                 
+                // Batch directory creation - only I/O, no shared state
                 CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
                     for (ResourceCreationTask task : batch) {
-                        // Create directories (I/O but fast for local filesystem)
                         task.file.getParentFile().mkdirs();
-                        
-                        // Create and configure resource (CPU-bound)
-                        // Note: ResourceSet operations are synchronized internally
-                        try {
-                            createAndSaveResource(task.file, task.object);
-                        } catch (IOException e) {
-                            throw new RuntimeException(e);
-                        }
                     }
-                }, cpuExecutor)
-                .thenRun(() -> {
-                    // Report progress after batch completes
-                    fProgressReporter.incrementBy(batch.size());
-                    fProgressReporter.maybeReport(
-                        count -> NLS.bind(Messages.GraficoModelExporter_3, count, totalModelFiles));
-                });
+                }, ioExecutor);
                 
-                futures.add(batchFuture);
+                dirFutures.add(batchFuture);
             }
             
-            // Wait for all batches to complete
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        } catch (Exception e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
-                throw (IOException) cause.getCause();
-            }
-            throw new IOException("Failed to create resources", e); //$NON-NLS-1$
+            // Wait for all directories to be created
+            CompletableFuture.allOf(dirFutures.toArray(new CompletableFuture[0])).join();
         } finally {
-            cpuExecutor.shutdown();
+            ioExecutor.shutdown();
+        }
+        
+        // PHASE 2: Add all resources to ResourceSet (single-threaded, no synchronization needed)
+        // ResourceSet is not thread-safe, so we do this sequentially
+        // This is fast CPU work - no I/O blocking
+        int processedCount = 0;
+        for (ResourceCreationTask task : tasks) {
+            createAndSaveResource(task.file, task.object);
+            
+            // Report progress periodically (every BATCH_SIZE items)
+            processedCount++;
+            if (processedCount % BATCH_SIZE == 0 || processedCount == tasks.size()) {
+                final int count = processedCount;
+                fProgressReporter.incrementBy(Math.min(BATCH_SIZE, count - ((count / BATCH_SIZE - 1) * BATCH_SIZE)));
+                fProgressReporter.maybeReport(
+                    c -> NLS.bind(Messages.GraficoModelExporter_3, count, totalModelFiles));
+            }
         }
     }
     
@@ -489,47 +485,46 @@ public class GraficoModelExporter {
     
     /**
      * Save the model to Resource.
-     * Thread-safe: synchronizes access to the shared ResourceSet.
+     * This method is now called from a single thread, so no synchronization is needed.
+     * The parallelization happens at the directory creation and file I/O levels,
+     * while ResourceSet operations remain sequential for correctness.
      * 
      * @param file
      * @param object
      * @throws IOException
      */
     private void createAndSaveResource(File file, EObject object) throws IOException {
-        // Synchronize access to fResourceSet since it's not thread-safe
-        synchronized (fResourceSet) {
-            // Update the URIConverter
-            // Map the logical name (filename) to the physical name (path+filename)
-            // Folders must be declared with absolute path or else the 'folder.xml' file is not created
-            // The model object must be declared with relative path or else concepts reference profiles through absolute path (which are gonna be different for each users)
-            URI key = (!(object instanceof IArchimateModel) && file.getName().equals(IGraficoConstants.FOLDER_XML)) ? URI.createFileURI(file.getAbsolutePath()) : URI.createFileURI(file.getName());
-            URI value = URI.createFileURI(file.getAbsolutePath());
-            fResourceSet.getURIConverter().getURIMap().put(key, value);
+        // Update the URIConverter
+        // Map the logical name (filename) to the physical name (path+filename)
+        // Folders must be declared with absolute path or else the 'folder.xml' file is not created
+        // The model object must be declared with relative path or else concepts reference profiles through absolute path (which are gonna be different for each users)
+        URI key = (!(object instanceof IArchimateModel) && file.getName().equals(IGraficoConstants.FOLDER_XML)) ? URI.createFileURI(file.getAbsolutePath()) : URI.createFileURI(file.getName());
+        URI value = URI.createFileURI(file.getAbsolutePath());
+        fResourceSet.getURIConverter().getURIMap().put(key, value);
 
-            // Create a new resource for selected file and add object to persist
-            XMLResource resource = (XMLResource)fResourceSet.createResource(key);
-            
-            // Use UTF-8 and don't start with an XML declaration
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_DECLARE_XML, Boolean.FALSE);
-            
-            // Make the produced XML easy to read
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_FORMATTED, Boolean.TRUE);
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_LINE_WIDTH, Integer.valueOf(5));
-            // Don't use encoded attribute. Needed to have proper references inside Diagrams
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_USE_ENCODED_ATTRIBUTE_STYLE, Boolean.FALSE);
-            
-            // Use cache for efficient saves
-            resource.getDefaultSaveOptions().put(XMLResource.OPTION_CONFIGURATION_CACHE, Boolean.TRUE);
-            
-            // Use UNIX line endings to avoid EOL diffs
-            resource.getDefaultSaveOptions().put(Resource.OPTION_LINE_DELIMITER, "\n"); //$NON-NLS-1$
-
-            // Add the object to the resource
-            resource.getContents().add(object);
-        }
+        // Create a new resource for selected file and add object to persist
+        XMLResource resource = (XMLResource)fResourceSet.createResource(key);
         
-        // Track this file as expected (thread-safe HashSet or synchronized set)
+        // Use UTF-8 and don't start with an XML declaration
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_DECLARE_XML, Boolean.FALSE);
+        
+        // Make the produced XML easy to read
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_FORMATTED, Boolean.TRUE);
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_LINE_WIDTH, Integer.valueOf(5));
+        // Don't use encoded attribute. Needed to have proper references inside Diagrams
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_USE_ENCODED_ATTRIBUTE_STYLE, Boolean.FALSE);
+        
+        // Use cache for efficient saves
+        resource.getDefaultSaveOptions().put(XMLResource.OPTION_CONFIGURATION_CACHE, Boolean.TRUE);
+        
+        // Use UNIX line endings to avoid EOL diffs
+        resource.getDefaultSaveOptions().put(Resource.OPTION_LINE_DELIMITER, "\n"); //$NON-NLS-1$
+
+        // Add the object to the resource
+        resource.getContents().add(object);
+        
+        // Track this file as expected
         expectedFiles.add(file);
     }
       /**
@@ -722,8 +717,10 @@ public class GraficoModelExporter {
         }
     }
     
-    private Set<File> expectedFiles = Collections.synchronizedSet(new HashSet<>());
-    private Set<File> writtenFiles = Collections.synchronizedSet(new HashSet<>());
+    // Use ConcurrentHashMap.newKeySet() for better concurrent scalability than Collections.synchronizedSet()
+    // These sets are accessed from multiple threads during parallel I/O operations
+    private Set<File> expectedFiles = ConcurrentHashMap.newKeySet();
+    private Set<File> writtenFiles = ConcurrentHashMap.newKeySet();
     
     // Buffer size for file operations (64KB for better disk throughput)
     private static final int BUFFER_SIZE = 64 * 1024;

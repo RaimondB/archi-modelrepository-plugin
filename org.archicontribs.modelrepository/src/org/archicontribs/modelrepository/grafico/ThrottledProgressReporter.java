@@ -112,7 +112,7 @@ public class ThrottledProgressReporter {
     
     /**
      * Called by the reporter thread to check for and send progress updates.
-     * This is the ONLY method that touches the UI thread.
+     * This is the ONLY method that touches the UI thread (except for finish()).
      */
     private void pollAndReport() {
         if (progress == null || finished.get()) {
@@ -203,18 +203,20 @@ public class ThrottledProgressReporter {
     }
     
     /**
-     * Set a subtask message with IMMEDIATE update.
-     * Unlike other methods, this updates the UI synchronously for phase announcements.
+     * Set a subtask message for the next poll.
+     * This is NON-BLOCKING - the reporter thread will pick up and display the message.
      * Use this for major phase transitions (e.g., "Reading files...", "Writing files...").
+     * 
+     * <p>Note: Unlike direct IProgressMonitor.subTask() calls, this does NOT immediately
+     * update the UI. The message will appear on the next poll (within 250ms by default).
+     * This ensures worker threads never block on UI synchronization.</p>
      * 
      * @param message The subtask message to display
      */
     public void subTask(String message) {
-        if (message != null && progress != null) {
-            // Update message generator for subsequent polls
+        if (message != null) {
+            // Set message generator for next poll - NON-BLOCKING
             messageGenerator.set(count -> message);
-            // IMMEDIATE update for phase announcements
-            progress.subTask(message);
         }
     }
     
@@ -234,37 +236,47 @@ public class ThrottledProgressReporter {
      * This method BLOCKS until the final report is sent and the reporter thread is stopped.
      * Call this at the end of processing.
      * 
+     * <p>The final UI update is scheduled on the reporter thread to maintain the invariant
+     * that only the reporter thread touches the UI.</p>
+     * 
      * @param finalMessage The final status message, or null for none
      */
     public void finish(String finalMessage) {
-        // Signal completion
-        finished.set(true);
+        if (finished.getAndSet(true)) {
+            // Already finished - avoid double finishing
+            return;
+        }
         
-        // Stop the reporter thread
+        if (progress == null) {
+            reporterThread.shutdown();
+            return;
+        }
+        
+        // Schedule the final update on the reporter thread
+        // This ensures only the reporter thread touches the UI
+        final String message = finalMessage;
+        reporterThread.execute(() -> {
+            // Report any remaining work
+            long currentCount = processedCount.sum();
+            int remaining = totalItems - (int) lastReportedCount;
+            
+            if (remaining > 0) {
+                progress.worked(remaining);
+                lastReportedCount = totalItems;
+            }
+            
+            if (message != null) {
+                progress.subTask(message);
+            }
+        });
+        
+        // Now shutdown and wait for the final update to complete
         reporterThread.shutdown();
         try {
             reporterThread.awaitTermination(1, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        
-        if (progress == null) {
-            return;
-        }
-        
-        // Report any remaining work on the current thread
-        long currentCount = processedCount.sum();
-        int remaining = totalItems - (int) lastReportedCount;
-        
-        if (remaining > 0) {
-            progress.worked(remaining);
-        }
-        
-        if (finalMessage != null) {
-            progress.subTask(finalMessage);
-        }
-        
-        lastReportedCount = totalItems;
     }
     
     /**
