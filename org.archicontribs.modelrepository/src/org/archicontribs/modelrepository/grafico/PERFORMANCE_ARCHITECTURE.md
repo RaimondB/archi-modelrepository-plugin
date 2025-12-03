@@ -209,6 +209,75 @@ void writeFiles(List<WriteTask> tasks, ExecutorService ioExecutor) {
 }
 ```
 
+### Pattern D: Direct Async I/O with CountDownLatch (Preferred for Bulk Operations)
+
+**Use this pattern instead of wrapping `AsynchronousFileChannel` operations in `CompletableFuture`
+when you have many I/O operations with simple completion actions.**
+
+```java
+void writeFilesDirect(List<WriteTask> tasks) throws IOException {
+    CountDownLatch latch = new CountDownLatch(tasks.size());
+    List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
+    
+    for (WriteTask task : tasks) {
+        writeFileAsyncDirect(task.file, task.content, latch, exceptions);
+    }
+    
+    latch.await();  // Wait for all to complete
+    
+    if (!exceptions.isEmpty()) {
+        throw exceptions.get(0);
+    }
+}
+
+// Direct async I/O - no CompletableFuture wrapper
+private void writeFileAsyncDirect(File file, byte[] data, 
+        CountDownLatch latch, List<IOException> exceptions) {
+    try {
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+            file.toPath(), CREATE, WRITE, TRUNCATE_EXISTING);
+        
+        channel.write(buffer, 0, null, new CompletionHandler<Integer, Void>() {
+            @Override
+            public void completed(Integer result, Void attachment) {
+                try { channel.close(); } catch (IOException e) { exceptions.add(e); }
+                finally { latch.countDown(); }
+            }
+            
+            @Override
+            public void failed(Throwable exc, Void attachment) {
+                try { channel.close(); } catch (IOException e) { /* ignore */ }
+                exceptions.add(exc instanceof IOException ? (IOException) exc : new IOException(exc));
+                latch.countDown();
+            }
+        });
+    } catch (IOException e) {
+        exceptions.add(e);
+        latch.countDown();
+    }
+}
+```
+
+**Why this is more efficient than CompletableFuture wrapping:**
+
+| Aspect | CompletableFuture Wrapper | Direct CountDownLatch |
+|--------|---------------------------|------------------------|
+| Object allocation | ~200 bytes per future | Single latch for all ops |
+| GC pressure | 30,000 files = 6MB+ | Minimal |
+| Synchronization | State machine overhead | Simple atomic decrement |
+| Callback path | Future completion → thenXxx chain | Direct to latch.countDown() |
+
+**When to use this pattern:**
+- Firing many async I/O operations of the same type (reads or writes)
+- Completion action is simple (store result, collect errors)
+- No need for async chaining (thenApply, thenCompose, etc.)
+
+**When to still use CompletableFuture:**
+- Need async chaining (read → CPU process → write)
+- Need to combine results from multiple async sources
+- Complex error handling with recovery
+
 ## Performance Targets
 
 | Metric | Target | Notes |
