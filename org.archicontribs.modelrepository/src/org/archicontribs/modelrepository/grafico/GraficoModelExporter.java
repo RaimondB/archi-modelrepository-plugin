@@ -8,7 +8,6 @@ package org.archicontribs.modelrepository.grafico;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
@@ -17,15 +16,12 @@ import java.nio.file.Files;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -138,13 +134,12 @@ public class GraficoModelExporter {
             return;
         }
         
-        // Count total work across ALL phases upfront: images + model files (hash + write)
+        // Count total work across ALL phases upfront: images + model files
         // This allows a SINGLE shared progress reporter across all phases
         int imageCount = countImages();
         int modelFileCount = countModelElements();
-        // Total work = images + hashing existing files + writing resources
-        // We estimate existing files to hash as roughly equal to model elements
-        int totalWork = imageCount + modelFileCount + modelFileCount;
+        // Total work = images + processing model files (merged read/serialize/hash/write pipeline)
+        int totalWork = imageCount + modelFileCount;
         
         // Store counts as final for use in lambdas
         final int totalImages = imageCount;
@@ -184,34 +179,16 @@ public class GraficoModelExporter {
             fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_3, 0, totalModelFiles));
             createAndSaveResourceForFolder(copy, modelFolder, totalModelFiles);
 
-            // Now save all Resources using ForkJoinPool for CPU work with batching
+            // MERGED PIPELINE: Read existing → Serialize → Hash both → Write if different
+            // This is more efficient than separate hash and write phases because:
+            // 1. Avoids storing all hashes in memory (ConcurrentHashMap overhead)
+            // 2. Writes immediately while serialized content is still in memory
+            // 3. Single pass through resources instead of two passes
+            // 
             // ForkJoinPool is optimal for CPU-bound work (XML serialization, hashing) - matches CPU cores
             // Batching reduces CompletableFuture overhead (30,000 files -> ~300 futures)
             int cpuThreads = Runtime.getRuntime().availableProcessors();
             ForkJoinPool cpuExecutor = new ForkJoinPool(cpuThreads);
-            
-            // Cache for file content hashes (SHA-256) to avoid keeping full content in memory
-            Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
-            
-            // Collect all files that need hashing first
-            fProgressReporter.subTask(Messages.GraficoModelExporter_7);
-            List<File> filesToHash = new ArrayList<>();
-            for(Resource resource : fResourceSet.getResources()) {
-                URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-                String filePath = uri.toFileString();
-                File file = new File(filePath);
-                if (file.exists()) {
-                    filesToHash.add(file);
-                }
-            }
-            
-            // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
-            // Within each batch: start all async reads, then process results as they complete
-            List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
-            final int totalFilesToHash = filesToHash.size();
-            
-            // Announce the "reading existing files" phase
-            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_4, 0, totalFilesToHash));
             
             // Collect all resources with their target files first (quick, sequential)
             List<ResourceWriteTask> writeTasks = new ArrayList<>();
@@ -219,61 +196,9 @@ public class GraficoModelExporter {
                 URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
                 String filePath = uri.toFileString();
                 File file = new File(filePath);
-                writeTasks.add(new ResourceWriteTask(resource, file, null)); // Hash filled in later
+                writeTasks.add(new ResourceWriteTask(resource, file, null));
             }
             int totalResources = writeTasks.size();
-            
-            for (int i = 0; i < filesToHash.size(); i += BATCH_SIZE) {
-                final int start = i;
-                final int end = Math.min(i + BATCH_SIZE, filesToHash.size());
-                final List<File> batch = filesToHash.subList(start, end);
-                
-                // ONE future per batch - starts async reads for all files, then processes results
-                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                    // Start all async reads for this batch
-                    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
-                    for (File file : batch) {
-                        CompletableFuture<Void> readFuture = readFileAsync(file)
-                            .thenAcceptAsync(bytes -> {
-                                if (bytes != null) {
-                                    byte[] hash = computeHash(bytes);
-                                    if (hash != null) {
-                                        existingHashCache.put(file, hash);
-                                    }
-                                }
-                            }, cpuExecutor);
-                        batchReads.add(readFuture);
-                    }
-                    // Wait for all reads in this batch to complete
-                    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-                }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
-                .thenRun(() -> {
-                    // Report progress after batch completes - reduces UI thread contention
-                    fProgressReporter.incrementBy(batch.size());
-                    fProgressReporter.maybeReport(
-                        count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
-                });
-                
-                hashFutures.add(batchFuture);
-            }
-            
-            // Wait for all hash computations to complete
-            try {
-                CompletableFuture.allOf(hashFutures.toArray(new CompletableFuture[0])).join();
-            } catch (Exception e) {
-                // Continue with export even if some hashes failed
-            }
-            
-            // Check for cancellation
-            if (fProgressReporter.isCanceled()) {
-                cpuExecutor.shutdown();
-                return;
-            }
-            
-            // Update writeTasks with the computed hashes
-            for (ResourceWriteTask task : writeTasks) {
-                task.existingHash = existingHashCache.get(task.file);
-            }
             
             // Serialize resources using CPU executor, write files using virtual threads
             List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
@@ -284,11 +209,12 @@ public class GraficoModelExporter {
                 return;
             }
             
-            // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
-            // Within each batch: serialize all (CPU), then start all async writes directly (no Future wrapping)
-            List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
+            // MERGED BATCHING: One CompletableFuture per batch (30,000 files -> ~300 futures)
+            // Each batch: read existing files → serialize → hash compare → write if changed
+            // This keeps serialized content in memory only until write completes
+            List<CompletableFuture<Void>> pipelineFutures = new ArrayList<>();
             
-            // Announce the "writing resources" phase
+            // Announce the merged phase
             fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_5, 0, totalResources));
             
             for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
@@ -296,36 +222,56 @@ public class GraficoModelExporter {
                 final int end = Math.min(i + BATCH_SIZE, writeTasks.size());
                 final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
                 
-                // ONE future per batch - serializes all (CPU), then fires async writes directly
+                // ONE future per batch - handles entire pipeline: read → serialize → hash → write
                 CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                    // First pass: CPU-bound serialization and hash comparison
+                    // STEP 1: Start async reads for all existing files in batch
+                    // This fires off all I/O requests in parallel
+                    List<CompletableFuture<byte[]>> existingContentFutures = new ArrayList<>();
+                    for (ResourceWriteTask task : batch) {
+                        if (task.file.exists()) {
+                            existingContentFutures.add(readFileAsync(task.file));
+                        } else {
+                            existingContentFutures.add(CompletableFuture.completedFuture(null));
+                        }
+                    }
+                    
+                    // Wait for all reads to complete (disk I/O happens in parallel)
+                    CompletableFuture.allOf(existingContentFutures.toArray(new CompletableFuture[0])).join();
+                    
+                    // STEP 2: Serialize and compare content directly (CPU-bound)
+                    // Since we have both existing and new content in memory, direct comparison
+                    // is faster than computing SHA-256 hashes (avoids ~2000 CPU cycles per file)
                     List<FileWriteRequest> writeRequests = new ArrayList<>();
                     
-                    for (ResourceWriteTask task : batch) {
+                    for (int j = 0; j < batch.size(); j++) {
+                        ResourceWriteTask task = batch.get(j);
                         try {
+                            // Get existing content (already read async)
+                            byte[] existingContent = existingContentFutures.get(j).join();
+                            
                             // CPU-bound: serialize to byte array
                             ByteArrayOutputStream os = new ByteArrayOutputStream(4096);
                             task.resource.save(os, null);
                             byte[] newContent = os.toByteArray();
                             
-                            // CPU-bound: compute hash and check if content changed
-                            byte[] newHash = computeHash(newContent);
-                            if (task.existingHash == null || !Arrays.equals(newHash, task.existingHash)) {
-                                // Content changed - queue for async write
+                            // Direct content comparison - faster than hashing when both are in memory
+                            if (!Arrays.equals(existingContent, newContent)) {
+                                // Content changed - queue for async write (content still in memory)
                                 task.file.getParentFile().mkdirs();
                                 writtenFiles.add(task.file);
                                 writeRequests.add(new FileWriteRequest(task.file, newContent));
                             }
+                            // If unchanged, newContent is released immediately (no storage)
                         } catch (IOException ex) {
                             exceptions.add(ex);
                         }
                     }
                     
                     if (writeRequests.isEmpty()) {
-                        return null; // No writes needed
+                        return null; // No writes needed for this batch
                     }
                     
-                    // Second pass: fire async writes directly using CountDownLatch for synchronization
+                    // STEP 3: Fire async writes directly using CountDownLatch
                     CountDownLatch writeLatch = new CountDownLatch(writeRequests.size());
                     
                     for (FileWriteRequest req : writeRequests) {
@@ -348,12 +294,12 @@ public class GraficoModelExporter {
                         count -> NLS.bind(Messages.GraficoModelExporter_5, count, totalResources));
                 });
                 
-                writeFutures.add(batchFuture);
+                pipelineFutures.add(batchFuture);
             }
             
-            // Wait for all writes to complete
+            // Wait for all pipeline operations to complete
             try {
-                CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0])).join();
+                CompletableFuture.allOf(pipelineFutures.toArray(new CompletableFuture[0])).join();
             } catch (Exception e) {
                 Throwable cause = e.getCause();
                 if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
@@ -585,7 +531,7 @@ public class GraficoModelExporter {
                         final File targetFile = file;
                         final byte[] contentToWrite = newBytes;
                         
-                        // Read existing file hash (I/O), compute new hash (CPU), compare, write if needed (I/O)
+                        // Read existing file (I/O), compare content directly, write if needed (I/O)
                         CompletableFuture<Void> future = CompletableFuture
                             .supplyAsync(() -> {
                                 // I/O: Read existing file if it exists
@@ -595,12 +541,9 @@ public class GraficoModelExporter {
                                 return null;
                             }, ioExecutor)
                             .thenApplyAsync(existingBytes -> {
-                                // CPU: Compute hashes
-                                byte[] existingHash = existingBytes != null ? computeHash(existingBytes) : null;
-                                byte[] newHash = computeHash(contentToWrite);
-                                // Return null if content unchanged
-                                if (existingHash != null && Arrays.equals(existingHash, newHash)) {
-                                    return null;
+                                // Direct content comparison - faster than hashing when both are in memory
+                                if (Arrays.equals(existingBytes, contentToWrite)) {
+                                    return null; // Content unchanged
                                 }
                                 return contentToWrite;
                             }, cpuExecutor)
@@ -998,24 +941,5 @@ public class GraficoModelExporter {
      */
     private boolean isEmptyDirectory(File dir) {
         return isEmptyDirectory(dir.toPath());
-    }
-    
-    /**
-     * Compute SHA-256 hash of a byte array.
-     * 
-     * @param data The data to hash
-     * @return The SHA-256 hash as byte array, or null if data is null
-     */
-    private byte[] computeHash(byte[] data) {
-        if (data == null) {
-            return null;
-        }
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256"); //$NON-NLS-1$
-            return digest.digest(data);
-        } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is always available in Java, this should never happen
-            throw new RuntimeException("SHA-256 algorithm not available", e); //$NON-NLS-1$
-        }
     }
 }

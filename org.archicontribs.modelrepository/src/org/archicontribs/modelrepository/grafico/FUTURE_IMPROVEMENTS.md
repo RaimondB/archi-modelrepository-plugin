@@ -109,32 +109,37 @@ try {
 ---
 
 ### 6. Merge Hash Computation and Write into Single Pipeline (Exporter)
-**Status:** Not Started  
-**Impact:** High - Reduce memory pressure  
+**Status:** ✅ Completed (2025-12-03)  
+**Impact:** High - Reduce memory pressure and CPU overhead  
 **Effort:** Medium  
 
-Current flow: serialize → compute hash → compare → write if different
+Previous flow: 
+1. Read all existing files → compute hashes → store in `existingHashCache` (ConcurrentHashMap)
+2. Serialize all → compute new hashes → compare with cached hash → write if different
 
-Proposed flow: serialize → compute hash → if different, write immediately (data still in memory)
+New merged pipeline (per batch):
+1. Read existing files async (parallel I/O)
+2. Serialize resources (CPU)  
+3. **Direct byte array comparison** - no hashing needed since both are in memory
+4. Write immediately if different (async I/O) - content still in memory
 
-This avoids re-serializing or caching the byte[] content.
+Benefits:
+- Avoids storing all hashes in `ConcurrentHashMap` (30,000 entries × 32 bytes + object overhead)
+- **Eliminates SHA-256 computation entirely** (~2000 CPU cycles saved per file)
+- Writes immediately while serialized content is still in memory
+- Single pass through resources instead of two separate phases
+- Better memory locality - data stays hot in CPU cache
+- Removed `MessageDigest` and `NoSuchAlgorithmException` imports
 
 ---
 
 ### 7. Pre-size ConcurrentHashMap for Hash Cache (Exporter)
-**Status:** Not Started  
-**Impact:** Medium-High - Reduce rehashing overhead  
-**Effort:** Low  
+**Status:** ❌ No Longer Applicable  
+**Impact:** N/A  
+**Effort:** N/A  
 
-```java
-// Current
-Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
-
-// Improved - pre-size to expected capacity
-int expectedFiles = 30000;
-int cpuCount = Runtime.getRuntime().availableProcessors();
-Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>(expectedFiles, 0.75f, cpuCount);
-```
+This optimization is no longer relevant because the merged pipeline (#6) eliminated the hash cache entirely. 
+Direct byte array comparison is used instead of SHA-256 hashing.
 
 ---
 
@@ -335,4 +340,6 @@ Write-VolumeCache C:
 
 | Date | Item | Status | Notes |
 |------|------|--------|-------|
+| 2025-12-03 | #6 Merge Hash/Write Pipeline | ✅ Completed | Merged phases + eliminated hashing via direct byte comparison |
+| 2025-12-03 | #7 Pre-size Hash Cache | ❌ N/A | No longer applicable - hash cache eliminated |
 | 2025-12-03 | Document created | N/A | Initial 20 optimization opportunities identified |
