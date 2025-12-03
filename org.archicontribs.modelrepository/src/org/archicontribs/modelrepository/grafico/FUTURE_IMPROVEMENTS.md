@@ -17,54 +17,38 @@ This document tracks identified optimization opportunities for `GraficoModelExpo
 ## High Impact Optimizations
 
 ### 1. Avoid Serialization When Content Unchanged (Exporter)
-**Status:** Not Started  
-**Impact:** High - Skip CPU-intensive XML serialization entirely  
-**Effort:** Medium  
+**Status:** ❌ Not Feasible  
+**Impact:** N/A  
+**Effort:** N/A  
 
-Currently, every element is serialized to XML before comparing hashes. If we maintain a hash of the EMF object state (or track dirty flags), we could skip serialization for unchanged elements.
+~~Currently, every element is serialized to XML before comparing hashes. If we maintain a hash of the EMF object state (or track dirty flags), we could skip serialization for unchanged elements.~~
 
-**Implementation approach:**
-- Track EMF model change notifications
-- Maintain element-level dirty flags
-- Only serialize elements marked as dirty
+**Why not feasible:**
+EMF objects are not tracked across exports - the exporter works on a **copy** of the model (`EcoreUtil.copy(fModel)`), so there's no persistent state to track changes. Each export starts fresh with new EMF object instances, making dirty-flag tracking impossible without significant architectural changes to the export process.
 
 ---
 
 ### 2. ThreadLocal MessageDigest (Exporter)
-**Status:** Not Started  
-**Impact:** High - Eliminate lock contention on hash computation  
-**Effort:** Low  
+**Status:** ❌ No Longer Applicable  
+**Impact:** N/A  
+**Effort:** N/A  
 
-`MessageDigest.getInstance("SHA-256")` is called per-file. Use `ThreadLocal<MessageDigest>` to reuse instances:
+~~`MessageDigest.getInstance("SHA-256")` is called per-file. Use `ThreadLocal<MessageDigest>` to reuse instances.~~
 
-```java
-private static final ThreadLocal<MessageDigest> SHA256_DIGEST = ThreadLocal.withInitial(() -> {
-    try {
-        return MessageDigest.getInstance("SHA-256");
-    } catch (NoSuchAlgorithmException e) {
-        throw new RuntimeException(e);
-    }
-});
-
-private byte[] computeHash(byte[] data) {
-    MessageDigest digest = SHA256_DIGEST.get();
-    digest.reset();
-    return digest.digest(data);
-}
-```
+**Why not applicable:**
+The merged pipeline (#6) eliminated SHA-256 hashing entirely. We now use direct `Arrays.equals()` byte comparison since both existing and new content are in memory simultaneously. No `MessageDigest` is used anymore.
 
 ---
 
 ### 3. Pre-compute Element-to-File Mapping (Exporter)
-**Status:** Not Started  
-**Impact:** High - Reduce repeated path calculations  
-**Effort:** Medium  
+**Status:** ✅ Already Implemented  
+**Impact:** N/A  
+**Effort:** N/A  
 
-`createElementFile()` is called twice per element (once for hash check, once for write). Cache the `File` objects:
+~~`createElementFile()` is called twice per element (once for hash check, once for write). Cache the `File` objects.~~
 
-```java
-Map<String, File> elementFileCache = new HashMap<>(elementCount);
-```
+**Why already implemented:**
+The merged pipeline (#6) collects all `ResourceWriteTask` objects upfront, each containing the pre-computed `File`. The file path is calculated once and reused throughout the read → serialize → compare → write pipeline.
 
 ---
 
@@ -87,24 +71,20 @@ latch.await();
 ---
 
 ### 5. Limit Concurrent File Handles (Both)
-**Status:** Not Started  
-**Impact:** High - Prevent file handle exhaustion  
-**Effort:** Medium  
+**Status:** ✅ Already Handled  
+**Impact:** N/A  
+**Effort:** N/A  
 
-With 30,000 files, opening all `AsynchronousFileChannel`s simultaneously can exhaust OS file handles. Add a semaphore:
+~~With 30,000 files, opening all `AsynchronousFileChannel`s simultaneously can exhaust OS file handles. Add a semaphore.~~
 
-```java
-private static final int MAX_CONCURRENT_FILES = 256;
-private final Semaphore fileHandleSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
+**Why already handled:**
 
-// In async methods:
-fileHandleSemaphore.acquire();
-try {
-    // ... async file operation ...
-} finally {
-    fileHandleSemaphore.release();  // In completion handler
-}
-```
+1. **Batching limits concurrency**: We process 100 files per batch (`BATCH_SIZE = 100`)
+2. **ForkJoinPool limits parallelism**: Only `availableProcessors()` batches run concurrently (~8 cores = ~800 max concurrent files)
+3. **OS-level management**: `AsynchronousFileChannel` uses I/O Completion Ports (Windows) or internal thread pools (Linux/macOS) that inherently manage resources efficiently
+4. **Sequential batch waits**: Each batch waits for its I/O to complete before the next batch's results are processed
+
+With typical OS file handle limits of 4096+, our ~800 peak concurrent operations are well within safe bounds.
 
 ---
 
@@ -223,15 +203,27 @@ private static final Map<String, Object> SAVE_OPTIONS = Map.of(
 ---
 
 ### 13. Streaming XML Serialization (Exporter)
-**Status:** Not Started  
-**Impact:** Medium - Reduce memory for large elements  
-**Effort:** Medium  
+**Status:** ❌ Not Applicable  
+**Impact:** N/A  
+**Effort:** N/A  
 
-Instead of serializing to `byte[]` then writing, stream directly to `AsynchronousFileChannel`:
+~~Instead of serializing to `byte[]` then writing, stream directly to `AsynchronousFileChannel`.~~
 
-```java
-// Requires custom XMLResource output stream that wraps async channel
-```
+**Why not applicable:**
+
+The in-memory serialization is **required** for our change-detection strategy. The current flow is:
+
+1. Serialize to `byte[]` in memory
+2. Compare with existing file content (`Arrays.equals()`)
+3. **Only write if content differs**
+
+This prevents unnecessary file writes that would:
+- Trigger virus scanners (significant latency on Windows)
+- Trigger file watchers (IDE, git, backup tools)
+- Update file modification timestamps unnecessarily
+- Cause unnecessary disk I/O
+
+Streaming directly to disk would bypass comparison and always write, defeating the purpose of our optimization.
 
 ---
 
@@ -340,6 +332,12 @@ Write-VolumeCache C:
 
 | Date | Item | Status | Notes |
 |------|------|--------|-------|
+| 2025-12-04 | #13 Streaming Serialization | ❌ N/A | In-memory required for change detection before write |
+| 2025-12-04 | #5 Limit File Handles | ✅ Already Handled | Batching + ForkJoinPool + OS-level I/O management |
+| 2025-12-04 | #1 Dirty Flag Tracking | ❌ Not Feasible | EMF objects are copies, not tracked across exports |
+| 2025-12-04 | #2 ThreadLocal MessageDigest | ❌ N/A | Hashing eliminated - using direct byte comparison |
+| 2025-12-04 | #3 Pre-compute File Mapping | ✅ Already Done | Merged pipeline stores File in ResourceWriteTask |
+| 2025-12-04 | Cleanup optimization | ✅ Completed | Changed Set<File> to Set<Path> with normalization |
 | 2025-12-03 | #6 Merge Hash/Write Pipeline | ✅ Completed | Merged phases + eliminated hashing via direct byte comparison |
 | 2025-12-03 | #7 Pre-size Hash Cache | ❌ N/A | No longer applicable - hash cache eliminated |
 | 2025-12-03 | Document created | N/A | Initial 20 optimization opportunities identified |
