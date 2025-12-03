@@ -119,18 +119,35 @@ private byte[] computeHash(byte[] data) {
 
 ### 7. Progress Reporting
 
-Minimize UI thread updates:
+**Use `ThrottledProgressReporter` for time-based throttling** to minimize UI thread contention:
 
 ```java
-AtomicInteger processed = new AtomicInteger(0);
-final int total = files.size();
+// Create throttled reporter - updates at most every 250ms or every 2000 files
+ThrottledProgressReporter reporter = new ThrottledProgressReporter(
+    progress.split(totalFiles), totalFiles);
 
-// Report every 1000 files, not every file
-int count = processed.incrementAndGet();
-if (count % 1000 == 0 || count == total) {
-    progress.subTask(String.format("Processing %d of %d files...", count, total));
-}
+// In async callbacks (called from many threads):
+reporter.incrementAndMaybeReport(
+    count -> String.format("Processing %d of %d files...", count, totalFiles));
+
+// At end - ensures final progress is reported:
+reporter.finish(null);
 ```
+
+**Why not per-file or even per-1000-files updates?**
+
+- `progress.subTask()` synchronizes with the UI thread, causing blocking
+- With 30,000 files across 8 CPU cores, many threads contend for UI updates
+- Time-based throttling (250ms) provides smooth UI updates without contention
+- `LongAdder` provides lock-free counting with minimal cache-line bouncing
+
+**ThrottledProgressReporter benefits:**
+
+- Uses `LongAdder` for lock-free counting (vs `AtomicInteger` cache-line bouncing)
+- Time-based throttling: updates UI at most every 250ms
+- Count-based throttling: updates only after 2000 files processed  
+- Double-checked locking: only one thread updates UI at a time
+- Thread-safe for use in async completion handlers
 
 ## Implementation Patterns
 
@@ -248,7 +265,7 @@ for (List<File> batch : batches) {
 - [ ] All file writes use `AsynchronousFileChannel` or virtual threads
 - [ ] CPU work (serialization, hashing) uses `ForkJoinPool` sized to CPU cores
 - [ ] Files batched in groups of 100 to reduce `CompletableFuture` overhead
-- [ ] Progress reported every 1000 files, not per-file
+- [ ] Progress uses `ThrottledProgressReporter` for time-based updates (every 250ms)
 - [ ] SHA-256 hashes used instead of full content caching
 - [ ] 64KB buffer size for I/O operations
 - [ ] Executors properly shut down in finally blocks

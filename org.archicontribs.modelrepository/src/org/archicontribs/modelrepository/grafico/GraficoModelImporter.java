@@ -24,7 +24,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -240,11 +239,15 @@ public class GraficoModelImporter {
         
         // Store results in a concurrent map
         Map<String, byte[]> imageData = new ConcurrentHashMap<>();
-        AtomicInteger filesProcessed = new AtomicInteger(0);
         final int totalFiles = filesToLoad.size();
         
         // Use ForkJoinPool for coordinating batches
         ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+        
+        // Use throttled progress reporter to minimize UI thread contention
+        // Updates at most every 250ms or every 2000 files
+        ThrottledProgressReporter imageProgressReporter = new ThrottledProgressReporter(
+            progress.split(filesToLoad.size()), totalFiles);
         
         try {
             // TRUE BATCHING: One CompletableFuture per batch (reduces futures overhead)
@@ -267,11 +270,9 @@ public class GraficoModelImporter {
                                     imageData.put(path.getFileName().toString(), bytes);
                                 }
                                 
-                                // Report progress every 1000 files
-                                int count = filesProcessed.incrementAndGet();
-                                if (count % 1000 == 0) {
-                                    progress.subTask(String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
-                                }
+                                // Throttled progress update - minimizes UI thread sync
+                                imageProgressReporter.incrementAndMaybeReport(
+                                    count -> String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
                             });
                         
                         batchReads.add(readFuture);
@@ -317,7 +318,8 @@ public class GraficoModelImporter {
                 throw new IOException("Failed to load images", e); //$NON-NLS-1$
             }
             
-            progress.worked(filesToLoad.size());
+            // Ensure all image progress is reported
+            imageProgressReporter.finish(null);
         } finally {
             cpuExecutor.shutdown();
         }
@@ -527,8 +529,12 @@ public class GraficoModelImporter {
             
             // Use a concurrent map to store loaded elements
             Map<Path, EObject> loadedElements = new ConcurrentHashMap<>();
-            AtomicInteger filesProcessed = new AtomicInteger(0);
             final int totalFiles = filesToLoad.size();
+            
+            // Use throttled progress reporter to minimize UI thread contention
+            // Updates at most every 250ms or every 2000 files
+            ThrottledProgressReporter loadProgressReporter = new ThrottledProgressReporter(
+                progress.split(filesInThisFolder), totalFiles);
             
             try {
                 // TRUE BATCHING: One CompletableFuture per batch (reduces 30,000 futures to ~300)
@@ -573,11 +579,9 @@ public class GraficoModelImporter {
                                         loadedElements.put(path, element);
                                     }
                                     
-                                    // Report progress every 1000 files
-                                    int count = filesProcessed.incrementAndGet();
-                                    if (count % 1000 == 0) {
-                                        progress.subTask(String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
-                                    }
+                                    // Throttled progress update - minimizes UI thread sync
+                                    loadProgressReporter.incrementAndMaybeReport(
+                                        count -> String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
                                 });
                             
                             batchReads.add(readFuture);
@@ -598,7 +602,7 @@ public class GraficoModelImporter {
                 try {
                     // Wait with timeout to allow cancellation checks
                     while (!allFutures.isDone()) {
-                        if (progress.isCanceled()) {
+                        if (loadProgressReporter.isCanceled()) {
                             cpuExecutor.shutdownNow();
                             return currentFolder;
                         }
@@ -631,8 +635,8 @@ public class GraficoModelImporter {
                     }
                 }
                 
-                // Report progress once for all files in this folder (batch update)
-                progress.worked(filesInThisFolder);
+                // Ensure all load progress is reported
+                loadProgressReporter.finish(null);
             } finally {
                 cpuExecutor.shutdown();
             }

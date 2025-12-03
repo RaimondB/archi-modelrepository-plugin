@@ -29,7 +29,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
@@ -181,8 +180,12 @@ public class GraficoModelExporter {
         // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
         // Within each batch: start all async reads, then process results as they complete
         List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
-        AtomicInteger filesProcessed = new AtomicInteger(0);
         final int totalFilesToHash = filesToHash.size();
+        
+        // Use throttled progress reporter to minimize UI thread contention
+        // Updates at most every 250ms or every 2000 files
+        ThrottledProgressReporter hashProgressReporter = new ThrottledProgressReporter(
+            progress.split(15), totalFilesToHash);
         
         for (int i = 0; i < filesToHash.size(); i += BATCH_SIZE) {
             final int start = i;
@@ -203,11 +206,9 @@ public class GraficoModelExporter {
                                 }
                             }
                             
-                            // Report progress every 1000 files
-                            int count = filesProcessed.incrementAndGet();
-                            if (count % 1000 == 0) {
-                                progress.subTask(NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
-                            }
+                            // Throttled progress update - minimizes UI thread sync
+                            hashProgressReporter.incrementAndMaybeReport(
+                                count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
                         }, cpuExecutor);
                     batchReads.add(readFuture);
                 }
@@ -224,7 +225,9 @@ public class GraficoModelExporter {
         } catch (Exception e) {
             // Continue with export even if some hashes failed
         }
-        progress.worked(15);
+        
+        // Ensure all hash progress is reported
+        hashProgressReporter.finish(null);
         
         // Check for cancellation
         if (progress.isCanceled()) {
@@ -237,11 +240,13 @@ public class GraficoModelExporter {
         
         int totalResources = fResourceSet.getResources().size();
         progress.subTask(NLS.bind(Messages.GraficoModelExporter_5, totalResources));
-        SubMonitor writeProgress = progress.split(50);
-        writeProgress.setWorkRemaining(totalResources);
+        
+        // Use throttled progress reporter to minimize UI thread contention
+        ThrottledProgressReporter writeProgressReporter = new ThrottledProgressReporter(
+            progress.split(50), totalResources);
         
         // Check for cancellation before starting
-        if (writeProgress.isCanceled()) {
+        if (progress.isCanceled()) {
             cpuExecutor.shutdown();
             return;
         }
@@ -257,7 +262,6 @@ public class GraficoModelExporter {
         
         // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
         // Within each batch: serialize all (CPU), then start all async writes
-        AtomicInteger completed = new AtomicInteger(0);
         List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
         
         for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
@@ -288,19 +292,16 @@ public class GraficoModelExporter {
                     } catch (IOException ex) {
                         exceptions.add(ex);
                     }
+                    
+                    // Throttled progress update - minimizes UI thread sync
+                    writeProgressReporter.incrementAndMaybeReport(
+                        count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalResources)); //$NON-NLS-1$
                 }
                 
                 // Second pass: start all async writes for this batch
                 List<CompletableFuture<Void>> batchWrites = new ArrayList<>();
                 for (FileWriteRequest req : writeRequests) {
                     batchWrites.add(writeFileAsync(req.file, req.content));
-                }
-                
-                // Update progress for all files in batch
-                int done = completed.addAndGet(batch.size());
-                if (done % 1000 < batch.size()) { // Crossed a 1000 boundary
-                    writeProgress.worked(batch.size());
-                    writeProgress.subTask(NLS.bind(Messages.GraficoModelExporter_5, done + " of " + totalResources)); //$NON-NLS-1$
                 }
                 
                 // Return future that completes when all writes are done
@@ -320,8 +321,8 @@ public class GraficoModelExporter {
             }
         }
         
-        // Update remaining progress
-        writeProgress.worked(totalResources % 1000);
+        // Ensure all write progress is reported
+        writeProgressReporter.finish(null);
         
         // Shutdown executor
         cpuExecutor.shutdown();

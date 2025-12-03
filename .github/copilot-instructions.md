@@ -17,7 +17,7 @@ When working on `GraficoModelExporter.java` or `GraficoModelImporter.java`, foll
    - `ForkJoinPool(availableProcessors())` for CPU work (XML serialization, SHA-256 hashing)
    - Virtual threads (`Executors.newVirtualThreadPerTaskExecutor()`) for I/O operations
 3. **Batch Operations**: Group 100 files per `CompletableFuture` to reduce overhead (30,000 files → 300 futures)
-4. **Progress Reporting**: Update UI every 1000 files, not per-file
+4. **Progress Reporting**: Use `ThrottledProgressReporter` for time-based UI updates (every 250ms, not per-file)
 5. **Memory**: Use SHA-256 hashes (32 bytes) instead of caching full file contents
 
 ### ⚠️ Critical: Proper Async Pipelining
@@ -191,6 +191,34 @@ Thread.sleep(5000);
 5. **Progress Monitor Contention**: `AtomicInteger.incrementAndGet()` 30,000 times causes cache line bouncing
    - **Symptom**: Poor multi-core scaling
    - **Fix**: Use `LongAdder` instead of `AtomicInteger` for counters
+
+6. **UI Thread Synchronization**: Calling `progress.subTask()` or `progress.worked()` too frequently blocks worker threads
+   - **Symptom**: Progress dialog freezes, overall slowdown
+   - **Fix**: Use `ThrottledProgressReporter` for time-based throttling (every 250ms max)
+
+### ThrottledProgressReporter Pattern
+
+Use `ThrottledProgressReporter` to minimize UI thread synchronization overhead:
+
+```java
+// Create throttled reporter - updates at most every 250ms or every 2000 files
+ThrottledProgressReporter reporter = new ThrottledProgressReporter(
+    progress.split(totalFiles), totalFiles);
+
+// In async callbacks (called from many threads):
+reporter.incrementAndMaybeReport(
+    count -> String.format("Processing %d of %d files...", count, totalFiles));
+
+// At end - ensures final progress is reported:
+reporter.finish(null);
+```
+
+**Key benefits:**
+- Uses `LongAdder` for lock-free counting (no cache-line bouncing)
+- Time-based throttling: updates UI at most every 250ms
+- Count-based throttling: updates only after 2000 files processed
+- Double-checked locking: only one thread updates UI at a time
+- Thread-safe for use in async completion handlers
 
 ### Recommended Instrumentation
 
