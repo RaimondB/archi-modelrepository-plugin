@@ -165,8 +165,9 @@ public class GraficoModelImporter {
     	
     	// Count total files for the shared progress reporter
     	// This includes model files + image files
-    	int modelFileCount = countFilesRecursively(modelFolder);
-    	int imageFileCount = countFilesInFolder(imagesFolder);
+    	// Uses optimized NIO2 file walking (much faster than File.listFiles())
+    	int modelFileCount = GraficoUtils.countModelFilesRecursively(modelFolder.toPath());
+    	int imageFileCount = GraficoUtils.countFilesInFolder(imagesFolder.toPath());
     	int totalFiles = modelFileCount + imageFileCount;
     	
     	// Create a SINGLE shared progress reporter for all phases
@@ -471,50 +472,6 @@ public class GraficoModelImporter {
 		
 		return model;
 	}
-    
-    /**
-     * Count files recursively in a folder (excluding folder.xml files).
-     * Used for calculating proportional progress.
-     */
-    private int countFilesRecursively(File folder) {
-        if (!folder.isDirectory()) {
-            return 0;
-        }
-        
-        int count = 0;
-        File[] contents = folder.listFiles();
-        if (contents != null) {
-            for (File file : contents) {
-                if (file.isDirectory()) {
-                    count += countFilesRecursively(file);
-                } else if (!file.getName().equals(IGraficoConstants.FOLDER_XML)) {
-                    count++;
-                }
-            }
-        }
-        return count;
-    }
-    
-    /**
-     * Count regular files in a single folder (non-recursive).
-     * Used for counting images folder.
-     */
-    private int countFilesInFolder(File folder) {
-        if (!folder.isDirectory()) {
-            return 0;
-        }
-        
-        int count = 0;
-        File[] contents = folder.listFiles();
-        if (contents != null) {
-            for (File file : contents) {
-                if (file.isFile()) {
-                    count++;
-                }
-            }
-        }
-        return count;
-    }
 	
 	/**
 	 * Load each XML file to recreate original object

@@ -9,11 +9,18 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.eclipse.jgit.errors.ConfigInvalidException;
 import org.eclipse.jgit.lib.ConfigConstants;
@@ -199,5 +206,108 @@ public class GraficoUtils {
         String str = new String(loader.getBytes(), StandardCharsets.UTF_8);
         str = str.replaceAll("\\r?\\n", lineEnding); //$NON-NLS-1$
         Files.write(Paths.get(file.getAbsolutePath()), str.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE);
+    }
+    
+    // ==================== File Counting Methods ====================
+    // These use NIO2 for optimal performance compared to File.listFiles()
+    
+    /**
+     * Count files recursively in a folder, excluding folder.xml files.
+     * Uses NIO2 Files.walkFileTree for optimal performance.
+     * 
+     * <p>This is significantly faster than File.listFiles() because:</p>
+     * <ul>
+     *   <li>Uses native OS directory traversal via NIO2</li>
+     *   <li>Avoids creating File objects for each entry</li>
+     *   <li>Streams directory entries instead of loading all into memory</li>
+     * </ul>
+     * 
+     * @param folder The folder to count files in
+     * @return Number of files (excluding folder.xml files)
+     */
+    public static int countModelFilesRecursively(Path folder) {
+        if (folder == null || !Files.isDirectory(folder)) {
+            return 0;
+        }
+        
+        AtomicInteger count = new AtomicInteger(0);
+        
+        try {
+            Files.walkFileTree(folder, EnumSet.noneOf(FileVisitOption.class), Integer.MAX_VALUE,
+                new SimpleFileVisitor<Path>() {
+                    @Override
+                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                        // Count all files except folder.xml
+                        if (!file.getFileName().toString().equals(IGraficoConstants.FOLDER_XML)) {
+                            count.incrementAndGet();
+                        }
+                        return FileVisitResult.CONTINUE;
+                    }
+                    
+                    @Override
+                    public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                        // Continue on failure - don't let one bad file stop counting
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+        } catch (IOException e) {
+            // Return what we counted so far
+        }
+        
+        return count.get();
+    }
+    
+    /**
+     * Count regular files in a single folder (non-recursive).
+     * Uses NIO2 Files.list for optimal performance.
+     * 
+     * @param folder The folder to count files in
+     * @return Number of regular files in the folder
+     */
+    public static int countFilesInFolder(Path folder) {
+        if (folder == null || !Files.isDirectory(folder)) {
+            return 0;
+        }
+        
+        try (var stream = Files.list(folder)) {
+            return (int) stream.filter(Files::isRegularFile).count();
+        } catch (IOException e) {
+            return 0;
+        }
+    }
+    
+    /**
+     * Count all files recursively, including folder.xml files.
+     * Used for total file count when all files matter.
+     * 
+     * @param folder The folder to count files in
+     * @return Total number of files
+     */
+    public static int countAllFilesRecursively(Path folder) {
+        if (folder == null || !Files.isDirectory(folder)) {
+            return 0;
+        }
+        
+        AtomicInteger count = new AtomicInteger(0);
+        
+        try {
+            Files.walkFileTree(folder, EnumSet.noneOf(FileVisitOption.class), Integer.MAX_VALUE,
+                new SimpleFileVisitor<Path>() {
+                    @Override
+                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                        count.incrementAndGet();
+                        return FileVisitResult.CONTINUE;
+                    }
+                    
+                    @Override
+                    public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+        } catch (IOException e) {
+            // Return what we counted so far
+        }
+        
+        return count.get();
     }
 }
