@@ -182,10 +182,22 @@ public class GraficoModelExporter {
         List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
         final int totalFilesToHash = filesToHash.size();
         
-        // Use throttled progress reporter to minimize UI thread contention
-        // Updates at most every 250ms or every 2000 files
-        ThrottledProgressReporter hashProgressReporter = new ThrottledProgressReporter(
-            progress.split(15), totalFilesToHash);
+        // Collect all resources with their target files first (quick, sequential)
+        List<ResourceWriteTask> writeTasks = new ArrayList<>();
+        for(Resource resource : fResourceSet.getResources()) {
+            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+            String filePath = uri.toFileString();
+            File file = new File(filePath);
+            writeTasks.add(new ResourceWriteTask(resource, file, null)); // Hash filled in later
+        }
+        int totalResources = writeTasks.size();
+        
+        // Create a SINGLE throttled progress reporter for both hash and write phases
+        // This ensures only ONE background thread handles UI updates across all phases
+        // Total work = hash phase (65% weight) + write phase (remaining to 100%)
+        int totalWork = totalFilesToHash + totalResources;
+        ThrottledProgressReporter progressReporter = new ThrottledProgressReporter(
+            progress.split(65), totalWork);
         
         for (int i = 0; i < filesToHash.size(); i += BATCH_SIZE) {
             final int start = i;
@@ -213,8 +225,8 @@ public class GraficoModelExporter {
             }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
             .thenRun(() -> {
                 // Report progress after batch completes - reduces UI thread contention
-                hashProgressReporter.incrementBy(batch.size());
-                hashProgressReporter.maybeReport(
+                progressReporter.incrementBy(batch.size());
+                progressReporter.maybeReport(
                     count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
             });
             
@@ -228,38 +240,28 @@ public class GraficoModelExporter {
             // Continue with export even if some hashes failed
         }
         
-        // Ensure all hash progress is reported
-        hashProgressReporter.finish(null);
-        
         // Check for cancellation
         if (progress.isCanceled()) {
+            progressReporter.finish(null);
             cpuExecutor.shutdown();
             return;
+        }
+        
+        // Update writeTasks with the computed hashes
+        for (ResourceWriteTask task : writeTasks) {
+            task.existingHash = existingHashCache.get(task.file);
         }
         
         // Serialize resources using CPU executor, write files using virtual threads
         List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
         
-        int totalResources = fResourceSet.getResources().size();
         progress.subTask(NLS.bind(Messages.GraficoModelExporter_5, totalResources));
-        
-        // Use throttled progress reporter to minimize UI thread contention
-        ThrottledProgressReporter writeProgressReporter = new ThrottledProgressReporter(
-            progress.split(50), totalResources);
         
         // Check for cancellation before starting
         if (progress.isCanceled()) {
+            progressReporter.finish(null);
             cpuExecutor.shutdown();
             return;
-        }
-        
-        // Collect all resources with their target files first (quick, sequential)
-        List<ResourceWriteTask> writeTasks = new ArrayList<>();
-        for(Resource resource : fResourceSet.getResources()) {
-            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-            String filePath = uri.toFileString();
-            File file = new File(filePath);
-            writeTasks.add(new ResourceWriteTask(resource, file, existingHashCache.get(file)));
         }
         
         // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
@@ -307,9 +309,9 @@ public class GraficoModelExporter {
             }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
             .thenRun(() -> {
                 // Report progress after batch completes - reduces UI thread contention
-                writeProgressReporter.incrementBy(batch.size());
-                writeProgressReporter.maybeReport(
-                    count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalResources)); //$NON-NLS-1$
+                progressReporter.incrementBy(batch.size());
+                progressReporter.maybeReport(
+                    count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalWork)); //$NON-NLS-1$
             });
             
             writeFutures.add(batchFuture);
@@ -325,8 +327,8 @@ public class GraficoModelExporter {
             }
         }
         
-        // Ensure all write progress is reported
-        writeProgressReporter.finish(null);
+        // Ensure all progress is reported and stop the reporter thread
+        progressReporter.finish(null);
         
         // Shutdown executor
         cpuExecutor.shutdown();
@@ -565,7 +567,7 @@ public class GraficoModelExporter {
     private static class ResourceWriteTask {
         final Resource resource;
         final File file;
-        final byte[] existingHash;
+        byte[] existingHash;  // Mutable - filled in after hash phase completes
         
         ResourceWriteTask(Resource resource, File file, byte[] existingHash) {
             this.resource = resource;

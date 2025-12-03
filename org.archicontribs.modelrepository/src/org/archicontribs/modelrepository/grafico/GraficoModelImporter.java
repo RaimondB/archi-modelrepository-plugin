@@ -101,6 +101,12 @@ public class GraficoModelImporter {
      */
     private File fLocalRepoFolder;
     
+    /**
+     * Shared progress reporter for all phases of import.
+     * Uses a dedicated background thread for UI updates - worker threads never block.
+     */
+    private ThrottledProgressReporter fProgressReporter;
+    
     // Batch size for CompletableFuture operations (reduces overhead from 30,000 futures to ~300)
     private static final int BATCH_SIZE = 100;
     
@@ -149,12 +155,23 @@ public class GraficoModelImporter {
     	    return null;
     	}
     	
-    	// Reset the ID -> Object lookup table
-    	fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
+    	// Count total files for the shared progress reporter
+    	// This includes model files + image files
+    	int modelFileCount = countFilesRecursively(modelFolder);
+    	int imageFileCount = countFilesInFolder(imagesFolder);
+    	int totalFiles = modelFileCount + imageFileCount;
     	
-        // Load the Model from files (it will contain unresolved proxies)
-        progress.subTask(Messages.GraficoModelImporter_1);
-    	fModel = loadModel(modelFolder, progress.split(60));
+    	// Create a SINGLE shared progress reporter for all phases
+    	// This ensures only ONE background thread handles UI updates across all phases
+    	fProgressReporter = new ThrottledProgressReporter(progress.split(80), totalFiles);
+    	
+    	try {
+    	    // Reset the ID -> Object lookup table
+    	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
+    	
+            // Load the Model from files (it will contain unresolved proxies)
+            progress.subTask(Messages.GraficoModelImporter_1);
+    	    fModel = loadModel(modelFolder, progress.split(60));
     	
     	// Check for cancellation
     	if (progress.isCanceled()) {
@@ -201,6 +218,13 @@ public class GraficoModelImporter {
     	loadImages(imagesFolder, archiveManager, progress.split(20));
 
     	return fModel;
+    	} finally {
+    	    // Ensure the shared progress reporter is stopped
+    	    if (fProgressReporter != null) {
+    	        fProgressReporter.finish(null);
+    	        fProgressReporter = null;
+    	    }
+    	}
     }
     
     /**
@@ -244,10 +268,8 @@ public class GraficoModelImporter {
         // Use ForkJoinPool for coordinating batches
         ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
         
-        // Use throttled progress reporter to minimize UI thread contention
-        // Updates at most every 250ms or every 2000 files
-        ThrottledProgressReporter imageProgressReporter = new ThrottledProgressReporter(
-            progress.split(filesToLoad.size()), totalFiles);
+        // Use the shared progress reporter (created in importAsModel)
+        // This ensures only ONE background thread handles UI updates
         
         try {
             // TRUE BATCHING: One CompletableFuture per batch (reduces futures overhead)
@@ -278,10 +300,12 @@ public class GraficoModelImporter {
                     return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
                 }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
                 .thenRun(() -> {
-                    // Report progress after batch completes - reduces UI thread contention
-                    imageProgressReporter.incrementBy(batch.size());
-                    imageProgressReporter.maybeReport(
-                        count -> String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                    // Report progress via shared reporter - NON-BLOCKING
+                    if (fProgressReporter != null) {
+                        fProgressReporter.incrementBy(batch.size());
+                        fProgressReporter.maybeReport(
+                            count -> String.format(Messages.GraficoModelImporter_4 + " (%d)", count)); //$NON-NLS-1$
+                    }
                 });
                 
                 futures.add(batchFuture);
@@ -320,8 +344,7 @@ public class GraficoModelImporter {
                 throw new IOException("Failed to load images", e); //$NON-NLS-1$
             }
             
-            // Ensure all image progress is reported
-            imageProgressReporter.finish(null);
+            // Progress is reported via shared reporter - no finish() here
         } finally {
             cpuExecutor.shutdown();
         }
@@ -477,6 +500,27 @@ public class GraficoModelImporter {
         }
         return count;
     }
+    
+    /**
+     * Count regular files in a single folder (non-recursive).
+     * Used for counting images folder.
+     */
+    private int countFilesInFolder(File folder) {
+        if (!folder.isDirectory()) {
+            return 0;
+        }
+        
+        int count = 0;
+        File[] contents = folder.listFiles();
+        if (contents != null) {
+            for (File file : contents) {
+                if (file.isFile()) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
 	
 	/**
 	 * Load each XML file to recreate original object
@@ -533,10 +577,8 @@ public class GraficoModelImporter {
             Map<Path, EObject> loadedElements = new ConcurrentHashMap<>();
             final int totalFiles = filesToLoad.size();
             
-            // Use throttled progress reporter to minimize UI thread contention
-            // Updates at most every 250ms or every 2000 files
-            ThrottledProgressReporter loadProgressReporter = new ThrottledProgressReporter(
-                progress.split(filesInThisFolder), totalFiles);
+            // Use the shared progress reporter (created in importAsModel)
+            // This ensures only ONE background thread handles UI updates
             
             try {
                 // TRUE BATCHING: One CompletableFuture per batch (reduces 30,000 futures to ~300)
@@ -589,10 +631,12 @@ public class GraficoModelImporter {
                         return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
                     }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
                     .thenRun(() -> {
-                        // Report progress after batch completes - reduces UI thread contention
-                        loadProgressReporter.incrementBy(batch.size());
-                        loadProgressReporter.maybeReport(
-                            count -> String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                        // Report progress via shared reporter - NON-BLOCKING
+                        if (fProgressReporter != null) {
+                            fProgressReporter.incrementBy(batch.size());
+                            fProgressReporter.maybeReport(
+                                count -> String.format(Messages.GraficoModelImporter_1 + " (%d)", count)); //$NON-NLS-1$
+                        }
                     });
                     
                     futures.add(batchFuture);
@@ -606,7 +650,7 @@ public class GraficoModelImporter {
                 try {
                     // Wait with timeout to allow cancellation checks
                     while (!allFutures.isDone()) {
-                        if (loadProgressReporter.isCanceled()) {
+                        if (fProgressReporter != null && fProgressReporter.isCanceled()) {
                             cpuExecutor.shutdownNow();
                             return currentFolder;
                         }
@@ -639,8 +683,7 @@ public class GraficoModelImporter {
                     }
                 }
                 
-                // Ensure all load progress is reported
-                loadProgressReporter.finish(null);
+                // Progress is reported via shared reporter - no finish() here
             } finally {
                 cpuExecutor.shutdown();
             }
