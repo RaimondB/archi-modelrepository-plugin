@@ -12,8 +12,11 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -840,98 +843,76 @@ public class GraficoModelExporter {
     
     /**
      * Clean up any files that were not written in this export.
-     * Uses virtual threads for I/O-bound deletions with batched CompletableFutures.
+     * Uses NIO2 Files.walkFileTree() for efficient single-pass deletion.
+     * Files are deleted during visitFile(), directories are deleted in postVisitDirectory()
+     * (after their contents have been processed), which is safe and efficient.
      */
     private void cleanupObsoleteFiles(File folder) throws IOException {
         if (!folder.exists()) {
             return;
         }
         
-        // First, collect all files to delete (recursive traversal)
-        List<File> filesToDelete = new ArrayList<>();
-        List<File> directoriesToCheck = new ArrayList<>();
-        collectObsoleteFiles(folder, filesToDelete, directoriesToCheck);
-        
-        if (filesToDelete.isEmpty() && directoriesToCheck.isEmpty()) {
-            return;
-        }
-        
-        // Use virtual threads for I/O-bound file deletions (not ForkJoinPool which is for CPU work)
-        ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
-        List<CompletableFuture<Void>> deleteFutures = new ArrayList<>();
-        
-        try {
-            // TRUE BATCHING: One future per batch of file deletions
-            for (int i = 0; i < filesToDelete.size(); i += BATCH_SIZE) {
-                final int start = i;
-                final int end = Math.min(i + BATCH_SIZE, filesToDelete.size());
-                final List<File> batch = filesToDelete.subList(start, end);
-                
-                // Virtual threads handle I/O blocking efficiently
-                CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
-                    for (File file : batch) {
-                        try {
-                            Files.deleteIfExists(file.toPath());
-                        } catch (IOException e) {
-                            // Ignore deletion errors for cleanup
-                        }
-                    }
-                }, ioExecutor);
-                
-                deleteFutures.add(batchFuture);
-            }
-            
-            // Wait for all file deletions to complete
-            CompletableFuture.allOf(deleteFutures.toArray(new CompletableFuture[0])).join();
-            
-            // Now clean up empty directories (must be done after files are deleted)
-            // Process in reverse order (deepest first) to handle nested empty dirs
-            Collections.reverse(directoriesToCheck);
-            for (File dir : directoriesToCheck) {
-                if (dir.exists() && dir.isDirectory()) {
-                    String[] contents = dir.list();
-                    if (contents != null && contents.length == 0) {
-                        dir.delete();
+        // Single-pass walk: delete obsolete files immediately, delete empty directories after contents processed
+        Files.walkFileTree(folder.toPath(), new SimpleFileVisitor<java.nio.file.Path>() {
+            @Override
+            public FileVisitResult visitFile(java.nio.file.Path path, BasicFileAttributes attrs) {
+                File file = path.toFile();
+                if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
+                    // File is obsolete - delete immediately
+                    try {
+                        Files.delete(path);
+                    } catch (IOException e) {
+                        // Ignore deletion errors for cleanup
                     }
                 }
+                return FileVisitResult.CONTINUE;
             }
             
-            // Finally check if the root folder is empty
-            if (folder.exists() && folder.isDirectory()) {
-                String[] contents = folder.list();
-                if (contents != null && contents.length == 0) {
-                    folder.delete();
+            @Override
+            public FileVisitResult postVisitDirectory(java.nio.file.Path dir, IOException exc) throws IOException {
+                // Don't delete the root folder itself
+                if (!dir.equals(folder.toPath())) {
+                    // Check if directory is now empty and delete if so
+                    // This is safe because postVisitDirectory is called AFTER all contents are processed
+                    if (isEmptyDirectory(dir)) {
+                        Files.delete(dir);
+                    }
                 }
+                return FileVisitResult.CONTINUE;
             }
-        } finally {
-            ioExecutor.shutdown();
+        });
+        
+        // Finally check if the root folder itself is empty
+        if (folder.exists() && isEmptyDirectory(folder)) {
+            Files.delete(folder.toPath());
         }
     }
     
     /**
-     * Recursively collect obsolete files and directories for cleanup.
+     * Check if a directory is empty using NIO2 DirectoryStream.
+     * More efficient than File.list() as it doesn't need to create a full array.
      * 
-     * @param folder Current folder to scan
-     * @param filesToDelete List to add obsolete files to
-     * @param directoriesToCheck List to add directories to (for empty dir cleanup)
+     * @param dir the directory path to check
+     * @return true if directory is empty
      */
-    private void collectObsoleteFiles(File folder, List<File> filesToDelete, List<File> directoriesToCheck) {
-        File[] files = folder.listFiles();
-        if (files == null) {
-            return;
+    private boolean isEmptyDirectory(java.nio.file.Path dir) {
+        try (java.nio.file.DirectoryStream<java.nio.file.Path> stream = Files.newDirectoryStream(dir)) {
+            return !stream.iterator().hasNext();
+        } catch (IOException e) {
+            // If we can't check, assume not empty (safer)
+            return false;
         }
-        
-        for (File file : files) {
-            if (file.isDirectory()) {
-                // Recurse into subdirectory
-                collectObsoleteFiles(file, filesToDelete, directoriesToCheck);
-                // Track directory for potential empty cleanup
-                directoriesToCheck.add(file);
-            } else if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
-                // File is obsolete - queue for deletion
-                filesToDelete.add(file);
-            }
-        }
+    }
+    
+    /**
+     * Check if a directory is empty using NIO2 DirectoryStream.
+     * Overload for File parameter.
+     * 
+     * @param dir the directory to check
+     * @return true if directory is empty
+     */
+    private boolean isEmptyDirectory(File dir) {
+        return isEmptyDirectory(dir.toPath());
     }
     
     /**

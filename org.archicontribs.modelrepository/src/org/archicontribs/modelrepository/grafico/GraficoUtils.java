@@ -99,7 +99,8 @@ public class GraficoUtils {
     }
     
     /**
-     * Get an empty and unique local folder to contain the local repo
+     * Get an empty and unique local folder to contain the local repo.
+     * Uses NIO2 for efficient directory content checking.
      * @param parentFolder
      * @param repoURL
      * @return the folder
@@ -110,11 +111,29 @@ public class GraficoUtils {
         int count = 1;
         File file = new File(parentFolder, folderName);
         
-        while(file.exists() && file.list().length > 0) {
+        // Use NIO2 Files.list() to check if directory is non-empty (more efficient than File.list())
+        while(file.exists() && isNonEmptyDirectory(file)) {
             file = new File(parentFolder, folderName + "_" + count++); //$NON-NLS-1$
         }
         
         return file;
+    }
+    
+    /**
+     * Check if a directory is non-empty using NIO2.
+     * @param dir the directory to check
+     * @return true if directory exists and contains at least one entry
+     */
+    private static boolean isNonEmptyDirectory(File dir) {
+        if (!dir.isDirectory()) {
+            return false;
+        }
+        try (java.nio.file.DirectoryStream<Path> stream = Files.newDirectoryStream(dir.toPath())) {
+            return stream.iterator().hasNext();
+        } catch (IOException e) {
+            // Fall back to assuming non-empty on error
+            return true;
+        }
     }
     
     /**
