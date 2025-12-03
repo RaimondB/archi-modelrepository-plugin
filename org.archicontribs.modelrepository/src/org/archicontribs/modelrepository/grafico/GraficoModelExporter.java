@@ -142,6 +142,10 @@ public class GraficoModelExporter {
         // We estimate existing files to hash as roughly equal to model elements
         int totalWork = imageCount + modelFileCount + modelFileCount;
         
+        // Store counts as final for use in lambdas
+        final int totalImages = imageCount;
+        final int totalModelFiles = modelFileCount;
+        
         // Create a SINGLE throttled progress reporter for ALL phases (images, hash, write)
         // This ensures only ONE background thread handles UI updates across the entire export
         fProgressReporter = new ThrottledProgressReporter(progress.split(85), totalWork);
@@ -149,8 +153,8 @@ public class GraficoModelExporter {
         try {
             // Save model images (if any): this has to be done on original model (not a copy)
             // Uses shared fProgressReporter for progress updates
-            fProgressReporter.subTask(Messages.GraficoModelExporter_1);
-            saveImages();
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_1, 0, totalImages));
+            saveImages(totalImages);
             
             // Check for cancellation
             if (fProgressReporter.isCanceled()) {
@@ -173,8 +177,8 @@ public class GraficoModelExporter {
             }
             
             // Create directory structure and prepare all Resources
-            fProgressReporter.subTask(Messages.GraficoModelExporter_3);
-            createAndSaveResourceForFolder(copy, modelFolder);
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_3, 0, totalModelFiles));
+            createAndSaveResourceForFolder(copy, modelFolder, totalModelFiles);
 
             // Now save all Resources using ForkJoinPool for CPU work with batching
             // ForkJoinPool is optimal for CPU-bound work (XML serialization, hashing) - matches CPU cores
@@ -203,7 +207,7 @@ public class GraficoModelExporter {
             final int totalFilesToHash = filesToHash.size();
             
             // Announce the "reading existing files" phase
-            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_4, totalFilesToHash));
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_4, 0, totalFilesToHash));
             
             // Collect all resources with their target files first (quick, sequential)
             List<ResourceWriteTask> writeTasks = new ArrayList<>();
@@ -281,7 +285,7 @@ public class GraficoModelExporter {
             List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
             
             // Announce the "writing resources" phase
-            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_5, totalResources));
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_5, 0, totalResources));
             
             for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
                 final int start = i;
@@ -326,7 +330,7 @@ public class GraficoModelExporter {
                     // Report progress after batch completes - reduces UI thread contention
                     fProgressReporter.incrementBy(batch.size());
                     fProgressReporter.maybeReport(
-                        count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalWork)); //$NON-NLS-1$
+                        count -> NLS.bind(Messages.GraficoModelExporter_5, count, totalResources));
                 });
                 
                 writeFutures.add(batchFuture);
@@ -370,9 +374,10 @@ public class GraficoModelExporter {
      * 
      * @param folderContainer Model or folder to work on 
      * @param folder Directory in which to generate files
+     * @param totalModelFiles Total number of model files for progress reporting
      * @throws IOException
      */
-    private void createAndSaveResourceForFolder(IFolderContainer folderContainer, File folder) throws IOException {
+    private void createAndSaveResourceForFolder(IFolderContainer folderContainer, File folder, int totalModelFiles) throws IOException {
         // Collect all work items first (quick, single-threaded traversal)
         List<ResourceCreationTask> tasks = new ArrayList<>();
         collectResourceCreationTasks(folderContainer, folder, tasks);
@@ -411,7 +416,7 @@ public class GraficoModelExporter {
                     // Report progress after batch completes
                     fProgressReporter.incrementBy(batch.size());
                     fProgressReporter.maybeReport(
-                        count -> NLS.bind(Messages.GraficoModelExporter_3, count, totalTasks));
+                        count -> NLS.bind(Messages.GraficoModelExporter_3, count, totalModelFiles));
                 });
                 
                 futures.add(batchFuture);
@@ -531,8 +536,10 @@ public class GraficoModelExporter {
      * Extract and save images used inside a model as separate image files
      * Uses virtual threads for I/O (file reads/writes) and ForkJoinPool for CPU work (hashing)
      * Uses the shared fProgressReporter for progress updates.
+     * 
+     * @param totalImages Total number of images for progress reporting
      */
-    private void saveImages() throws IOException {
+    private void saveImages(int totalImages) throws IOException {
         Set<String> processed = new HashSet<>();
         List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
         List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
@@ -600,7 +607,7 @@ public class GraficoModelExporter {
                                 // Report progress using shared reporter
                                 fProgressReporter.incrementBy(1);
                                 fProgressReporter.maybeReport(
-                                    count -> NLS.bind(Messages.GraficoModelExporter_1, count));
+                                    count -> NLS.bind(Messages.GraficoModelExporter_1, count, totalImages));
                             })
                             .exceptionally(e -> {
                                 Throwable cause = e.getCause() != null ? e.getCause() : e;

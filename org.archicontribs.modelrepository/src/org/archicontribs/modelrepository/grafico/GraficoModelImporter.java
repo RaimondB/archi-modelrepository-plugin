@@ -38,6 +38,7 @@ import org.eclipse.emf.ecore.resource.Resource;
 import org.eclipse.emf.ecore.util.EcoreUtil;
 import org.eclipse.emf.ecore.xmi.impl.XMLResourceImpl;
 import org.eclipse.gef.commands.CommandStack;
+import org.eclipse.osgi.util.NLS;
 
 import com.archimatetool.editor.model.IArchiveManager;
 import com.archimatetool.editor.model.compatibility.CompatibilityHandlerException;
@@ -171,8 +172,8 @@ public class GraficoModelImporter {
     	
             // Load the Model from files (it will contain unresolved proxies)
             // Uses shared fProgressReporter for progress updates
-    	    fProgressReporter.subTask(Messages.GraficoModelImporter_1);
-    	    fModel = loadModel(modelFolder);
+    	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_1, 0, modelFileCount));
+    	    fModel = loadModel(modelFolder, modelFileCount);
     	
     	    // Check for cancellation
     	    if (fProgressReporter.isCanceled()) {
@@ -213,8 +214,8 @@ public class GraficoModelImporter {
             fModel.setAdapter(CommandStack.class, cmdStack);
         
     	    // Load images - uses shared fProgressReporter for progress updates
-    	    fProgressReporter.subTask(Messages.GraficoModelImporter_4);
-    	    loadImages(imagesFolder, archiveManager);
+    	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_4, 0, imageFileCount));
+    	    loadImages(imagesFolder, archiveManager, imageFileCount);
 
     	    return fModel;
     	} finally {
@@ -237,8 +238,12 @@ public class GraficoModelImporter {
      * Read images from images subfolder and load them into the model.
      * Uses TRUE BATCHING with async I/O for parallel file operations.
      * Uses the shared fProgressReporter for progress updates.
+     * 
+     * @param folder The images folder
+     * @param archiveManager The archive manager to add images to
+     * @param totalImages Total number of images for progress reporting
      */
-    private void loadImages(File folder, IArchiveManager archiveManager) throws IOException {
+    private void loadImages(File folder, IArchiveManager archiveManager, int totalImages) throws IOException {
         Path folderPath = folder.toPath();
         
         if (!Files.isDirectory(folderPath)) {
@@ -300,7 +305,7 @@ public class GraficoModelImporter {
                     if (fProgressReporter != null) {
                         fProgressReporter.incrementBy(batch.size());
                         fProgressReporter.maybeReport(
-                            count -> String.format(Messages.GraficoModelImporter_4 + " (%d)", count)); //$NON-NLS-1$
+                            count -> NLS.bind(Messages.GraficoModelImporter_4, count, totalImages));
                     }
                 });
                 
@@ -427,7 +432,7 @@ public class GraficoModelImporter {
         }
     }
     
-	private IArchimateModel loadModel(File folder) throws IOException {
+	private IArchimateModel loadModel(File folder, int totalModelFiles) throws IOException {
 		IArchimateModel model = (IArchimateModel)loadElement(new File(folder, IGraficoConstants.FOLDER_XML));
 		
 		List<FolderType> folderList = new ArrayList<FolderType>();
@@ -452,7 +457,7 @@ public class GraficoModelImporter {
 		        fProgressReporter.maybeReport(
 		            count -> String.format(Messages.GraficoModelImporter_5, folderType.toString()));
 		    }
-		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()));
+		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()), totalModelFiles);
 		    if(tmpFolder != null) {
 		        model.getFolders().add(tmpFolder);
 		    }
@@ -511,10 +516,11 @@ public class GraficoModelImporter {
 	 * Uses the shared fProgressReporter for progress updates.
 	 * 
 	 * @param folder
+	 * @param totalModelFiles Total number of model files for progress reporting
 	 * @return Model folder
 	 * @throws IOException 
 	 */
-    private IFolder loadFolder(File folder) throws IOException {
+    private IFolder loadFolder(File folder, int totalModelFiles) throws IOException {
         Path folderPath = folder.toPath();
         Path folderXmlPath = folderPath.resolve(IGraficoConstants.FOLDER_XML);
         
@@ -607,7 +613,7 @@ public class GraficoModelImporter {
                         if (fProgressReporter != null) {
                             fProgressReporter.incrementBy(batch.size());
                             fProgressReporter.maybeReport(
-                                count -> String.format(Messages.GraficoModelImporter_1 + " (%d)", count)); //$NON-NLS-1$
+                                count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
                         }
                     });
                     
@@ -668,7 +674,7 @@ public class GraficoModelImporter {
                 return currentFolder;
             }
             
-            IFolder loadedFolder = loadFolder(subFolder.toFile());
+            IFolder loadedFolder = loadFolder(subFolder.toFile(), totalModelFiles);
             if (loadedFolder != null) {
                 currentFolder.getFolders().add(loadedFolder);
             }
