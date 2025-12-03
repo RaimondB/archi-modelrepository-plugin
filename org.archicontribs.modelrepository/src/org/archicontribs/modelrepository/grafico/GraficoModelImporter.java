@@ -19,13 +19,13 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
-import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
@@ -207,7 +207,7 @@ public class GraficoModelImporter {
     
     /**
      * Read images from images subfolder and load them into the model
-     * Uses NIO2 Path APIs and CompletableFuture for parallel async I/O
+     * Uses virtual threads for parallel I/O operations
      * @param monitor Progress monitor for UI feedback, can be null
      */
     private void loadImages(File folder, IArchiveManager archiveManager, IProgressMonitor monitor) throws IOException {
@@ -232,15 +232,14 @@ public class GraficoModelImporter {
         
         progress.setWorkRemaining(filesToLoad.size());
         
-        // Use ForkJoinPool for work-stealing parallel reads
-        int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-        ForkJoinPool executor = new ForkJoinPool(Math.min(maxThreads, filesToLoad.size()));
+        // Use virtual threads for I/O-bound file reading
+        ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
         
         // Store results in a concurrent map
         Map<String, byte[]> imageData = new ConcurrentHashMap<>();
         
         try {
-            // Create CompletableFutures for all file reads
+            // Create CompletableFutures for all file reads using virtual threads
             List<CompletableFuture<Void>> futures = filesToLoad.stream()
                 .map(path -> CompletableFuture.runAsync(() -> {
                     try {
@@ -249,7 +248,7 @@ public class GraficoModelImporter {
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
-                }, executor))
+                }, ioExecutor))
                 .collect(Collectors.toList());
             
             // Wait for all reads to complete using allOf
@@ -261,7 +260,7 @@ public class GraficoModelImporter {
                 // Wait with timeout to allow cancellation checks
                 while (!allFutures.isDone()) {
                     if (progress.isCanceled()) {
-                        executor.shutdownNow();
+                        ioExecutor.shutdownNow();
                         return;
                     }
                     try {
@@ -287,12 +286,7 @@ public class GraficoModelImporter {
             
             progress.worked(filesToLoad.size());
         } finally {
-            executor.shutdown();
-            try {
-                executor.awaitTermination(30, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            ioExecutor.shutdown();
         }
         
         // Add all loaded images to the archive manager
@@ -449,7 +443,7 @@ public class GraficoModelImporter {
 	
 	/**
 	 * Load each XML file to recreate original object
-	 * Uses NIO2 async I/O and CompletableFuture for better performance
+	 * Uses virtual threads for I/O-bound file reading
 	 * 
 	 * @param folder
 	 * @param monitor Progress monitor for UI feedback, can be null
@@ -494,16 +488,15 @@ public class GraficoModelImporter {
         // We use the file count from this level; subfolders handle their own counts
         progress.setWorkRemaining(Math.max(filesInThisFolder + subfolderCount, 1));
         
-        // Load files in parallel using ForkJoinPool (work-stealing, better for I/O-bound tasks)
+        // Load files in parallel using virtual threads (optimal for I/O-bound work)
         if (!filesToLoad.isEmpty()) {
-            int maxThreads = ModelRepositoryPlugin.getInstance().getPreferenceStore().getInt(IPreferenceConstants.PREFS_EXPORT_MAX_THREADS);
-            ForkJoinPool executor = new ForkJoinPool(Math.min(maxThreads, filesToLoad.size()));
+            ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
             
             // Use a concurrent map to store loaded elements
             Map<Path, EObject> loadedElements = new ConcurrentHashMap<>();
             
             try {
-                // Create CompletableFutures for all file loads
+                // Create CompletableFutures for all file loads using virtual threads
                 List<CompletableFuture<Void>> futures = filesToLoad.stream()
                     .map(path -> CompletableFuture.runAsync(() -> {
                         try {
@@ -512,7 +505,7 @@ public class GraficoModelImporter {
                         } catch (IOException e) {
                             throw new RuntimeException(e);
                         }
-                    }, executor))
+                    }, ioExecutor))
                     .collect(Collectors.toList());
                 
                 // Wait for all loads to complete using allOf for better composition
@@ -524,7 +517,7 @@ public class GraficoModelImporter {
                     // Wait with timeout to allow cancellation checks
                     while (!allFutures.isDone()) {
                         if (progress.isCanceled()) {
-                            executor.shutdownNow();
+                            ioExecutor.shutdownNow();
                             return currentFolder;
                         }
                         try {
@@ -559,12 +552,7 @@ public class GraficoModelImporter {
                 // Report progress once for all files in this folder (batch update)
                 progress.worked(filesInThisFolder);
             } finally {
-                executor.shutdown();
-                try {
-                    executor.awaitTermination(30, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                ioExecutor.shutdown();
             }
         }
         
