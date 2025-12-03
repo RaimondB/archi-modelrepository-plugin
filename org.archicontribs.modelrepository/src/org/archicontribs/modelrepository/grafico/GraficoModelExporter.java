@@ -78,6 +78,12 @@ public class GraficoModelExporter {
      */
     private File fLocalRepoFolder;
     
+    /**
+     * Shared progress reporter across all phases (images, hash, write).
+     * Uses dedicated background thread for UI updates to prevent worker thread blocking.
+     */
+    private ThrottledProgressReporter fProgressReporter;
+    
 	/**
 	 * @param model The model to export
 	 * @param folder The root folder in which to write the grafico XML files
@@ -128,220 +134,231 @@ public class GraficoModelExporter {
             return;
         }
         
-        // Save model images (if any): this has to be done on original model (not a copy)
-        progress.subTask(Messages.GraficoModelExporter_1);
-        saveImages(progress.split(10));
+        // Count total work across ALL phases upfront: images + model files (hash + write)
+        // This allows a SINGLE shared progress reporter across all phases
+        int imageCount = countImages();
+        int modelFileCount = countModelElements();
+        // Total work = images + hashing existing files + writing resources
+        // We estimate existing files to hash as roughly equal to model elements
+        int totalWork = imageCount + modelFileCount + modelFileCount;
         
-        // Create ResourceSet
-        fResourceSet = new ResourceSetImpl();
-        fResourceSet.getResourceFactoryRegistry().getExtensionToFactoryMap().put("*", new XMLResourceFactoryImpl()); //$NON-NLS-1$
-        // Add a URIConverter that will be used to map full filenames to logical names
-        fResourceSet.setURIConverter(new ExtensibleURIConverterImpl());
+        // Create a SINGLE throttled progress reporter for ALL phases (images, hash, write)
+        // This ensures only ONE background thread handles UI updates across the entire export
+        fProgressReporter = new ThrottledProgressReporter(progress.split(85), totalWork);
         
-        // Now work on a copy
-        progress.subTask(Messages.GraficoModelExporter_2);
-        IArchimateModel copy = EcoreUtil.copy(fModel);
-        progress.worked(5);
-        
-        // Check for cancellation
-        if (progress.isCanceled()) {
-            return;
-        }
-        
-        // Create directory structure and prepare all Resources
-        progress.subTask(Messages.GraficoModelExporter_3);
-        createAndSaveResourceForFolder(copy, modelFolder);
-        progress.worked(10);
+        try {
+            // Save model images (if any): this has to be done on original model (not a copy)
+            // Uses shared fProgressReporter for progress updates
+            fProgressReporter.subTask(Messages.GraficoModelExporter_1);
+            saveImages();
+            
+            // Check for cancellation
+            if (fProgressReporter.isCanceled()) {
+                return;
+            }
+            
+            // Create ResourceSet
+            fProgressReporter.subTask(Messages.GraficoModelExporter_2);
+            fResourceSet = new ResourceSetImpl();
+            fResourceSet.getResourceFactoryRegistry().getExtensionToFactoryMap().put("*", new XMLResourceFactoryImpl()); //$NON-NLS-1$
+            // Add a URIConverter that will be used to map full filenames to logical names
+            fResourceSet.setURIConverter(new ExtensibleURIConverterImpl());
+            
+            // Now work on a copy
+            IArchimateModel copy = EcoreUtil.copy(fModel);
+            
+            // Check for cancellation
+            if (fProgressReporter.isCanceled()) {
+                return;
+            }
+            
+            // Create directory structure and prepare all Resources
+            fProgressReporter.subTask(Messages.GraficoModelExporter_3);
+            createAndSaveResourceForFolder(copy, modelFolder);
 
-        // Now save all Resources using ForkJoinPool for CPU work with batching
-        // ForkJoinPool is optimal for CPU-bound work (XML serialization, hashing) - matches CPU cores
-        // Batching reduces CompletableFuture overhead (30,000 files -> ~300 futures)
-        int cpuThreads = Runtime.getRuntime().availableProcessors();
-        ForkJoinPool cpuExecutor = new ForkJoinPool(cpuThreads);
-        
-        // Cache for file content hashes (SHA-256) to avoid keeping full content in memory
-        Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
-        
-        // Collect all files that need hashing first
-        progress.subTask(Messages.GraficoModelExporter_7);
-        List<File> filesToHash = new ArrayList<>();
-        for(Resource resource : fResourceSet.getResources()) {
-            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-            String filePath = uri.toFileString();
-            File file = new File(filePath);
-            if (file.exists()) {
-                filesToHash.add(file);
-            }
-        }
-        
-        // Pre-compute hashes of existing files in parallel for comparison
-        progress.subTask(NLS.bind(Messages.GraficoModelExporter_4, filesToHash.size()));
-        
-        // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
-        // Within each batch: start all async reads, then process results as they complete
-        List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
-        final int totalFilesToHash = filesToHash.size();
-        
-        // Collect all resources with their target files first (quick, sequential)
-        List<ResourceWriteTask> writeTasks = new ArrayList<>();
-        for(Resource resource : fResourceSet.getResources()) {
-            URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
-            String filePath = uri.toFileString();
-            File file = new File(filePath);
-            writeTasks.add(new ResourceWriteTask(resource, file, null)); // Hash filled in later
-        }
-        int totalResources = writeTasks.size();
-        
-        // Create a SINGLE throttled progress reporter for both hash and write phases
-        // This ensures only ONE background thread handles UI updates across all phases
-        // Total work = hash phase (65% weight) + write phase (remaining to 100%)
-        int totalWork = totalFilesToHash + totalResources;
-        ThrottledProgressReporter progressReporter = new ThrottledProgressReporter(
-            progress.split(65), totalWork);
-        
-        for (int i = 0; i < filesToHash.size(); i += BATCH_SIZE) {
-            final int start = i;
-            final int end = Math.min(i + BATCH_SIZE, filesToHash.size());
-            final List<File> batch = filesToHash.subList(start, end);
+            // Now save all Resources using ForkJoinPool for CPU work with batching
+            // ForkJoinPool is optimal for CPU-bound work (XML serialization, hashing) - matches CPU cores
+            // Batching reduces CompletableFuture overhead (30,000 files -> ~300 futures)
+            int cpuThreads = Runtime.getRuntime().availableProcessors();
+            ForkJoinPool cpuExecutor = new ForkJoinPool(cpuThreads);
             
-            // ONE future per batch - starts async reads for all files, then processes results
-            CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                // Start all async reads for this batch
-                List<CompletableFuture<Void>> batchReads = new ArrayList<>();
-                for (File file : batch) {
-                    CompletableFuture<Void> readFuture = readFileAsync(file)
-                        .thenAcceptAsync(bytes -> {
-                            if (bytes != null) {
-                                byte[] hash = computeHash(bytes);
-                                if (hash != null) {
-                                    existingHashCache.put(file, hash);
+            // Cache for file content hashes (SHA-256) to avoid keeping full content in memory
+            Map<File, byte[]> existingHashCache = new ConcurrentHashMap<>();
+            
+            // Collect all files that need hashing first
+            fProgressReporter.subTask(Messages.GraficoModelExporter_7);
+            List<File> filesToHash = new ArrayList<>();
+            for(Resource resource : fResourceSet.getResources()) {
+                URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+                String filePath = uri.toFileString();
+                File file = new File(filePath);
+                if (file.exists()) {
+                    filesToHash.add(file);
+                }
+            }
+            
+            // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
+            // Within each batch: start all async reads, then process results as they complete
+            List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
+            final int totalFilesToHash = filesToHash.size();
+            
+            // Announce the "reading existing files" phase
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_4, totalFilesToHash));
+            
+            // Collect all resources with their target files first (quick, sequential)
+            List<ResourceWriteTask> writeTasks = new ArrayList<>();
+            for(Resource resource : fResourceSet.getResources()) {
+                URI uri = fResourceSet.getURIConverter().normalize(resource.getURI());
+                String filePath = uri.toFileString();
+                File file = new File(filePath);
+                writeTasks.add(new ResourceWriteTask(resource, file, null)); // Hash filled in later
+            }
+            int totalResources = writeTasks.size();
+            
+            for (int i = 0; i < filesToHash.size(); i += BATCH_SIZE) {
+                final int start = i;
+                final int end = Math.min(i + BATCH_SIZE, filesToHash.size());
+                final List<File> batch = filesToHash.subList(start, end);
+                
+                // ONE future per batch - starts async reads for all files, then processes results
+                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                    // Start all async reads for this batch
+                    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                    for (File file : batch) {
+                        CompletableFuture<Void> readFuture = readFileAsync(file)
+                            .thenAcceptAsync(bytes -> {
+                                if (bytes != null) {
+                                    byte[] hash = computeHash(bytes);
+                                    if (hash != null) {
+                                        existingHashCache.put(file, hash);
+                                    }
                                 }
-                            }
-                        }, cpuExecutor);
-                    batchReads.add(readFuture);
-                }
-                // Wait for all reads in this batch to complete
-                return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-            }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
-            .thenRun(() -> {
-                // Report progress after batch completes - reduces UI thread contention
-                progressReporter.incrementBy(batch.size());
-                progressReporter.maybeReport(
-                    count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
-            });
-            
-            hashFutures.add(batchFuture);
-        }
-        
-        // Wait for all hash computations to complete
-        try {
-            CompletableFuture.allOf(hashFutures.toArray(new CompletableFuture[0])).join();
-        } catch (Exception e) {
-            // Continue with export even if some hashes failed
-        }
-        
-        // Check for cancellation
-        if (progress.isCanceled()) {
-            progressReporter.finish(null);
-            cpuExecutor.shutdown();
-            return;
-        }
-        
-        // Update writeTasks with the computed hashes
-        for (ResourceWriteTask task : writeTasks) {
-            task.existingHash = existingHashCache.get(task.file);
-        }
-        
-        // Serialize resources using CPU executor, write files using virtual threads
-        List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
-        
-        progress.subTask(NLS.bind(Messages.GraficoModelExporter_5, totalResources));
-        
-        // Check for cancellation before starting
-        if (progress.isCanceled()) {
-            progressReporter.finish(null);
-            cpuExecutor.shutdown();
-            return;
-        }
-        
-        // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
-        // Within each batch: serialize all (CPU), then start all async writes
-        List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
-        
-        for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
-            final int start = i;
-            final int end = Math.min(i + BATCH_SIZE, writeTasks.size());
-            final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
-            
-            // ONE future per batch - serializes all, then writes all async
-            CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                // First pass: CPU-bound serialization and hash comparison
-                List<FileWriteRequest> writeRequests = new ArrayList<>();
-                
-                for (ResourceWriteTask task : batch) {
-                    try {
-                        // CPU-bound: serialize to byte array
-                        ByteArrayOutputStream os = new ByteArrayOutputStream(4096);
-                        task.resource.save(os, null);
-                        byte[] newContent = os.toByteArray();
-                        
-                        // CPU-bound: compute hash and check if content changed
-                        byte[] newHash = computeHash(newContent);
-                        if (task.existingHash == null || !Arrays.equals(newHash, task.existingHash)) {
-                            // Content changed - queue for async write
-                            task.file.getParentFile().mkdirs();
-                            writtenFiles.add(task.file);
-                            writeRequests.add(new FileWriteRequest(task.file, newContent));
-                        }
-                    } catch (IOException ex) {
-                        exceptions.add(ex);
+                            }, cpuExecutor);
+                        batchReads.add(readFuture);
                     }
-                }
+                    // Wait for all reads in this batch to complete
+                    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+                }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
+                .thenRun(() -> {
+                    // Report progress after batch completes - reduces UI thread contention
+                    fProgressReporter.incrementBy(batch.size());
+                    fProgressReporter.maybeReport(
+                        count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
+                });
                 
-                // Second pass: start all async writes for this batch
-                List<CompletableFuture<Void>> batchWrites = new ArrayList<>();
-                for (FileWriteRequest req : writeRequests) {
-                    batchWrites.add(writeFileAsync(req.file, req.content));
-                }
-                
-                // Return future that completes when all writes are done
-                return CompletableFuture.allOf(batchWrites.toArray(new CompletableFuture[0]));
-            }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
-            .thenRun(() -> {
-                // Report progress after batch completes - reduces UI thread contention
-                progressReporter.incrementBy(batch.size());
-                progressReporter.maybeReport(
-                    count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalWork)); //$NON-NLS-1$
-            });
-            
-            writeFutures.add(batchFuture);
-        }
-        
-        // Wait for all writes to complete
-        try {
-            CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0])).join();
-        } catch (Exception e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
-                exceptions.add((IOException) cause.getCause());
+                hashFutures.add(batchFuture);
             }
-        }
-        
-        // Ensure all progress is reported and stop the reporter thread
-        progressReporter.finish(null);
-        
-        // Shutdown executor
-        cpuExecutor.shutdown();
-        
-        // Clean up obsolete files after all resources are saved
-        progress.subTask(Messages.GraficoModelExporter_6);
-        cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
-        cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
-        progress.worked(10);
-        
-        // Throw on any exception
-        if(!exceptions.isEmpty()) {
-            throw exceptions.get(0);
+            
+            // Wait for all hash computations to complete
+            try {
+                CompletableFuture.allOf(hashFutures.toArray(new CompletableFuture[0])).join();
+            } catch (Exception e) {
+                // Continue with export even if some hashes failed
+            }
+            
+            // Check for cancellation
+            if (fProgressReporter.isCanceled()) {
+                cpuExecutor.shutdown();
+                return;
+            }
+            
+            // Update writeTasks with the computed hashes
+            for (ResourceWriteTask task : writeTasks) {
+                task.existingHash = existingHashCache.get(task.file);
+            }
+            
+            // Serialize resources using CPU executor, write files using virtual threads
+            List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
+            
+            // Check for cancellation before starting
+            if (fProgressReporter.isCanceled()) {
+                cpuExecutor.shutdown();
+                return;
+            }
+            
+            // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
+            // Within each batch: serialize all (CPU), then start all async writes
+            List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
+            
+            // Announce the "writing resources" phase
+            fProgressReporter.subTask(NLS.bind(Messages.GraficoModelExporter_5, totalResources));
+            
+            for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
+                final int start = i;
+                final int end = Math.min(i + BATCH_SIZE, writeTasks.size());
+                final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
+                
+                // ONE future per batch - serializes all, then writes all async
+                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                    // First pass: CPU-bound serialization and hash comparison
+                    List<FileWriteRequest> writeRequests = new ArrayList<>();
+                    
+                    for (ResourceWriteTask task : batch) {
+                        try {
+                            // CPU-bound: serialize to byte array
+                            ByteArrayOutputStream os = new ByteArrayOutputStream(4096);
+                            task.resource.save(os, null);
+                            byte[] newContent = os.toByteArray();
+                            
+                            // CPU-bound: compute hash and check if content changed
+                            byte[] newHash = computeHash(newContent);
+                            if (task.existingHash == null || !Arrays.equals(newHash, task.existingHash)) {
+                                // Content changed - queue for async write
+                                task.file.getParentFile().mkdirs();
+                                writtenFiles.add(task.file);
+                                writeRequests.add(new FileWriteRequest(task.file, newContent));
+                            }
+                        } catch (IOException ex) {
+                            exceptions.add(ex);
+                        }
+                    }
+                    
+                    // Second pass: start all async writes for this batch
+                    List<CompletableFuture<Void>> batchWrites = new ArrayList<>();
+                    for (FileWriteRequest req : writeRequests) {
+                        batchWrites.add(writeFileAsync(req.file, req.content));
+                    }
+                    
+                    // Return future that completes when all writes are done
+                    return CompletableFuture.allOf(batchWrites.toArray(new CompletableFuture[0]));
+                }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
+                .thenRun(() -> {
+                    // Report progress after batch completes - reduces UI thread contention
+                    fProgressReporter.incrementBy(batch.size());
+                    fProgressReporter.maybeReport(
+                        count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalWork)); //$NON-NLS-1$
+                });
+                
+                writeFutures.add(batchFuture);
+            }
+            
+            // Wait for all writes to complete
+            try {
+                CompletableFuture.allOf(writeFutures.toArray(new CompletableFuture[0])).join();
+            } catch (Exception e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                    exceptions.add((IOException) cause.getCause());
+                }
+            }
+            
+            // Shutdown executor
+            cpuExecutor.shutdown();
+            
+            // Clean up obsolete files after all resources are saved
+            fProgressReporter.subTask(Messages.GraficoModelExporter_6);
+            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.MODEL_FOLDER));
+            cleanupObsoleteFiles(new File(fLocalRepoFolder, IGraficoConstants.IMAGES_FOLDER));
+            
+            // Throw on any exception
+            if(!exceptions.isEmpty()) {
+                throw exceptions.get(0);
+            }
+        } finally {
+            // Ensure progress reporter is always stopped
+            if (fProgressReporter != null) {
+                fProgressReporter.finish(null);
+            }
         }
     }
     
@@ -434,11 +451,9 @@ public class GraficoModelExporter {
       /**
      * Extract and save images used inside a model as separate image files
      * Uses virtual threads for I/O (file reads/writes) and ForkJoinPool for CPU work (hashing)
-     * @param monitor Progress monitor for UI feedback, can be null
+     * Uses the shared fProgressReporter for progress updates.
      */
-    private void saveImages(IProgressMonitor monitor) throws IOException {
-        SubMonitor progress = SubMonitor.convert(monitor);
-        
+    private void saveImages() throws IOException {
         Set<String> processed = new HashSet<>();
         List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
         List<IOException> exceptions = Collections.synchronizedList(new ArrayList<>());
@@ -447,21 +462,6 @@ public class GraficoModelExporter {
         if(archiveManager == null) {
             archiveManager = IArchiveManager.FACTORY.createArchiveManager(fModel);
         }
-        
-        // Count images for progress
-        int imageCount = 0;
-        for(Iterator<EObject> iter = fModel.eAllContents(); iter.hasNext();) {
-            EObject eObject = iter.next();
-            if(eObject instanceof IDiagramModelImageProvider) {
-                IDiagramModelImageProvider imageProvider = (IDiagramModelImageProvider)eObject;
-                if(imageProvider.getImagePath() != null) {
-                    imageCount++;
-                }
-            }
-        }
-        
-        // Set work remaining based on number of images
-        progress.setWorkRemaining(imageCount + 1);
         
         // Virtual threads for I/O, ForkJoinPool for CPU
         int cpuThreads = Runtime.getRuntime().availableProcessors();
@@ -477,13 +477,6 @@ public class GraficoModelExporter {
                     
                     if(imagePath != null && !processed.contains(imagePath)) {
                         processed.add(imagePath);
-                        
-                        // Check for cancellation
-                        if (progress.isCanceled()) {
-                            cpuExecutor.shutdown();
-                            ioExecutor.shutdown();
-                            return;
-                        }
                         
                         byte[] newBytes = archiveManager.getBytesFromEntry(imagePath);
                         if(newBytes == null) {
@@ -524,6 +517,12 @@ public class GraficoModelExporter {
                                 }
                                 return CompletableFuture.completedFuture(null);
                             }, ioExecutor)
+                            .thenRun(() -> {
+                                // Report progress using shared reporter
+                                fProgressReporter.incrementBy(1);
+                                fProgressReporter.maybeReport(
+                                    count -> NLS.bind(Messages.GraficoModelExporter_1, count));
+                            })
                             .exceptionally(e -> {
                                 Throwable cause = e.getCause() != null ? e.getCause() : e;
                                 if (cause instanceof IOException) {
@@ -535,7 +534,6 @@ public class GraficoModelExporter {
                             });
                         
                         writeFutures.add(future);
-                        progress.worked(1);
                     }
                 }
             }
@@ -559,6 +557,55 @@ public class GraficoModelExporter {
         if (!exceptions.isEmpty()) {
             throw exceptions.get(0);
         }
+    }
+    
+    /**
+     * Count the number of unique images in the model.
+     * Used to estimate total work for progress reporting.
+     * 
+     * @return Number of unique images
+     */
+    private int countImages() {
+        Set<String> uniquePaths = new HashSet<>();
+        for(Iterator<EObject> iter = fModel.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IDiagramModelImageProvider) {
+                IDiagramModelImageProvider imageProvider = (IDiagramModelImageProvider)eObject;
+                String imagePath = imageProvider.getImagePath();
+                if(imagePath != null) {
+                    uniquePaths.add(imagePath);
+                }
+            }
+        }
+        return uniquePaths.size();
+    }
+    
+    /**
+     * Count the total number of model elements that will be exported.
+     * This includes folders, elements, and model metadata.
+     * Used to estimate total work for progress reporting.
+     * 
+     * @return Estimated number of model files
+     */
+    private int countModelElements() {
+        int count = 1; // For the model itself (folder.xml in root)
+        count += countElementsInContainer(fModel);
+        return count;
+    }
+    
+    /**
+     * Recursively count elements in a folder container.
+     */
+    private int countElementsInContainer(IFolderContainer container) {
+        int count = 0;
+        for (IFolder folder : container.getFolders()) {
+            count++; // The folder itself (folder.xml)
+            if (folder instanceof IFolder) {
+                count += ((IFolder) folder).getElements().size(); // Elements in folder
+            }
+            count += countElementsInContainer(folder); // Recurse
+        }
+        return count;
     }
     
     /**

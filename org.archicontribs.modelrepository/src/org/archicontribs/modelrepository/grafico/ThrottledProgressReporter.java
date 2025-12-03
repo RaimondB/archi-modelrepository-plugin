@@ -203,6 +203,33 @@ public class ThrottledProgressReporter {
     }
     
     /**
+     * Set a subtask message with IMMEDIATE update.
+     * Unlike other methods, this updates the UI synchronously for phase announcements.
+     * Use this for major phase transitions (e.g., "Reading files...", "Writing files...").
+     * 
+     * @param message The subtask message to display
+     */
+    public void subTask(String message) {
+        if (message != null && progress != null) {
+            // Update message generator for subsequent polls
+            messageGenerator.set(count -> message);
+            // IMMEDIATE update for phase announcements
+            progress.subTask(message);
+        }
+    }
+    
+    /**
+     * Record work done (throttled).
+     * This is NON-BLOCKING - the reporter thread will pick up the update.
+     * Use this instead of calling progress.worked() directly.
+     * 
+     * @param work The amount of work done
+     */
+    public void worked(int work) {
+        processedCount.add(work);
+    }
+    
+    /**
      * Report final progress and ensure all work is accounted for.
      * This method BLOCKS until the final report is sent and the reporter thread is stopped.
      * Call this at the end of processing.

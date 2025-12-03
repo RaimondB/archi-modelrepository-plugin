@@ -170,54 +170,53 @@ public class GraficoModelImporter {
     	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
     	
             // Load the Model from files (it will contain unresolved proxies)
-            progress.subTask(Messages.GraficoModelImporter_1);
-    	    fModel = loadModel(modelFolder, progress.split(60));
+            // Uses shared fProgressReporter for progress updates
+    	    fProgressReporter.subTask(Messages.GraficoModelImporter_1);
+    	    fModel = loadModel(modelFolder);
     	
-    	// Check for cancellation
-    	if (progress.isCanceled()) {
-    	    return null;
-    	}
+    	    // Check for cancellation
+    	    if (fProgressReporter.isCanceled()) {
+    	        return null;
+    	    }
     	
-    	// Create a new Resource for the model object so we can work with it in the ModelCompatibility class
-    	Resource resource = new XMLResourceImpl();
-    	resource.getContents().add(fModel);
+    	    // Create a new Resource for the model object so we can work with it in the ModelCompatibility class
+    	    Resource resource = new XMLResourceImpl();
+    	    resource.getContents().add(fModel);
     	
-        // Resolve proxies
-        progress.subTask(Messages.GraficoModelImporter_2);
-        resolveProxies();
-        progress.worked(15);
+            // Resolve proxies - quick operation, no per-file progress needed
+    	    fProgressReporter.subTask(Messages.GraficoModelImporter_2);
+            resolveProxies();
 
-    	// New model compatibility
-        ModelCompatibility modelCompatibility = new ModelCompatibility(resource);
+    	    // New model compatibility
+            ModelCompatibility modelCompatibility = new ModelCompatibility(resource);
     	
-        // Fix any backward compatibility issues
-    	// This has to be done here because GraficoModelLoader#loadModel() will save with latest metamodel version number
-    	// And then the ModelCompatibility won't be able to tell the version number
-        progress.subTask(Messages.GraficoModelImporter_3);
-        try {
-            modelCompatibility.fixCompatibility();
-        }
-        catch(CompatibilityHandlerException ex) {
-            ModelRepositoryPlugin.getInstance().log(IStatus.ERROR, "Error loading model", ex); //$NON-NLS-1$
-        }
-        progress.worked(5);
+            // Fix any backward compatibility issues
+    	    // This has to be done here because GraficoModelLoader#loadModel() will save with latest metamodel version number
+    	    // And then the ModelCompatibility won't be able to tell the version number
+    	    fProgressReporter.subTask(Messages.GraficoModelImporter_3);
+            try {
+                modelCompatibility.fixCompatibility();
+            }
+            catch(CompatibilityHandlerException ex) {
+                ModelRepositoryPlugin.getInstance().log(IStatus.ERROR, "Error loading model", ex); //$NON-NLS-1$
+            }
 
-    	// We now have to remove the Eobject from its Resource so it can be saved in its proper *.archimate format
-        resource.getContents().remove(fModel);
+    	    // We now have to remove the Eobject from its Resource so it can be saved in its proper *.archimate format
+            resource.getContents().remove(fModel);
         
-        // Add Archive Manager and CommandStack
-        IArchiveManager archiveManager = IArchiveManager.FACTORY.createArchiveManager(fModel);
-        fModel.setAdapter(IArchiveManager.class, archiveManager);
+            // Add Archive Manager and CommandStack
+            IArchiveManager archiveManager = IArchiveManager.FACTORY.createArchiveManager(fModel);
+            fModel.setAdapter(IArchiveManager.class, archiveManager);
         
-        // We do need a CommandStack for ACLI
-        CommandStack cmdStack = new CommandStack();
-        fModel.setAdapter(CommandStack.class, cmdStack);
+            // We do need a CommandStack for ACLI
+            CommandStack cmdStack = new CommandStack();
+            fModel.setAdapter(CommandStack.class, cmdStack);
         
-    	// Load images
-    	progress.subTask(Messages.GraficoModelImporter_4);
-    	loadImages(imagesFolder, archiveManager, progress.split(20));
+    	    // Load images - uses shared fProgressReporter for progress updates
+    	    fProgressReporter.subTask(Messages.GraficoModelImporter_4);
+    	    loadImages(imagesFolder, archiveManager);
 
-    	return fModel;
+    	    return fModel;
     	} finally {
     	    // Ensure the shared progress reporter is stopped
     	    if (fProgressReporter != null) {
@@ -235,12 +234,11 @@ public class GraficoModelImporter {
     }
     
     /**
-     * Read images from images subfolder and load them into the model
-     * Uses TRUE BATCHING with async I/O for parallel file operations
-     * @param monitor Progress monitor for UI feedback, can be null
+     * Read images from images subfolder and load them into the model.
+     * Uses TRUE BATCHING with async I/O for parallel file operations.
+     * Uses the shared fProgressReporter for progress updates.
      */
-    private void loadImages(File folder, IArchiveManager archiveManager, IProgressMonitor monitor) throws IOException {
-        SubMonitor progress = SubMonitor.convert(monitor);
+    private void loadImages(File folder, IArchiveManager archiveManager) throws IOException {
         Path folderPath = folder.toPath();
         
         if (!Files.isDirectory(folderPath)) {
@@ -258,8 +256,6 @@ public class GraficoModelImporter {
         if (filesToLoad.isEmpty()) {
             return;
         }
-        
-        progress.setWorkRemaining(filesToLoad.size());
         
         // Store results in a concurrent map
         Map<String, byte[]> imageData = new ConcurrentHashMap<>();
@@ -319,7 +315,7 @@ public class GraficoModelImporter {
             try {
                 // Wait with timeout to allow cancellation checks
                 while (!allFutures.isDone()) {
-                    if (progress.isCanceled()) {
+                    if (fProgressReporter != null && fProgressReporter.isCanceled()) {
                         cpuExecutor.shutdownNow();
                         return;
                     }
@@ -431,9 +427,7 @@ public class GraficoModelImporter {
         }
     }
     
-	private IArchimateModel loadModel(File folder, IProgressMonitor monitor) throws IOException {
-        SubMonitor progress = SubMonitor.convert(monitor);
-        
+	private IArchimateModel loadModel(File folder) throws IOException {
 		IArchimateModel model = (IArchimateModel)loadElement(new File(folder, IGraficoConstants.FOLDER_XML));
 		
 		List<FolderType> folderList = new ArrayList<FolderType>();
@@ -447,29 +441,18 @@ public class GraficoModelImporter {
 		folderList.add(FolderType.RELATIONS);
 		folderList.add(FolderType.DIAGRAMS);
 
-        // Count total files across all folders for proportional progress
-        progress.subTask(Messages.GraficoModelImporter_6);
-        Map<FolderType, Integer> folderFileCounts = new ConcurrentHashMap<>();
-        int totalFiles = 0;
-        for (FolderType folderType : folderList) {
-            File typeFolder = new File(folder, folderType.toString());
-            int count = countFilesRecursively(typeFolder);
-            folderFileCounts.put(folderType, count);
-            totalFiles += count;
-        }
-        
-        // Use total file count for proportional progress, minimum 1 to avoid division by zero
-        progress.setWorkRemaining(Math.max(totalFiles, 1));
-
 		// Loop based on FolderType enumeration
 		for(FolderType folderType : folderList) {
-		    // Check for cancellation
-		    if (progress.isCanceled()) {
+		    // Check for cancellation via shared reporter
+		    if (fProgressReporter != null && fProgressReporter.isCanceled()) {
 		        return model;
 		    }
-            progress.subTask(String.format(Messages.GraficoModelImporter_5, folderType.toString()));
-            int folderFileCount = folderFileCounts.getOrDefault(folderType, 1);
-		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()), progress.split(folderFileCount));
+		    // Update phase message via shared reporter
+		    if (fProgressReporter != null) {
+		        fProgressReporter.maybeReport(
+		            count -> String.format(Messages.GraficoModelImporter_5, folderType.toString()));
+		    }
+		    IFolder tmpFolder = loadFolder(new File(folder, folderType.toString()));
 		    if(tmpFolder != null) {
 		        model.getFolders().add(tmpFolder);
 		    }
@@ -524,16 +507,14 @@ public class GraficoModelImporter {
 	
 	/**
 	 * Load each XML file to recreate original object
-	 * Uses ForkJoinPool with proper pipelining for parallel I/O and CPU operations
+	 * Uses ForkJoinPool with proper pipelining for parallel I/O and CPU operations.
+	 * Uses the shared fProgressReporter for progress updates.
 	 * 
 	 * @param folder
-	 * @param monitor Progress monitor for UI feedback, can be null
 	 * @return Model folder
 	 * @throws IOException 
 	 */
-    private IFolder loadFolder(File folder, IProgressMonitor monitor) throws IOException {
-        SubMonitor progress = SubMonitor.convert(monitor);
-        
+    private IFolder loadFolder(File folder) throws IOException {
         Path folderPath = folder.toPath();
         Path folderXmlPath = folderPath.resolve(IGraficoConstants.FOLDER_XML);
         
@@ -559,15 +540,6 @@ public class GraficoModelImporter {
                 }
             });
         }
-        
-        // Calculate work units: files in this folder + estimated work for subfolders
-        // Subfolders will get their own proportional split from the parent's progress
-        int filesInThisFolder = filesToLoad.size();
-        int subfolderCount = foldersToLoad.size();
-        
-        // Set remaining work - files get 1 unit each, subfolders will be recursively split
-        // We use the file count from this level; subfolders handle their own counts
-        progress.setWorkRemaining(Math.max(filesInThisFolder + subfolderCount, 1));
         
         // Load files in parallel using TRUE BATCHING with async I/O + CPU parsing
         if (!filesToLoad.isEmpty()) {
@@ -689,14 +661,14 @@ public class GraficoModelImporter {
             }
         }
         
-        // Load subfolders (recursively, with progress)
+        // Load subfolders recursively
         for (Path subFolder : foldersToLoad) {
-            // Check for cancellation
-            if (progress.isCanceled()) {
+            // Check for cancellation via shared reporter
+            if (fProgressReporter != null && fProgressReporter.isCanceled()) {
                 return currentFolder;
             }
             
-            IFolder loadedFolder = loadFolder(subFolder.toFile(), progress.split(1));
+            IFolder loadedFolder = loadFolder(subFolder.toFile());
             if (loadedFolder != null) {
                 currentFolder.getFolders().add(loadedFolder);
             }
