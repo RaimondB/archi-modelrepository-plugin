@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
@@ -284,7 +285,7 @@ public class GraficoModelExporter {
             }
             
             // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
-            // Within each batch: serialize all (CPU), then start all async writes
+            // Within each batch: serialize all (CPU), then start all async writes directly (no Future wrapping)
             List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
             
             // Announce the "writing resources" phase
@@ -295,7 +296,7 @@ public class GraficoModelExporter {
                 final int end = Math.min(i + BATCH_SIZE, writeTasks.size());
                 final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
                 
-                // ONE future per batch - serializes all, then writes all async
+                // ONE future per batch - serializes all (CPU), then fires async writes directly
                 CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
                     // First pass: CPU-bound serialization and hash comparison
                     List<FileWriteRequest> writeRequests = new ArrayList<>();
@@ -320,15 +321,26 @@ public class GraficoModelExporter {
                         }
                     }
                     
-                    // Second pass: start all async writes for this batch
-                    List<CompletableFuture<Void>> batchWrites = new ArrayList<>();
-                    for (FileWriteRequest req : writeRequests) {
-                        batchWrites.add(writeFileAsync(req.file, req.content));
+                    if (writeRequests.isEmpty()) {
+                        return null; // No writes needed
                     }
                     
-                    // Return future that completes when all writes are done
-                    return CompletableFuture.allOf(batchWrites.toArray(new CompletableFuture[0]));
-                }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
+                    // Second pass: fire async writes directly using CountDownLatch for synchronization
+                    CountDownLatch writeLatch = new CountDownLatch(writeRequests.size());
+                    
+                    for (FileWriteRequest req : writeRequests) {
+                        writeFileAsyncDirect(req.file, req.content, writeLatch, exceptions);
+                    }
+                    
+                    // Wait for all writes in this batch to complete
+                    try {
+                        writeLatch.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    
+                    return null;
+                }, cpuExecutor)
                 .thenRun(() -> {
                     // Report progress after batch completes - reduces UI thread contention
                     fProgressReporter.incrementBy(batch.size());
@@ -839,6 +851,59 @@ public class GraficoModelExporter {
         }
         
         return result;
+    }
+    
+    /**
+     * Write file bytes asynchronously using AsynchronousFileChannel with direct callback.
+     * Uses CountDownLatch for synchronization instead of CompletableFuture wrapper.
+     * This is more efficient as it avoids creating a CompletableFuture per write.
+     * 
+     * @param file The file to write
+     * @param data The data to write
+     * @param latch CountDownLatch to decrement when write completes
+     * @param exceptions List to add any IOException to
+     */
+    private void writeFileAsyncDirect(File file, byte[] data, CountDownLatch latch, List<IOException> exceptions) {
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(data);
+            
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                file.toPath(), 
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING);
+            
+            channel.write(buffer, 0, null, new CompletionHandler<Integer, Void>() {
+                @Override
+                public void completed(Integer bytesWritten, Void attachment) {
+                    try {
+                        channel.close();
+                    } catch (IOException e) {
+                        exceptions.add(e);
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+                
+                @Override
+                public void failed(Throwable exc, Void attachment) {
+                    try {
+                        channel.close();
+                    } catch (IOException e) {
+                        // Ignore close error
+                    }
+                    if (exc instanceof IOException) {
+                        exceptions.add((IOException) exc);
+                    } else {
+                        exceptions.add(new IOException(exc));
+                    }
+                    latch.countDown();
+                }
+            });
+        } catch (IOException e) {
+            exceptions.add(e);
+            latch.countDown();
+        }
     }
     
     /**
