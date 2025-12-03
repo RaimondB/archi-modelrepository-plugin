@@ -237,11 +237,21 @@ Images are loaded eagerly but may not be immediately needed. Consider lazy loadi
 ---
 
 ### 15. Skip Unchanged Folders During Cleanup (Exporter)
-**Status:** Not Started  
+**Status:** ✅ Completed (2025-12-04)  
 **Impact:** Medium - Reduce directory traversal  
 **Effort:** Low  
 
-`cleanupObsoleteFiles()` traverses all directories. If we track which folders had changes, we can skip unchanged subtrees.
+~~`cleanupObsoleteFiles()` traverses all directories. If we track which folders had changes, we can skip unchanged subtrees.~~
+
+**Implementation:**
+- Added `expectedDirectories` set that tracks all parent directories of expected files
+- In `preVisitDirectory()`, check if directory is in `expectedDirectories`
+- If not, delete entire subtree with `deleteDirectoryRecursively()` and return `SKIP_SUBTREE`
+- Avoids traversing obsolete folder structures file-by-file
+
+**Benefits:**
+- If a folder with 1000 files is deleted from the model, we now delete it in one operation instead of visiting each file
+- Reduces set lookups from O(files in subtree) to O(1) for skipped directories
 
 ---
 
@@ -332,6 +342,7 @@ Write-VolumeCache C:
 
 | Date | Item | Status | Notes |
 |------|------|--------|-------|
+| 2025-12-04 | #15 Skip Unchanged Folders | ✅ Completed | Track expectedDirectories, use SKIP_SUBTREE for obsolete folders |
 | 2025-12-04 | #13 Streaming Serialization | ❌ N/A | In-memory required for change detection before write |
 | 2025-12-04 | #5 Limit File Handles | ✅ Already Handled | Batching + ForkJoinPool + OS-level I/O management |
 | 2025-12-04 | #1 Dirty Flag Tracking | ❌ Not Feasible | EMF objects are copies, not tracked across exports |

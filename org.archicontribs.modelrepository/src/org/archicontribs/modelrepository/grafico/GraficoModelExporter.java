@@ -128,6 +128,7 @@ public class GraficoModelExporter {
         // Clear tracking sets
         expectedFiles.clear();
         writtenFiles.clear();
+        expectedDirectories.clear();
         
         // Check for cancellation
         if (progress.isCanceled()) {
@@ -682,11 +683,23 @@ public class GraficoModelExporter {
     private Set<java.nio.file.Path> expectedFiles = ConcurrentHashMap.newKeySet();
     private Set<java.nio.file.Path> writtenFiles = ConcurrentHashMap.newKeySet();
     
+    // Track directories that contain expected files - used to skip unchanged subtrees during cleanup
+    private Set<java.nio.file.Path> expectedDirectories = ConcurrentHashMap.newKeySet();
+    
     /**
      * Add a path to expectedFiles, normalizing it first for consistent lookups.
+     * Also tracks all parent directories for efficient subtree skipping during cleanup.
      */
     private void addExpectedFile(java.nio.file.Path path) {
-        expectedFiles.add(path.normalize());
+        java.nio.file.Path normalized = path.normalize();
+        expectedFiles.add(normalized);
+        
+        // Track all parent directories up to root for subtree skipping
+        java.nio.file.Path parent = normalized.getParent();
+        while (parent != null) {
+            expectedDirectories.add(parent);
+            parent = parent.getParent();
+        }
     }
     
     /**
@@ -890,6 +903,9 @@ public class GraficoModelExporter {
      * Uses NIO2 Files.walkFileTree() for efficient single-pass deletion.
      * Files are deleted during visitFile(), directories are deleted in postVisitDirectory()
      * (after their contents have been processed), which is safe and efficient.
+     * 
+     * Optimization: Skips entire subtrees that have no expected files (SKIP_SUBTREE),
+     * avoiding traversal of unchanged directory structures.
      */
     private void cleanupObsoleteFiles(File folder) throws IOException {
         if (!folder.exists()) {
@@ -901,6 +917,23 @@ public class GraficoModelExporter {
         java.nio.file.Path folderPath = folder.toPath().normalize();
         
         Files.walkFileTree(folderPath, new SimpleFileVisitor<java.nio.file.Path>() {
+            @Override
+            public FileVisitResult preVisitDirectory(java.nio.file.Path dir, BasicFileAttributes attrs) {
+                // Skip subtrees that have no expected files - they can't contain anything we need to keep
+                // But always visit the root folder itself
+                java.nio.file.Path normalizedDir = dir.normalize();
+                if (!normalizedDir.equals(folderPath) && !expectedDirectories.contains(normalizedDir)) {
+                    // This directory has no expected files - delete entire subtree and skip
+                    try {
+                        deleteDirectoryRecursively(dir);
+                    } catch (IOException e) {
+                        // Ignore deletion errors for cleanup
+                    }
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+            
             @Override
             public FileVisitResult visitFile(java.nio.file.Path path, BasicFileAttributes attrs) {
                 // Normalize path for consistent lookup (matches how paths were added to sets)
@@ -934,6 +967,26 @@ public class GraficoModelExporter {
         if (folder.exists() && isEmptyDirectory(folder)) {
             Files.delete(folder.toPath());
         }
+    }
+    
+    /**
+     * Delete a directory and all its contents recursively.
+     * Used for cleaning up entire subtrees that have no expected files.
+     */
+    private void deleteDirectoryRecursively(java.nio.file.Path dir) throws IOException {
+        Files.walkFileTree(dir, new SimpleFileVisitor<java.nio.file.Path>() {
+            @Override
+            public FileVisitResult visitFile(java.nio.file.Path file, BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+            
+            @Override
+            public FileVisitResult postVisitDirectory(java.nio.file.Path d, IOException exc) throws IOException {
+                Files.delete(d);
+                return FileVisitResult.CONTINUE;
+            }
+        });
     }
     
     /**
