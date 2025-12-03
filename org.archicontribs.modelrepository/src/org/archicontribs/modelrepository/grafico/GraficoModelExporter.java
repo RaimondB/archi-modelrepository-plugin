@@ -205,16 +205,18 @@ public class GraficoModelExporter {
                                     existingHashCache.put(file, hash);
                                 }
                             }
-                            
-                            // Throttled progress update - minimizes UI thread sync
-                            hashProgressReporter.incrementAndMaybeReport(
-                                count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
                         }, cpuExecutor);
                     batchReads.add(readFuture);
                 }
                 // Wait for all reads in this batch to complete
                 return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-            }, cpuExecutor).thenCompose(f -> f); // Flatten the nested future
+            }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
+            .thenRun(() -> {
+                // Report progress after batch completes - reduces UI thread contention
+                hashProgressReporter.incrementBy(batch.size());
+                hashProgressReporter.maybeReport(
+                    count -> NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
+            });
             
             hashFutures.add(batchFuture);
         }
@@ -292,10 +294,6 @@ public class GraficoModelExporter {
                     } catch (IOException ex) {
                         exceptions.add(ex);
                     }
-                    
-                    // Throttled progress update - minimizes UI thread sync
-                    writeProgressReporter.incrementAndMaybeReport(
-                        count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalResources)); //$NON-NLS-1$
                 }
                 
                 // Second pass: start all async writes for this batch
@@ -306,7 +304,13 @@ public class GraficoModelExporter {
                 
                 // Return future that completes when all writes are done
                 return CompletableFuture.allOf(batchWrites.toArray(new CompletableFuture[0]));
-            }, cpuExecutor).thenCompose(f -> f); // Flatten the nested future
+            }, cpuExecutor).thenCompose(f -> f) // Flatten the nested future
+            .thenRun(() -> {
+                // Report progress after batch completes - reduces UI thread contention
+                writeProgressReporter.incrementBy(batch.size());
+                writeProgressReporter.maybeReport(
+                    count -> NLS.bind(Messages.GraficoModelExporter_5, count + " of " + totalResources)); //$NON-NLS-1$
+            });
             
             writeFutures.add(batchFuture);
         }

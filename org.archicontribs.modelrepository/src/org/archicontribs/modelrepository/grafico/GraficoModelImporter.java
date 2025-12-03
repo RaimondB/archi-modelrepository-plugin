@@ -269,10 +269,6 @@ public class GraficoModelImporter {
                                 if (bytes != null) {
                                     imageData.put(path.getFileName().toString(), bytes);
                                 }
-                                
-                                // Throttled progress update - minimizes UI thread sync
-                                imageProgressReporter.incrementAndMaybeReport(
-                                    count -> String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
                             });
                         
                         batchReads.add(readFuture);
@@ -280,7 +276,13 @@ public class GraficoModelImporter {
                     
                     // Return future that completes when all batch reads are done
                     return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-                }, cpuExecutor).thenCompose(f -> f); // Flatten nested future
+                }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
+                .thenRun(() -> {
+                    // Report progress after batch completes - reduces UI thread contention
+                    imageProgressReporter.incrementBy(batch.size());
+                    imageProgressReporter.maybeReport(
+                        count -> String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                });
                 
                 futures.add(batchFuture);
             }
@@ -578,10 +580,6 @@ public class GraficoModelImporter {
                                     if (element != null) {
                                         loadedElements.put(path, element);
                                     }
-                                    
-                                    // Throttled progress update - minimizes UI thread sync
-                                    loadProgressReporter.incrementAndMaybeReport(
-                                        count -> String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
                                 });
                             
                             batchReads.add(readFuture);
@@ -589,7 +587,13 @@ public class GraficoModelImporter {
                         
                         // Return future that completes when all batch reads are done
                         return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-                    }, cpuExecutor).thenCompose(f -> f); // Flatten nested future
+                    }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
+                    .thenRun(() -> {
+                        // Report progress after batch completes - reduces UI thread contention
+                        loadProgressReporter.incrementBy(batch.size());
+                        loadProgressReporter.maybeReport(
+                            count -> String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                    });
                     
                     futures.add(batchFuture);
                 }
