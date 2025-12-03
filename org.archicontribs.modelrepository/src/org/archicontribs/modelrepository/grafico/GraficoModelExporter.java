@@ -258,7 +258,7 @@ public class GraficoModelExporter {
                             if (!Arrays.equals(existingContent, newContent)) {
                                 // Content changed - queue for async write (content still in memory)
                                 task.file.getParentFile().mkdirs();
-                                writtenFiles.add(task.file);
+                                addWrittenFile(task.file.toPath());
                                 writeRequests.add(new FileWriteRequest(task.file, newContent));
                             }
                             // If unchanged, newContent is released immediately (no storage)
@@ -485,8 +485,8 @@ public class GraficoModelExporter {
         // Add the object to the resource
         resource.getContents().add(object);
         
-        // Track this file as expected
-        expectedFiles.add(file);
+        // Track this file as expected (use Path for faster cleanup lookups)
+        addExpectedFile(file.toPath());
     }
       /**
      * Extract and save images used inside a model as separate image files
@@ -526,7 +526,7 @@ public class GraficoModelExporter {
                         }
                         
                         File file = new File(fLocalRepoFolder, imagePath);
-                        expectedFiles.add(file);
+                        addExpectedFile(file.toPath());
                         
                         final File targetFile = file;
                         final byte[] contentToWrite = newBytes;
@@ -551,7 +551,7 @@ public class GraficoModelExporter {
                                 // I/O: Write file if content changed using async channel
                                 if (dataToWrite != null) {
                                     targetFile.getParentFile().mkdirs();
-                                    writtenFiles.add(targetFile);
+                                    addWrittenFile(targetFile.toPath());
                                     return writeFileAsync(targetFile, dataToWrite);
                                 }
                                 return CompletableFuture.completedFuture(null);
@@ -677,8 +677,24 @@ public class GraficoModelExporter {
     
     // Use ConcurrentHashMap.newKeySet() for better concurrent scalability than Collections.synchronizedSet()
     // These sets are accessed from multiple threads during parallel I/O operations
-    private Set<File> expectedFiles = ConcurrentHashMap.newKeySet();
-    private Set<File> writtenFiles = ConcurrentHashMap.newKeySet();
+    // Using Path instead of File for faster lookups (no object conversion needed in cleanup)
+    // Paths are normalized before adding to ensure consistent hashCode/equals
+    private Set<java.nio.file.Path> expectedFiles = ConcurrentHashMap.newKeySet();
+    private Set<java.nio.file.Path> writtenFiles = ConcurrentHashMap.newKeySet();
+    
+    /**
+     * Add a path to expectedFiles, normalizing it first for consistent lookups.
+     */
+    private void addExpectedFile(java.nio.file.Path path) {
+        expectedFiles.add(path.normalize());
+    }
+    
+    /**
+     * Add a path to writtenFiles, normalizing it first for consistent lookups.
+     */
+    private void addWrittenFile(java.nio.file.Path path) {
+        writtenFiles.add(path.normalize());
+    }
     
     // Buffer size for file operations (64KB for better disk throughput)
     private static final int BUFFER_SIZE = 64 * 1024;
@@ -881,11 +897,15 @@ public class GraficoModelExporter {
         }
         
         // Single-pass walk: delete obsolete files immediately, delete empty directories after contents processed
-        Files.walkFileTree(folder.toPath(), new SimpleFileVisitor<java.nio.file.Path>() {
+        // Uses normalized Path for O(1) set lookups (no File object conversion needed)
+        java.nio.file.Path folderPath = folder.toPath().normalize();
+        
+        Files.walkFileTree(folderPath, new SimpleFileVisitor<java.nio.file.Path>() {
             @Override
             public FileVisitResult visitFile(java.nio.file.Path path, BasicFileAttributes attrs) {
-                File file = path.toFile();
-                if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
+                // Normalize path for consistent lookup (matches how paths were added to sets)
+                java.nio.file.Path normalizedPath = path.normalize();
+                if (!writtenFiles.contains(normalizedPath) && !expectedFiles.contains(normalizedPath)) {
                     // File is obsolete - delete immediately
                     try {
                         Files.delete(path);
@@ -899,7 +919,7 @@ public class GraficoModelExporter {
             @Override
             public FileVisitResult postVisitDirectory(java.nio.file.Path dir, IOException exc) throws IOException {
                 // Don't delete the root folder itself
-                if (!dir.equals(folder.toPath())) {
+                if (!dir.equals(folderPath)) {
                     // Check if directory is now empty and delete if so
                     // This is safe because postVisitDirectory is called AFTER all contents are processed
                     if (isEmptyDirectory(dir)) {
