@@ -702,32 +702,98 @@ public class GraficoModelExporter {
     }
     
     /**
-     * Clean up any files that were not written in this export
+     * Clean up any files that were not written in this export.
+     * Uses virtual threads for I/O-bound deletions with batched CompletableFutures.
      */
     private void cleanupObsoleteFiles(File folder) throws IOException {
         if (!folder.exists()) {
             return;
         }
         
-        File[] files = folder.listFiles();
-        if (files != null) {
-            for (File file : files) {
-                if (file.isDirectory()) {
-                    cleanupObsoleteFiles(file);
-                    // Delete directory if empty
-                    if (file.exists() && file.list().length == 0) {
-                        file.delete();
-                    }
-                }
-                else if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
-                    file.delete();
-                }
-            }
+        // First, collect all files to delete (recursive traversal)
+        List<File> filesToDelete = new ArrayList<>();
+        List<File> directoriesToCheck = new ArrayList<>();
+        collectObsoleteFiles(folder, filesToDelete, directoriesToCheck);
+        
+        if (filesToDelete.isEmpty() && directoriesToCheck.isEmpty()) {
+            return;
         }
         
-        // Delete the folder if it's empty
-        if (folder.exists() && folder.list().length == 0) {
-            folder.delete();
+        // Use virtual threads for I/O-bound file deletions (not ForkJoinPool which is for CPU work)
+        ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        List<CompletableFuture<Void>> deleteFutures = new ArrayList<>();
+        
+        try {
+            // TRUE BATCHING: One future per batch of file deletions
+            for (int i = 0; i < filesToDelete.size(); i += BATCH_SIZE) {
+                final int start = i;
+                final int end = Math.min(i + BATCH_SIZE, filesToDelete.size());
+                final List<File> batch = filesToDelete.subList(start, end);
+                
+                // Virtual threads handle I/O blocking efficiently
+                CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
+                    for (File file : batch) {
+                        try {
+                            Files.deleteIfExists(file.toPath());
+                        } catch (IOException e) {
+                            // Ignore deletion errors for cleanup
+                        }
+                    }
+                }, ioExecutor);
+                
+                deleteFutures.add(batchFuture);
+            }
+            
+            // Wait for all file deletions to complete
+            CompletableFuture.allOf(deleteFutures.toArray(new CompletableFuture[0])).join();
+            
+            // Now clean up empty directories (must be done after files are deleted)
+            // Process in reverse order (deepest first) to handle nested empty dirs
+            Collections.reverse(directoriesToCheck);
+            for (File dir : directoriesToCheck) {
+                if (dir.exists() && dir.isDirectory()) {
+                    String[] contents = dir.list();
+                    if (contents != null && contents.length == 0) {
+                        dir.delete();
+                    }
+                }
+            }
+            
+            // Finally check if the root folder is empty
+            if (folder.exists() && folder.isDirectory()) {
+                String[] contents = folder.list();
+                if (contents != null && contents.length == 0) {
+                    folder.delete();
+                }
+            }
+        } finally {
+            ioExecutor.shutdown();
+        }
+    }
+    
+    /**
+     * Recursively collect obsolete files and directories for cleanup.
+     * 
+     * @param folder Current folder to scan
+     * @param filesToDelete List to add obsolete files to
+     * @param directoriesToCheck List to add directories to (for empty dir cleanup)
+     */
+    private void collectObsoleteFiles(File folder, List<File> filesToDelete, List<File> directoriesToCheck) {
+        File[] files = folder.listFiles();
+        if (files == null) {
+            return;
+        }
+        
+        for (File file : files) {
+            if (file.isDirectory()) {
+                // Recurse into subdirectory
+                collectObsoleteFiles(file, filesToDelete, directoriesToCheck);
+                // Track directory for potential empty cleanup
+                directoriesToCheck.add(file);
+            } else if (!writtenFiles.contains(file) && !expectedFiles.contains(file)) {
+                // File is obsolete - queue for deletion
+                filesToDelete.add(file);
+            }
         }
     }
     

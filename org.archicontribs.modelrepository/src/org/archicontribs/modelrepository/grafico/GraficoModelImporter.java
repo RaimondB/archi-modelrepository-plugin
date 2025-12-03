@@ -213,7 +213,7 @@ public class GraficoModelImporter {
     
     /**
      * Read images from images subfolder and load them into the model
-     * Uses async I/O with proper pipelining for parallel file operations
+     * Uses TRUE BATCHING with async I/O for parallel file operations
      * @param monitor Progress monitor for UI feedback, can be null
      */
     private void loadImages(File folder, IArchiveManager archiveManager, IProgressMonitor monitor) throws IOException {
@@ -243,30 +243,48 @@ public class GraficoModelImporter {
         AtomicInteger filesProcessed = new AtomicInteger(0);
         final int totalFiles = filesToLoad.size();
         
+        // Use ForkJoinPool for coordinating batches
+        ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+        
         try {
-            // Properly pipelined: async read -> store result
-            // All async reads are started, then we wait for all to complete
+            // TRUE BATCHING: One CompletableFuture per batch (reduces futures overhead)
+            // Within each batch: start async reads, store results as they complete
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             
-            for (Path path : filesToLoad) {
-                // Chain: async read -> store in map
-                CompletableFuture<Void> future = readFileAsync(path.toFile())
-                    .thenAccept(bytes -> {
-                        if (bytes != null) {
-                            imageData.put(path.getFileName().toString(), bytes);
-                        }
-                        
-                        // Report progress every 1000 files
-                        int count = filesProcessed.incrementAndGet();
-                        if (count % 1000 == 0) {
-                            progress.subTask(String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
-                        }
-                    });
+            for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
+                final int start = i;
+                final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
+                final List<Path> batch = filesToLoad.subList(start, end);
                 
-                futures.add(future);
+                // ONE future per batch - starts async reads for all files in batch
+                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                    
+                    for (Path path : batch) {
+                        CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
+                            .thenAccept(bytes -> {
+                                if (bytes != null) {
+                                    imageData.put(path.getFileName().toString(), bytes);
+                                }
+                                
+                                // Report progress every 1000 files
+                                int count = filesProcessed.incrementAndGet();
+                                if (count % 1000 == 0) {
+                                    progress.subTask(String.format(Messages.GraficoModelImporter_4 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                                }
+                            });
+                        
+                        batchReads.add(readFuture);
+                    }
+                    
+                    // Return future that completes when all batch reads are done
+                    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+                }, cpuExecutor).thenCompose(f -> f); // Flatten nested future
+                
+                futures.add(batchFuture);
             }
             
-            // Wait for all async reads to complete
+            // Wait for all batches to complete
             CompletableFuture<Void> allFutures = CompletableFuture.allOf(
                 futures.toArray(new CompletableFuture[0])
             );
@@ -275,6 +293,7 @@ public class GraficoModelImporter {
                 // Wait with timeout to allow cancellation checks
                 while (!allFutures.isDone()) {
                     if (progress.isCanceled()) {
+                        cpuExecutor.shutdownNow();
                         return;
                     }
                     try {
@@ -300,7 +319,7 @@ public class GraficoModelImporter {
             
             progress.worked(filesToLoad.size());
         } finally {
-            // No executor to shutdown since async file channel handles its own threads
+            cpuExecutor.shutdown();
         }
         
         // Add all loaded images to the archive manager
@@ -502,7 +521,7 @@ public class GraficoModelImporter {
         // We use the file count from this level; subfolders handle their own counts
         progress.setWorkRemaining(Math.max(filesInThisFolder + subfolderCount, 1));
         
-        // Load files in parallel using properly pipelined async I/O + CPU parsing
+        // Load files in parallel using TRUE BATCHING with async I/O + CPU parsing
         if (!filesToLoad.isEmpty()) {
             ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
             
@@ -512,49 +531,66 @@ public class GraficoModelImporter {
             final int totalFiles = filesToLoad.size();
             
             try {
-                // Properly pipelined: async read (I/O-bound) -> parse XML (CPU-bound)
+                // TRUE BATCHING: One CompletableFuture per batch (reduces 30,000 futures to ~300)
+                // Within each batch: start async reads, then process results as they complete
                 List<CompletableFuture<Void>> futures = new ArrayList<>();
                 
-                for (Path path : filesToLoad) {
-                    // Chain: async read -> parse XML in CPU pool -> store result
-                    CompletableFuture<Void> future = readFileAsync(path.toFile())
-                        .thenApplyAsync(bytes -> {
-                            // CPU-bound: parse XML from bytes
-                            if (bytes == null) {
-                                return null;
-                            }
-                            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                                
-                                // Update ID -> Object mapping table (thread-safe map)
-                                fIDLookup.put(eObject.getId(), eObject);
-                                if (eObject instanceof IArchimateModel) {
-                                    for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
-                                        fIDLookup.put(profile.getId(), profile);
-                                    }
-                                }
-                                
-                                return eObject;
-                            } catch (IOException e) {
-                                throw new RuntimeException(e);
-                            }
-                        }, cpuExecutor)
-                        .thenAccept(element -> {
-                            if (element != null) {
-                                loadedElements.put(path, element);
-                            }
-                            
-                            // Report progress every 1000 files
-                            int count = filesProcessed.incrementAndGet();
-                            if (count % 1000 == 0) {
-                                progress.subTask(String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
-                            }
-                        });
+                for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
+                    final int start = i;
+                    final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
+                    final List<Path> batch = filesToLoad.subList(start, end);
                     
-                    futures.add(future);
+                    // ONE future per batch - starts async reads, chains CPU parsing
+                    CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                        // Start all async reads for this batch
+                        List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                        
+                        for (Path path : batch) {
+                            CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
+                                .thenApplyAsync(bytes -> {
+                                    // CPU-bound: parse XML from bytes
+                                    if (bytes == null) {
+                                        return null;
+                                    }
+                                    try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                                        IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                                        
+                                        // Update ID -> Object mapping table (thread-safe map)
+                                        fIDLookup.put(eObject.getId(), eObject);
+                                        if (eObject instanceof IArchimateModel) {
+                                            for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
+                                                fIDLookup.put(profile.getId(), profile);
+                                            }
+                                        }
+                                        
+                                        return eObject;
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }, cpuExecutor)
+                                .thenAccept(element -> {
+                                    if (element != null) {
+                                        loadedElements.put(path, element);
+                                    }
+                                    
+                                    // Report progress every 1000 files
+                                    int count = filesProcessed.incrementAndGet();
+                                    if (count % 1000 == 0) {
+                                        progress.subTask(String.format(Messages.GraficoModelImporter_1 + " (%d of %d)", count, totalFiles)); //$NON-NLS-1$
+                                    }
+                                });
+                            
+                            batchReads.add(readFuture);
+                        }
+                        
+                        // Return future that completes when all batch reads are done
+                        return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+                    }, cpuExecutor).thenCompose(f -> f); // Flatten nested future
+                    
+                    futures.add(batchFuture);
                 }
                 
-                // Wait for all loads to complete using allOf for better composition
+                // Wait for all batches to complete
                 CompletableFuture<Void> allFutures = CompletableFuture.allOf(
                     futures.toArray(new CompletableFuture[0])
                 );
