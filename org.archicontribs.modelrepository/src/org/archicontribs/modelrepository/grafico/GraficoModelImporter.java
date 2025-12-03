@@ -108,6 +108,13 @@ public class GraficoModelImporter {
      */
     private ThrottledProgressReporter fProgressReporter;
     
+    /**
+     * Shared CPU executor for parallel XML parsing across all folders.
+     * Sized to CPU cores since XML parsing is CPU-bound.
+     * Created once per import, not per folder.
+     */
+    private ForkJoinPool fCpuExecutor;
+    
     // Batch size for CompletableFuture operations (reduces overhead from 30,000 futures to ~300)
     private static final int BATCH_SIZE = 100;
     
@@ -166,12 +173,16 @@ public class GraficoModelImporter {
     	// This ensures only ONE background thread handles UI updates across all phases
     	fProgressReporter = new ThrottledProgressReporter(progress.split(80), totalFiles);
     	
+    	// Create a SINGLE shared CPU executor for all parallel XML parsing
+    	// This avoids creating a new ForkJoinPool for each folder in the hierarchy
+    	fCpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+    	
     	try {
     	    // Reset the ID -> Object lookup table
     	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
     	
             // Load the Model from files (it will contain unresolved proxies)
-            // Uses shared fProgressReporter for progress updates
+            // Uses shared fProgressReporter and fCpuExecutor
     	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_1, 0, modelFileCount));
     	    fModel = loadModel(modelFolder, modelFileCount);
     	
@@ -213,12 +224,17 @@ public class GraficoModelImporter {
             CommandStack cmdStack = new CommandStack();
             fModel.setAdapter(CommandStack.class, cmdStack);
         
-    	    // Load images - uses shared fProgressReporter for progress updates
+    	    // Load images - uses shared fProgressReporter and fCpuExecutor
     	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_4, 0, imageFileCount));
     	    loadImages(imagesFolder, archiveManager, imageFileCount);
 
     	    return fModel;
     	} finally {
+    	    // Ensure the shared CPU executor is stopped
+    	    if (fCpuExecutor != null) {
+    	        fCpuExecutor.shutdown();
+    	        fCpuExecutor = null;
+    	    }
     	    // Ensure the shared progress reporter is stopped
     	    if (fProgressReporter != null) {
     	        fProgressReporter.finish(null);
@@ -266,88 +282,78 @@ public class GraficoModelImporter {
         Map<String, byte[]> imageData = new ConcurrentHashMap<>();
         final int totalFiles = filesToLoad.size();
         
-        // Use ForkJoinPool for coordinating batches
-        ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+        // Use the shared CPU executor and progress reporter (created in importAsModel)
+        // This avoids creating a new ForkJoinPool for images
         
-        // Use the shared progress reporter (created in importAsModel)
-        // This ensures only ONE background thread handles UI updates
+        // TRUE BATCHING: One CompletableFuture per batch (reduces futures overhead)
+        // Within each batch: start async reads, store results as they complete
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        
+        for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
+            final int start = i;
+            final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
+            final List<Path> batch = filesToLoad.subList(start, end);
+            
+            // ONE future per batch - starts async reads for all files in batch
+            CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                
+                for (Path path : batch) {
+                    CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
+                        .thenAccept(bytes -> {
+                            if (bytes != null) {
+                                imageData.put(path.getFileName().toString(), bytes);
+                            }
+                        });
+                    
+                    batchReads.add(readFuture);
+                }
+                
+                // Return future that completes when all batch reads are done
+                return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+            }, fCpuExecutor).thenCompose(f -> f) // Flatten nested future
+            .thenRun(() -> {
+                // Report progress via shared reporter - NON-BLOCKING
+                if (fProgressReporter != null) {
+                    fProgressReporter.incrementBy(batch.size());
+                    fProgressReporter.maybeReport(
+                        count -> NLS.bind(Messages.GraficoModelImporter_4, count, totalImages));
+                }
+            });
+            
+            futures.add(batchFuture);
+        }
+        
+        // Wait for all batches to complete
+        CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+            futures.toArray(new CompletableFuture[0])
+        );
         
         try {
-            // TRUE BATCHING: One CompletableFuture per batch (reduces futures overhead)
-            // Within each batch: start async reads, store results as they complete
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            
-            for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
-                final int start = i;
-                final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
-                final List<Path> batch = filesToLoad.subList(start, end);
-                
-                // ONE future per batch - starts async reads for all files in batch
-                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
-                    
-                    for (Path path : batch) {
-                        CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
-                            .thenAccept(bytes -> {
-                                if (bytes != null) {
-                                    imageData.put(path.getFileName().toString(), bytes);
-                                }
-                            });
-                        
-                        batchReads.add(readFuture);
-                    }
-                    
-                    // Return future that completes when all batch reads are done
-                    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-                }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
-                .thenRun(() -> {
-                    // Report progress via shared reporter - NON-BLOCKING
-                    if (fProgressReporter != null) {
-                        fProgressReporter.incrementBy(batch.size());
-                        fProgressReporter.maybeReport(
-                            count -> NLS.bind(Messages.GraficoModelImporter_4, count, totalImages));
-                    }
-                });
-                
-                futures.add(batchFuture);
-            }
-            
-            // Wait for all batches to complete
-            CompletableFuture<Void> allFutures = CompletableFuture.allOf(
-                futures.toArray(new CompletableFuture[0])
-            );
-            
-            try {
-                // Wait with timeout to allow cancellation checks
-                while (!allFutures.isDone()) {
-                    if (fProgressReporter != null && fProgressReporter.isCanceled()) {
-                        cpuExecutor.shutdownNow();
-                        return;
-                    }
-                    try {
-                        allFutures.get(100, TimeUnit.MILLISECONDS);
-                    } catch (java.util.concurrent.TimeoutException e) {
-                        // Continue checking for cancellation
-                    }
+            // Wait with timeout to allow cancellation checks
+            while (!allFutures.isDone()) {
+                if (fProgressReporter != null && fProgressReporter.isCanceled()) {
+                    return;
                 }
-                // Final get to propagate any exceptions
-                allFutures.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Image load interrupted", e); //$NON-NLS-1$
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
-                    throw (IOException) cause.getCause();
-                } else if (cause instanceof IOException) {
-                    throw (IOException) cause;
+                try {
+                    allFutures.get(100, TimeUnit.MILLISECONDS);
+                } catch (java.util.concurrent.TimeoutException e) {
+                    // Continue checking for cancellation
                 }
-                throw new IOException("Failed to load images", e); //$NON-NLS-1$
             }
-            
-            // Progress is reported via shared reporter - no finish() here
-        } finally {
-            cpuExecutor.shutdown();
+            // Final get to propagate any exceptions
+            allFutures.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Image load interrupted", e); //$NON-NLS-1$
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                throw (IOException) cause.getCause();
+            } else if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException("Failed to load images", e); //$NON-NLS-1$
         }
         
         // Add all loaded images to the archive manager
@@ -548,122 +554,114 @@ public class GraficoModelImporter {
         }
         
         // Load files in parallel using TRUE BATCHING with async I/O + CPU parsing
+        // Uses the shared fCpuExecutor (created once in importAsModel)
         if (!filesToLoad.isEmpty()) {
-            ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
-            
             // Use a concurrent map to store loaded elements
             Map<Path, EObject> loadedElements = new ConcurrentHashMap<>();
             final int totalFiles = filesToLoad.size();
             
-            // Use the shared progress reporter (created in importAsModel)
-            // This ensures only ONE background thread handles UI updates
+            // Use the shared progress reporter and CPU executor (created in importAsModel)
+            // This ensures only ONE ForkJoinPool across all folders
+            
+            // TRUE BATCHING: One CompletableFuture per batch (reduces 30,000 futures to ~300)
+            // Within each batch: start async reads, then process results as they complete
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            
+            for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
+                final int start = i;
+                final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
+                final List<Path> batch = filesToLoad.subList(start, end);
+                
+                // ONE future per batch - starts async reads, chains CPU parsing
+                CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                    // Start all async reads for this batch
+                    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                    
+                    for (Path path : batch) {
+                        CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
+                            .thenApplyAsync(bytes -> {
+                                // CPU-bound: parse XML from bytes
+                                if (bytes == null) {
+                                    return null;
+                                }
+                                try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                                    IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                                    
+                                    // Update ID -> Object mapping table (thread-safe map)
+                                    fIDLookup.put(eObject.getId(), eObject);
+                                    if (eObject instanceof IArchimateModel) {
+                                        for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
+                                            fIDLookup.put(profile.getId(), profile);
+                                        }
+                                    }
+                                    
+                                    return eObject;
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            }, fCpuExecutor)
+                            .thenAccept(element -> {
+                                if (element != null) {
+                                    loadedElements.put(path, element);
+                                }
+                            });
+                        
+                        batchReads.add(readFuture);
+                    }
+                    
+                    // Return future that completes when all batch reads are done
+                    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+                }, fCpuExecutor).thenCompose(f -> f) // Flatten nested future
+                .thenRun(() -> {
+                    // Report progress via shared reporter - NON-BLOCKING
+                    if (fProgressReporter != null) {
+                        fProgressReporter.incrementBy(batch.size());
+                        fProgressReporter.maybeReport(
+                            count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                    }
+                });
+                
+                futures.add(batchFuture);
+            }
+            
+            // Wait for all batches to complete
+            CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0])
+            );
             
             try {
-                // TRUE BATCHING: One CompletableFuture per batch (reduces 30,000 futures to ~300)
-                // Within each batch: start async reads, then process results as they complete
-                List<CompletableFuture<Void>> futures = new ArrayList<>();
-                
-                for (int i = 0; i < filesToLoad.size(); i += BATCH_SIZE) {
-                    final int start = i;
-                    final int end = Math.min(i + BATCH_SIZE, filesToLoad.size());
-                    final List<Path> batch = filesToLoad.subList(start, end);
-                    
-                    // ONE future per batch - starts async reads, chains CPU parsing
-                    CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
-                        // Start all async reads for this batch
-                        List<CompletableFuture<Void>> batchReads = new ArrayList<>();
-                        
-                        for (Path path : batch) {
-                            CompletableFuture<Void> readFuture = readFileAsync(path.toFile())
-                                .thenApplyAsync(bytes -> {
-                                    // CPU-bound: parse XML from bytes
-                                    if (bytes == null) {
-                                        return null;
-                                    }
-                                    try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                                        IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                                        
-                                        // Update ID -> Object mapping table (thread-safe map)
-                                        fIDLookup.put(eObject.getId(), eObject);
-                                        if (eObject instanceof IArchimateModel) {
-                                            for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
-                                                fIDLookup.put(profile.getId(), profile);
-                                            }
-                                        }
-                                        
-                                        return eObject;
-                                    } catch (IOException e) {
-                                        throw new RuntimeException(e);
-                                    }
-                                }, cpuExecutor)
-                                .thenAccept(element -> {
-                                    if (element != null) {
-                                        loadedElements.put(path, element);
-                                    }
-                                });
-                            
-                            batchReads.add(readFuture);
-                        }
-                        
-                        // Return future that completes when all batch reads are done
-                        return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
-                    }, cpuExecutor).thenCompose(f -> f) // Flatten nested future
-                    .thenRun(() -> {
-                        // Report progress via shared reporter - NON-BLOCKING
-                        if (fProgressReporter != null) {
-                            fProgressReporter.incrementBy(batch.size());
-                            fProgressReporter.maybeReport(
-                                count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-                        }
-                    });
-                    
-                    futures.add(batchFuture);
-                }
-                
-                // Wait for all batches to complete
-                CompletableFuture<Void> allFutures = CompletableFuture.allOf(
-                    futures.toArray(new CompletableFuture[0])
-                );
-                
-                try {
-                    // Wait with timeout to allow cancellation checks
-                    while (!allFutures.isDone()) {
-                        if (fProgressReporter != null && fProgressReporter.isCanceled()) {
-                            cpuExecutor.shutdownNow();
-                            return currentFolder;
-                        }
-                        try {
-                            allFutures.get(100, TimeUnit.MILLISECONDS);
-                        } catch (java.util.concurrent.TimeoutException e) {
-                            // Continue checking for cancellation
-                        }
+                // Wait with timeout to allow cancellation checks
+                while (!allFutures.isDone()) {
+                    if (fProgressReporter != null && fProgressReporter.isCanceled()) {
+                        return currentFolder;
                     }
-                    // Final get to propagate any exceptions
-                    allFutures.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Load interrupted", e); //$NON-NLS-1$
-                } catch (ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
-                        throw (IOException) cause.getCause();
-                    } else if (cause instanceof IOException) {
-                        throw (IOException) cause;
-                    }
-                    throw new IOException("Failed to load elements", e); //$NON-NLS-1$
-                }
-                
-                // Add elements in original order to maintain consistency
-                for (Path path : filesToLoad) {
-                    EObject element = loadedElements.get(path);
-                    if (element != null) {
-                        currentFolder.getElements().add(element);
+                    try {
+                        allFutures.get(100, TimeUnit.MILLISECONDS);
+                    } catch (java.util.concurrent.TimeoutException e) {
+                        // Continue checking for cancellation
                     }
                 }
+                // Final get to propagate any exceptions
+                allFutures.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Load interrupted", e); //$NON-NLS-1$
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException && cause.getCause() instanceof IOException) {
+                    throw (IOException) cause.getCause();
+                } else if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Failed to load elements", e); //$NON-NLS-1$
+            }
                 
-                // Progress is reported via shared reporter - no finish() here
-            } finally {
-                cpuExecutor.shutdown();
+            // Add elements in original order to maintain consistency
+            for (Path path : filesToLoad) {
+                EObject element = loadedElements.get(path);
+                if (element != null) {
+                    currentFolder.getElements().add(element);
+                }
             }
         }
         

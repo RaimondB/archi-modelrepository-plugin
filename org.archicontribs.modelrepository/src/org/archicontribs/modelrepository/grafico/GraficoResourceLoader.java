@@ -8,6 +8,7 @@ package org.archicontribs.modelrepository.grafico;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -23,9 +24,31 @@ import com.archimatetool.editor.model.compatibility.ModelCompatibility;
 import com.archimatetool.model.IIdentifier;
 
 /**
- * Load an EObject from a file or input stream
+ * Load an EObject from a file or input stream.
+ * 
+ * <p>Performance optimizations:</p>
+ * <ul>
+ *   <li>Parser features map is cached as a static immutable map (not recreated per file)</li>
+ *   <li>Load options are applied efficiently without creating new maps per call</li>
+ * </ul>
  */
 public class GraficoResourceLoader {
+    
+    /**
+     * Cached parser features - these are constant and don't need to be recreated for each file.
+     * Using unmodifiable map to prevent accidental modification.
+     */
+    private static final Map<String, Object> PARSER_FEATURES;
+    
+    static {
+        Map<String, Object> features = new HashMap<>();
+        // Don't allow DTD loading in case of XSS exploits
+        features.put("http://apache.org/xml/features/disallow-doctype-decl", Boolean.TRUE); //$NON-NLS-1$
+        features.put("http://apache.org/xml/features/nonvalidating/load-external-dtd", Boolean.FALSE); //$NON-NLS-1$
+        features.put("http://xml.org/sax/features/external-general-entities", Boolean.FALSE); //$NON-NLS-1$
+        features.put("http://xml.org/sax/features/external-parameter-entities", Boolean.FALSE); //$NON-NLS-1$
+        PARSER_FEATURES = Collections.unmodifiableMap(features);
+    }
 
     public static IIdentifier loadEObject(File file) throws IOException {
         XMLResource resource = new XMLResourceImpl(URI.createFileURI(file.getAbsolutePath()));
@@ -38,19 +61,11 @@ public class GraficoResourceLoader {
     }
     
     private static IIdentifier load(XMLResource resource, InputStream inputStream) throws IOException {
+        // Apply load options - use cached parser features
         resource.getDefaultLoadOptions().put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
-        
-        // Don't allow DTD loading in case of XSS exploits
-        Map<String, Object> parserFeatures = new HashMap<String, Object>();
-        parserFeatures.put("http://apache.org/xml/features/disallow-doctype-decl", Boolean.TRUE); //$NON-NLS-1$
-        parserFeatures.put("http://apache.org/xml/features/nonvalidating/load-external-dtd", Boolean.FALSE); //$NON-NLS-1$
-        parserFeatures.put("http://xml.org/sax/features/external-general-entities", Boolean.FALSE); //$NON-NLS-1$
-        parserFeatures.put("http://xml.org/sax/features/external-parameter-entities", Boolean.FALSE); //$NON-NLS-1$
-        resource.getDefaultLoadOptions().put(XMLResource.OPTION_PARSER_FEATURES, parserFeatures);
+        resource.getDefaultLoadOptions().put(XMLResource.OPTION_PARSER_FEATURES, PARSER_FEATURES);
        
-        ModelCompatibility modelCompatibility = new ModelCompatibility(resource);
-        
-        // Load the Resource so we can trap any exceptions
+        // Load the Resource - we'll only create ModelCompatibility if there are errors
         try {
             if(inputStream != null) {
                 resource.load(inputStream, null);
@@ -66,7 +81,9 @@ public class GraficoResourceLoader {
                 throw ex;
             }
             // Check to see if it's an exception that is OK or not
+            // Only create ModelCompatibility when we actually have errors (rare case)
             try {
+                ModelCompatibility modelCompatibility = new ModelCompatibility(resource);
                 modelCompatibility.checkErrors();
             }
             catch(IncompatibleModelException ex1) {
