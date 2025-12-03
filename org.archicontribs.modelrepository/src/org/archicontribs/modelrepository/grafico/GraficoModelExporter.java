@@ -178,8 +178,8 @@ public class GraficoModelExporter {
         // Pre-compute hashes of existing files in parallel for comparison
         progress.subTask(NLS.bind(Messages.GraficoModelExporter_4, filesToHash.size()));
         
-        // Use batching to reduce CompletableFuture overhead (30,000 files -> ~300 futures)
-        // Each batch: async read files, then compute hashes in CPU executor
+        // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
+        // Within each batch: start all async reads, then process results as they complete
         List<CompletableFuture<Void>> hashFutures = new ArrayList<>();
         AtomicInteger filesProcessed = new AtomicInteger(0);
         final int totalFilesToHash = filesToHash.size();
@@ -189,27 +189,33 @@ public class GraficoModelExporter {
             final int end = Math.min(i + BATCH_SIZE, filesToHash.size());
             final List<File> batch = filesToHash.subList(start, end);
             
-            // For each file in batch: async read -> then hash in CPU executor (properly pipelined)
-            for (File file : batch) {
-                CompletableFuture<Void> fileFuture = readFileAsync(file)
-                    .thenAcceptAsync(bytes -> {
-                        // This runs in cpuExecutor when async read completes
-                        if (bytes != null) {
-                            byte[] hash = computeHash(bytes);
-                            if (hash != null) {
-                                existingHashCache.put(file, hash);
+            // ONE future per batch - starts async reads for all files, then processes results
+            CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                // Start all async reads for this batch
+                List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+                for (File file : batch) {
+                    CompletableFuture<Void> readFuture = readFileAsync(file)
+                        .thenAcceptAsync(bytes -> {
+                            if (bytes != null) {
+                                byte[] hash = computeHash(bytes);
+                                if (hash != null) {
+                                    existingHashCache.put(file, hash);
+                                }
                             }
-                        }
-                        
-                        // Report progress every 1000 files
-                        int count = filesProcessed.incrementAndGet();
-                        if (count % 1000 == 0) {
-                            progress.subTask(NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
-                        }
-                    }, cpuExecutor);
-                
-                hashFutures.add(fileFuture);
-            }
+                            
+                            // Report progress every 1000 files
+                            int count = filesProcessed.incrementAndGet();
+                            if (count % 1000 == 0) {
+                                progress.subTask(NLS.bind(Messages.GraficoModelExporter_8, count, totalFilesToHash));
+                            }
+                        }, cpuExecutor);
+                    batchReads.add(readFuture);
+                }
+                // Wait for all reads in this batch to complete
+                return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+            }, cpuExecutor).thenCompose(f -> f); // Flatten the nested future
+            
+            hashFutures.add(batchFuture);
         }
         
         // Wait for all hash computations to complete
@@ -249,60 +255,59 @@ public class GraficoModelExporter {
             writeTasks.add(new ResourceWriteTask(resource, file, existingHashCache.get(file)));
         }
         
-        // Serialize with CPU executor (CPU-bound), then write async (I/O-bound)
-        // Properly pipelined: serialize -> hash check -> async write
+        // TRUE BATCHING with ASYNC I/O: One CompletableFuture per batch (30,000 files -> ~300 futures)
+        // Within each batch: serialize all (CPU), then start all async writes
         AtomicInteger completed = new AtomicInteger(0);
         List<CompletableFuture<Void>> writeFutures = new ArrayList<>();
         
-        for (ResourceWriteTask task : writeTasks) {
-            // CPU-bound work first, then chain async write
-            CompletableFuture<Void> taskFuture = CompletableFuture
-                .supplyAsync(() -> {
-                    // CPU-bound: serialize to byte array
+        for (int i = 0; i < writeTasks.size(); i += BATCH_SIZE) {
+            final int start = i;
+            final int end = Math.min(i + BATCH_SIZE, writeTasks.size());
+            final List<ResourceWriteTask> batch = writeTasks.subList(start, end);
+            
+            // ONE future per batch - serializes all, then writes all async
+            CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+                // First pass: CPU-bound serialization and hash comparison
+                List<FileWriteRequest> writeRequests = new ArrayList<>();
+                
+                for (ResourceWriteTask task : batch) {
                     try {
+                        // CPU-bound: serialize to byte array
                         ByteArrayOutputStream os = new ByteArrayOutputStream(4096);
                         task.resource.save(os, null);
-                        return os.toByteArray();
+                        byte[] newContent = os.toByteArray();
+                        
+                        // CPU-bound: compute hash and check if content changed
+                        byte[] newHash = computeHash(newContent);
+                        if (task.existingHash == null || !Arrays.equals(newHash, task.existingHash)) {
+                            // Content changed - queue for async write
+                            task.file.getParentFile().mkdirs();
+                            writtenFiles.add(task.file);
+                            writeRequests.add(new FileWriteRequest(task.file, newContent));
+                        }
                     } catch (IOException ex) {
                         exceptions.add(ex);
-                        return null;
                     }
-                }, cpuExecutor)
-                .thenComposeAsync(newContent -> {
-                    // CPU-bound: compute hash and check if content changed
-                    if (newContent == null) {
-                        return CompletableFuture.completedFuture(null);
-                    }
-                    
-                    byte[] newHash = computeHash(newContent);
-                    if (task.existingHash != null && Arrays.equals(newHash, task.existingHash)) {
-                        // No change needed, skip write
-                        return CompletableFuture.completedFuture(null);
-                    }
-                    
-                    // I/O-bound: write file using async channel (returns future, not blocking)
-                    task.file.getParentFile().mkdirs();
-                    writtenFiles.add(task.file);
-                    return writeFileAsync(task.file, newContent);
-                }, cpuExecutor)
-                .whenComplete((result, ex) -> {
-                    if (ex != null) {
-                        if (ex.getCause() instanceof IOException) {
-                            exceptions.add((IOException) ex.getCause());
-                        } else if (ex instanceof IOException) {
-                            exceptions.add((IOException) ex);
-                        }
-                    }
-                    
-                    // Update progress every 1000 files
-                    int done = completed.incrementAndGet();
-                    if (done % 1000 == 0) {
-                        writeProgress.worked(1000);
-                        writeProgress.subTask(NLS.bind(Messages.GraficoModelExporter_5, done + " of " + totalResources)); //$NON-NLS-1$
-                    }
-                });
+                }
+                
+                // Second pass: start all async writes for this batch
+                List<CompletableFuture<Void>> batchWrites = new ArrayList<>();
+                for (FileWriteRequest req : writeRequests) {
+                    batchWrites.add(writeFileAsync(req.file, req.content));
+                }
+                
+                // Update progress for all files in batch
+                int done = completed.addAndGet(batch.size());
+                if (done % 1000 < batch.size()) { // Crossed a 1000 boundary
+                    writeProgress.worked(batch.size());
+                    writeProgress.subTask(NLS.bind(Messages.GraficoModelExporter_5, done + " of " + totalResources)); //$NON-NLS-1$
+                }
+                
+                // Return future that completes when all writes are done
+                return CompletableFuture.allOf(batchWrites.toArray(new CompletableFuture[0]));
+            }, cpuExecutor).thenCompose(f -> f); // Flatten the nested future
             
-            writeFutures.add(taskFuture);
+            writeFutures.add(batchFuture);
         }
         
         // Wait for all writes to complete
@@ -561,6 +566,19 @@ public class GraficoModelExporter {
             this.resource = resource;
             this.file = file;
             this.existingHash = existingHash;
+        }
+    }
+    
+    /**
+     * Helper class for async file write requests
+     */
+    private static class FileWriteRequest {
+        final File file;
+        final byte[] content;
+        
+        FileWriteRequest(File file, byte[] content) {
+            this.file = file;
+            this.content = content;
         }
     }
     

@@ -56,6 +56,41 @@ CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();  // W
 - `thenAccept(fn)` - Consume result (quick operations, any thread)
 - `CompletableFuture.allOf(...).join()` - Final synchronization point ONLY
 
+### ⚠️ Critical: TRUE Batching vs Fake Batching
+
+Creating 30,000 `CompletableFuture` objects causes significant overhead. Use TRUE batching where **one future handles multiple files**.
+
+```java
+// ❌ WRONG: "Fake batching" - still creates 30,000 futures!
+for (int i = 0; i < files.size(); i += BATCH_SIZE) {
+    List<File> batch = files.subList(i, Math.min(i + BATCH_SIZE, files.size()));
+    for (File file : batch) {  // <-- Inner loop creates one future per file!
+        futures.add(CompletableFuture.runAsync(() -> process(file), executor));
+    }
+}
+// Result: 30,000 futures, NOT 300!
+
+// ✅ CORRECT: TRUE batching - one future per batch
+for (int i = 0; i < files.size(); i += BATCH_SIZE) {
+    final List<File> batch = files.subList(i, Math.min(i + BATCH_SIZE, files.size()));
+    
+    // ONE future processes ALL files in the batch
+    CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
+        for (File file : batch) {
+            process(file);  // Sequential within batch, parallel across batches
+        }
+    }, executor);
+    
+    futures.add(batchFuture);
+}
+// Result: 300 futures for 30,000 files!
+```
+
+**Why this matters:**
+- Each `CompletableFuture` allocates ~200 bytes of object overhead
+- 30,000 futures = 6MB+ of object allocations, causing GC pressure
+- ForkJoinPool work-stealing is more efficient with fewer, larger tasks
+
 ### Code Pattern
 
 ```java
@@ -68,6 +103,34 @@ for (int i = 0; i < files.size(); i += BATCH_SIZE) {
 }
 ```
 
+### ✅ Combined Pattern: TRUE Batching + Async I/O
+
+For maximum performance, combine TRUE batching (one future per batch) with async I/O (non-blocking within batch):
+
+```java
+// ONE outer future per batch, async I/O for all files within batch
+CompletableFuture<Void> batchFuture = CompletableFuture.supplyAsync(() -> {
+    // Start all async reads for this batch (non-blocking)
+    List<CompletableFuture<Void>> batchReads = new ArrayList<>();
+    for (File file : batch) {
+        CompletableFuture<Void> readFuture = readFileAsync(file)    // Async I/O
+            .thenAcceptAsync(bytes -> {                              // CPU work
+                if (bytes != null) {
+                    byte[] hash = computeHash(bytes);
+                    hashCache.put(file, hash);
+                }
+            }, cpuExecutor);
+        batchReads.add(readFuture);
+    }
+    // Return future that completes when all batch reads done
+    return CompletableFuture.allOf(batchReads.toArray(new CompletableFuture[0]));
+}, cpuExecutor).thenCompose(f -> f);  // Flatten nested future
+
+futures.add(batchFuture);
+```
+
+**Key insight**: The outer batch future limits total futures to ~300, while inner async I/O keeps disk busy without blocking threads.
+
 ## Eclipse Plugin Development
 
 - This is an Eclipse RCP/OSGi plugin
@@ -78,3 +141,94 @@ for (int i = 0; i < files.size(); i += BATCH_SIZE) {
 ## Testing
 
 Tests are in `org.archicontribs.modelrepository.tests`. Run with JUnit 5.
+
+## Performance Measurement & Debugging
+
+### Disk Cache Effects
+
+The OS filesystem cache makes second runs appear 10-100x faster. To measure true cold-disk performance:
+
+**Windows (PowerShell as Admin):**
+```powershell
+# Clear standby list (cached files) - requires RAMMap from Sysinternals
+# Or use this built-in approach:
+Write-VolumeCache C:
+
+# Alternative: Use RAMMap.exe from Sysinternals
+# RAMMap.exe /E  (empties standby list)
+```
+
+**Programmatic approach in Java:**
+```java
+// Force garbage collection and pause to let disk cache age out
+System.gc();
+Thread.sleep(5000);
+
+// Read a large unrelated file to flush cache (crude but effective)
+// Or use ProcessBuilder to call system cache-clear commands
+```
+
+**Best practice:** Run benchmark 3+ times, discard first run (warmup), report median of remaining runs.
+
+### Potential Slowdown Causes
+
+1. **File Handle Exhaustion**: Opening 30,000 `AsynchronousFileChannel`s simultaneously can exhaust OS file handles
+   - **Symptom**: Slowdown as file count increases, then errors
+   - **Fix**: Limit concurrent open channels (use semaphore or bounded executor)
+
+2. **ConcurrentHashMap Contention**: High contention on `existingHashCache` with 30,000 concurrent puts
+   - **Symptom**: CPU spinning, poor scaling beyond 4-8 cores  
+   - **Fix**: Use `ConcurrentHashMap` with higher initial capacity: `new ConcurrentHashMap<>(fileCount, 0.75f, cpuThreads)`
+
+3. **ByteBuffer Allocation Pressure**: Allocating 30,000 ByteBuffers causes GC pressure
+   - **Symptom**: GC pauses, increasing latency over time
+   - **Fix**: Use buffer pooling or direct buffers for large files
+
+4. **Too Many CompletableFutures**: Even with batching, 30,000 futures = 30,000 object allocations
+   - **Symptom**: Memory pressure, GC pauses
+   - **Fix**: True batching where one future handles multiple files
+
+5. **Progress Monitor Contention**: `AtomicInteger.incrementAndGet()` 30,000 times causes cache line bouncing
+   - **Symptom**: Poor multi-core scaling
+   - **Fix**: Use `LongAdder` instead of `AtomicInteger` for counters
+
+### Recommended Instrumentation
+
+Add timing to identify bottlenecks:
+
+```java
+long startHash = System.nanoTime();
+// ... hash phase ...
+long hashTime = System.nanoTime() - startHash;
+
+long startWrite = System.nanoTime();
+// ... write phase ...
+long writeTime = System.nanoTime() - startWrite;
+
+System.out.printf("Hash: %dms, Write: %dms%n", 
+    hashTime / 1_000_000, writeTime / 1_000_000);
+```
+
+### File Handle Limiting Pattern
+
+```java
+// Limit concurrent async file operations to prevent handle exhaustion
+private static final int MAX_CONCURRENT_FILES = 256;
+private final Semaphore fileHandleSemaphore = new Semaphore(MAX_CONCURRENT_FILES);
+
+private CompletableFuture<byte[]> readFileAsyncLimited(File file) {
+    return CompletableFuture.supplyAsync(() -> {
+        try {
+            fileHandleSemaphore.acquire();
+            try {
+                return readFileAsyncInternal(file).join();
+            } finally {
+                fileHandleSemaphore.release();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    });
+}
+```
