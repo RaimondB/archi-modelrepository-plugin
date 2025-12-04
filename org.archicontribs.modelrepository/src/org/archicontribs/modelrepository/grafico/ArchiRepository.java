@@ -23,6 +23,7 @@ import java.util.stream.Stream;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.AddCommand;
 import org.eclipse.jgit.api.CleanCommand;
@@ -375,24 +376,28 @@ public class ArchiRepository implements IArchiRepository {
             PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
                 @Override
                 public void run(IProgressMonitor pm) {
-                    pm.beginTask(Messages.ArchiRepository_1, IProgressMonitor.UNKNOWN);
+                    // Use SubMonitor for proper progress tracking across phases
+                    // Export gets 80%, git staging gets 20% (can be slow for large repos)
+                    SubMonitor progress = SubMonitor.convert(pm, Messages.ArchiRepository_1, 100);
 
                     try {
-                        // Export
+                        // Export model to GRAFICO format (80% of progress)
                         GraficoModelExporter exporter = new GraficoModelExporter(model, getLocalRepositoryFolder());
-                        exporter.exportModel(pm);
+                        exporter.exportModel(progress.split(80));
                         
                         // Check lock file is deleted
                         checkDeleteLockFile();
                         
-                        // Stage modified files to index - this can take a long time!
-                        // This will clear any different line endings and calls to git.status() will be faster
+                        // Stage modified files to index (20% of progress)
+                        // This can take a long time for large repos!
+                        progress.subTask(Messages.ArchiRepository_2);
                         try(Git git = Git.open(getLocalRepositoryFolder())) {
                             AddCommand addCommand = git.add();
-                            addCommand.addFilepattern(".");
+                            addCommand.addFilepattern("."); //$NON-NLS-1$
                             addCommand.setUpdate(false);
                             addCommand.call();
                         }
+                        progress.worked(20);
                     }
                     catch(IOException | GitAPIException ex) {
                         exception[0] = ex;

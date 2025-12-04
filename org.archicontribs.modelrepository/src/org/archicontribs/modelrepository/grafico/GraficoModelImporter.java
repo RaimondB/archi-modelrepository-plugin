@@ -220,7 +220,8 @@ public class GraficoModelImporter {
     	
     	// Create a SINGLE shared progress reporter for all phases
     	// This ensures only ONE background thread handles UI updates across all phases
-    	fProgressReporter = new ThrottledProgressReporter(progress.split(80), totalFiles);
+    	// Use 100% of allocated progress - no reserved portion left idle at the end
+    	fProgressReporter = new ThrottledProgressReporter(progress.split(100), totalFiles);
     	
     	// Create a SINGLE shared CPU executor for all parallel XML parsing
     	// This avoids creating a new ForkJoinPool for each folder in the hierarchy

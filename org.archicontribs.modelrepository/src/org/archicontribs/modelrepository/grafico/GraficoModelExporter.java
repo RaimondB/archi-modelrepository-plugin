@@ -195,7 +195,8 @@ public class GraficoModelExporter {
         
         // Create a SINGLE throttled progress reporter for ALL phases (images, hash, write)
         // This ensures only ONE background thread handles UI updates across the entire export
-        fProgressReporter = new ThrottledProgressReporter(progress.split(85), totalWork);
+        // Use 100% of allocated progress - no reserved portion left idle at the end
+        fProgressReporter = new ThrottledProgressReporter(progress.split(100), totalWork);
         
         try {
             // Save model images (if any): this has to be done on original model (not a copy)
