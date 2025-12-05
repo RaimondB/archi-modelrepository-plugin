@@ -146,23 +146,29 @@ public class SwitchBranchAction extends AbstractModelAction {
                         Messages.SwitchBranchAction_1);
 
                 // Commit dialog - changes are already staged, so commit will work
-                if(doCommit && !offerToCommitChanges()) {
-                    return;
+                if(doCommit) {
+                    if(!offerToCommitChanges()) {
+                        // User cancelled commit dialog - reset staged changes and abort
+                        getRepository().resetToRef(IGraficoConstants.HEAD);
+                        return;
+                    }
+                    // Commit succeeded - proceed to switch branch
+                } else {
+                    // User chose "no" to commit - ask if they want to lose changes
+                    boolean proceed = MessageDialog.openQuestion(fWindow.getShell(),
+                            Messages.SwitchBranchAction_0,
+                            Messages.SwitchBranchAction_5);
+                    
+                    if(!proceed) {
+                        // User cancelled - reset staged changes and abort
+                        getRepository().resetToRef(IGraficoConstants.HEAD);
+                        return;
+                    }
+                    
+                    // User chose to discard changes - reset to HEAD
+                    getRepository().resetToRef(IGraficoConstants.HEAD);
+                    notifyHistoryChanged = true;
                 }
-
-                // User chose "no" to commit - ask if they want to lose changes
-                boolean proceed = MessageDialog.openQuestion(fWindow.getShell(),
-                        Messages.SwitchBranchAction_0,
-                        Messages.SwitchBranchAction_5);
-                
-                if(!proceed) {
-                    return;
-                }
-                
-                // Abort changes by resetting to HEAD (discards staged but uncommitted changes)
-                getRepository().resetToRef(IGraficoConstants.HEAD);
-                
-                notifyHistoryChanged = true;
             }
             
             // Phase 2 & 3: Switch branch and load model with combined progress
