@@ -69,6 +69,17 @@ public class GraficoModelLoader {
      * @throws IOException
      */
     public IArchimateModel loadModel() throws IOException {
+        return loadModel(null);
+    }
+    
+    /**
+     * Load the model with external progress monitor.
+     * This is useful when combining loading with other operations in a single progress dialog.
+     * @param monitor Progress monitor (can be null for headless/own dialog behavior)
+     * @return The loaded model
+     * @throws IOException
+     */
+    public IArchimateModel loadModel(IProgressMonitor monitor) throws IOException {
         fRestoredObjects = null;
         
         // Import Grafico Model
@@ -77,16 +88,24 @@ public class GraficoModelLoader {
         IArchimateModel[] graficoModel = new IArchimateModel[1];
         IOException[] exception = new IOException[1];
         
-        // Support headless model by not opening dialogs and showing progress bars
-        if(!bHeadless)
-        {
-            // Use ProgressMonitorDialog to show progress and keep UI responsive
+        // If external monitor is provided, use it directly (no separate dialog)
+        // Otherwise, support headless mode or create our own dialog
+        if(monitor != null) {
+            // Use the provided external monitor
+            try {
+                graficoModel[0] = importer.importAsModel(monitor);
+            }
+            catch(IOException ex) {
+                exception[0] = ex;
+            }
+        } else if(!bHeadless) {
+            // No external monitor, not headless - create our own dialog
             try {
                 PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
                     @Override
-                    public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                    public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
                         try {
-                            graficoModel[0] = importer.importAsModel(monitor);
+                            graficoModel[0] = importer.importAsModel(pm);
                         }
                         catch(IOException ex) {
                             exception[0] = ex;
@@ -98,6 +117,7 @@ public class GraficoModelLoader {
                 throw new IOException(ex.getMessage(), ex);
             }
         } else {
+            // Headless mode - no progress
             try {
                 graficoModel[0] = importer.importAsModel();
             }
@@ -149,6 +169,48 @@ public class GraficoModelLoader {
         }
         
         return graficoModel[0];
+    }
+    
+    /**
+     * Open an already-imported model in the editor.
+     * This method performs the UI operations that must run on the UI thread:
+     * save, close old model, open new model, reopen editors.
+     * 
+     * <p>Use this when the import was done in a background thread and you need
+     * to complete the loading on the UI thread.</p>
+     * 
+     * @param graficoModel The model that was already imported
+     * @param importer The importer used (to check for unresolved objects)
+     * @throws IOException if there's an error saving or opening the model
+     */
+    public void openModel(IArchimateModel graficoModel, GraficoModelImporter importer) throws IOException {
+        if(graficoModel == null) {
+            return;
+        }
+        
+        fRestoredObjects = null;
+        
+        // Set file name on the grafico model so we can locate it
+        graficoModel.setFile(fRepository.getTempModelFile());
+        
+        // Resolve missing objects if any
+        List<UnresolvedObject> unresolvedObjects = importer != null ? importer.getUnresolvedObjects() : null;
+        if(unresolvedObjects != null) {
+            graficoModel = restoreProblemObjects(unresolvedObjects);
+        }
+        
+        // Save the model
+        IEditorModelManager.INSTANCE.saveModel(graficoModel);
+        
+        // Close and re-open the corresponding model if it is already open
+        IArchimateModel model = fRepository.locateModel();
+        if(model != null) {
+            // Store ids of open diagrams
+            List<String> openModelIDs = getOpenDiagramModelIdentifiers(model);
+            IEditorModelManager.INSTANCE.closeModel(model);
+            IEditorModelManager.INSTANCE.openModel(graficoModel);
+            reopenEditors(graficoModel, openModelIDs);
+        }
     }
     
     /**

@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.net.URISyntaxException;
 
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
+import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.PullResult;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -163,6 +164,20 @@ public interface IArchiRepository extends IGraficoConstants {
      * @throws GitAPIException 
      */
     void exportModelToGraficoFiles() throws IOException, GitAPIException;
+
+    /**
+     * Export the model to Grafico files with external progress monitor.
+     * This exports the model AND stages the changes with git add.
+     * 
+     * Use this when combining export with other operations in a single progress dialog.
+     * The return value indicates if there are changes (files written or deleted).
+     * 
+     * @param monitor Progress monitor (caller is responsible for managing the dialog)
+     * @return true if there are changes to commit after export
+     * @throws IOException
+     * @throws GitAPIException 
+     */
+    boolean exportModelToGraficoFiles(IProgressMonitor monitor) throws IOException, GitAPIException;
 
     /**
      * Save a checksum

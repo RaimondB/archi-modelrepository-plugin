@@ -147,18 +147,26 @@ public class GraficoModelExporter {
 	
     /**
      * Export the IArchimateModel as Grafico files
+     * @return true if any files were written or deleted (i.e., repository has changes)
      * @throws IOException
      */
-    public void exportModel() throws IOException {
-        exportModel(null);
+    public boolean exportModel() throws IOException {
+        return exportModel(null);
     }
     
     /**
-     * Export the IArchimateModel as Grafico files with progress monitoring
+     * Export the IArchimateModel as Grafico files with progress monitoring.
+     * 
+     * IMPORTANT: This method returns whether the export resulted in any file changes.
+     * The return value should be used to determine if git operations (add, commit) are needed,
+     * rather than calling hasChangesToCommit() which checks git status AFTER staging.
+     * See REFACTORING_NOTES.md for details on this design decision.
+     * 
      * @param monitor Progress monitor for UI feedback, can be null
+     * @return true if any files were written or deleted (i.e., repository has changes)
      * @throws IOException
      */
-    public void exportModel(IProgressMonitor monitor) throws IOException {
+    public boolean exportModel(IProgressMonitor monitor) throws IOException {
         long exportStart = System.nanoTime();
         
         // Use SubMonitor for easier progress reporting
@@ -172,14 +180,15 @@ public class GraficoModelExporter {
         modelFolder.mkdirs();
         imagesFolder.mkdirs();
         
-        // Clear tracking sets
+        // Clear tracking sets and counters
         expectedFiles.clear();
         writtenFiles.clear();
         expectedDirectories.clear();
+        deletedFilesCount.set(0);
         
         // Check for cancellation
         if (progress.isCanceled()) {
-            return;
+            return false;
         }
         
         // Count total work across ALL phases upfront: images + model files
@@ -208,7 +217,7 @@ public class GraficoModelExporter {
             
             // Check for cancellation
             if (fProgressReporter.isCanceled()) {
-                return;
+                return false;
             }
             
             // Create ResourceSet
@@ -225,7 +234,7 @@ public class GraficoModelExporter {
             
             // Check for cancellation
             if (fProgressReporter.isCanceled()) {
-                return;
+                return false;
             }
             
             // Create directory structure and prepare all Resources
@@ -268,7 +277,7 @@ public class GraficoModelExporter {
             // Check for cancellation before starting
             if (fProgressReporter.isCanceled()) {
                 cpuExecutor.shutdown();
-                return;
+                return false;
             }
             
             // BATCH-WRAPPED PIPELINE: Auto-tuned batches run in parallel, sequential I/O within each batch
@@ -375,6 +384,9 @@ public class GraficoModelExporter {
             if(!exceptions.isEmpty()) {
                 throw exceptions.get(0);
             }
+            
+            // Return true if any files were written or deleted
+            return writtenFiles.size() > 0 || deletedFilesCount.get() > 0;
         } finally {
             // Ensure progress reporter is always stopped
             if (fProgressReporter != null) {
@@ -709,6 +721,13 @@ public class GraficoModelExporter {
     
     // Track directories that contain expected files - used to skip unchanged subtrees during cleanup
     private Set<java.nio.file.Path> expectedDirectories = ConcurrentHashMap.newKeySet();
+    
+    /**
+     * Counter for deleted files during cleanup phase.
+     * Used to determine if export made any changes (written OR deleted files).
+     * Accessed atomically from cleanup methods.
+     */
+    private java.util.concurrent.atomic.AtomicInteger deletedFilesCount = new java.util.concurrent.atomic.AtomicInteger(0);
     
     /**
      * Add a path to expectedFiles, normalizing it first for consistent lookups.
@@ -1056,6 +1075,7 @@ public class GraficoModelExporter {
                     // File is obsolete - delete immediately
                     try {
                         Files.delete(path);
+                        deletedFilesCount.incrementAndGet(); // Track for hasChanges detection
                     } catch (IOException e) {
                         // Ignore deletion errors for cleanup
                     }
@@ -1086,12 +1106,14 @@ public class GraficoModelExporter {
     /**
      * Delete a directory and all its contents recursively.
      * Used for cleaning up entire subtrees that have no expected files.
+     * Tracks deleted files count for hasChanges detection.
      */
     private void deleteDirectoryRecursively(java.nio.file.Path dir) throws IOException {
         Files.walkFileTree(dir, new SimpleFileVisitor<java.nio.file.Path>() {
             @Override
             public FileVisitResult visitFile(java.nio.file.Path file, BasicFileAttributes attrs) throws IOException {
                 Files.delete(file);
+                deletedFilesCount.incrementAndGet(); // Track for hasChanges detection
                 return FileVisitResult.CONTINUE;
             }
             

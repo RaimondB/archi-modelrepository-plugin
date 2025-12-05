@@ -14,9 +14,14 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
 import org.eclipse.core.runtime.SubMonitor;
+import org.eclipse.swt.widgets.Display;
 
 /**
- * A throttled progress reporter that uses a dedicated background thread for UI updates.
+ * A throttled progress reporter that is completely thread-safe for UI updates.
+ * 
+ * <p>This class uses a dedicated background thread for polling and {@link Display#asyncExec}
+ * for all UI operations. Worker threads can safely call any method from any thread without
+ * risk of "Invalid thread access" SWT exceptions.</p>
  * 
  * <p>Key optimizations:</p>
  * <ul>
@@ -24,6 +29,7 @@ import org.eclipse.core.runtime.SubMonitor;
  *   <li>Dedicated reporter thread - worker threads NEVER block on UI synchronization</li>
  *   <li>Time-based polling - checks for updates every N milliseconds</li>
  *   <li>Worker threads only increment counters and set message generator (non-blocking)</li>
+ *   <li>Uses {@link Display#asyncExec} for all UI updates - safe from ANY thread</li>
  * </ul>
  * 
  * <p>Usage:</p>
@@ -112,7 +118,7 @@ public class ThrottledProgressReporter {
     
     /**
      * Called by the reporter thread to check for and send progress updates.
-     * This is the ONLY method that touches the UI thread (except for finish()).
+     * Uses Display.asyncExec() to ensure UI operations run on the UI thread.
      */
     private void pollAndReport() {
         if (progress == null || finished.get()) {
@@ -123,19 +129,31 @@ public class ThrottledProgressReporter {
         
         // Check if enough files have been processed to warrant an update
         if (currentCount - lastReportedCount >= fileInterval || currentCount >= totalItems) {
-            int workDelta = (int) (currentCount - lastReportedCount);
+            final int workDelta = (int) (currentCount - lastReportedCount);
+            final long reportedCount = currentCount;
             
-            if (workDelta > 0) {
-                progress.worked(workDelta);
-                lastReportedCount = currentCount;
-            }
-            
-            // Get and apply message if set
+            // Get message if set
             Function<Long, String> msgGen = messageGenerator.get();
-            if (msgGen != null) {
-                String message = msgGen.apply(currentCount);
-                if (message != null) {
-                    progress.subTask(message);
+            final String message = (msgGen != null) ? msgGen.apply(currentCount) : null;
+            
+            if (workDelta > 0 || message != null) {
+                // Update last reported count now to avoid duplicate updates
+                lastReportedCount = reportedCount;
+                
+                // Schedule UI update on the UI thread
+                Display display = Display.getDefault();
+                if (display != null && !display.isDisposed()) {
+                    display.asyncExec(() -> {
+                        if (progress == null || finished.get()) {
+                            return;
+                        }
+                        if (workDelta > 0) {
+                            progress.worked(workDelta);
+                        }
+                        if (message != null) {
+                            progress.subTask(message);
+                        }
+                    });
                 }
             }
         }
@@ -236,8 +254,7 @@ public class ThrottledProgressReporter {
      * This method BLOCKS until the final report is sent and the reporter thread is stopped.
      * Call this at the end of processing.
      * 
-     * <p>The final UI update is scheduled on the reporter thread to maintain the invariant
-     * that only the reporter thread touches the UI.</p>
+     * <p>Uses Display.syncExec() to ensure the final UI update completes before returning.</p>
      * 
      * @param finalMessage The final status message, or null for none
      */
@@ -247,35 +264,33 @@ public class ThrottledProgressReporter {
             return;
         }
         
-        if (progress == null) {
-            reporterThread.shutdown();
-            return;
-        }
-        
-        // Schedule the final update on the reporter thread
-        // This ensures only the reporter thread touches the UI
-        final String message = finalMessage;
-        reporterThread.execute(() -> {
-            // Report any remaining work
-            long currentCount = processedCount.sum();
-            int remaining = totalItems - (int) lastReportedCount;
-            
-            if (remaining > 0) {
-                progress.worked(remaining);
-                lastReportedCount = totalItems;
-            }
-            
-            if (message != null) {
-                progress.subTask(message);
-            }
-        });
-        
-        // Now shutdown and wait for the final update to complete
+        // Shutdown the reporter thread first
         reporterThread.shutdown();
         try {
             reporterThread.awaitTermination(1, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        
+        if (progress == null) {
+            return;
+        }
+        
+        // Report any remaining work on the UI thread
+        final String message = finalMessage;
+        final long currentCount = processedCount.sum();
+        final int remaining = totalItems - (int) lastReportedCount;
+        
+        Display display = Display.getDefault();
+        if (display != null && !display.isDisposed()) {
+            display.syncExec(() -> {
+                if (remaining > 0) {
+                    progress.worked(remaining);
+                }
+                if (message != null) {
+                    progress.subTask(message);
+                }
+            });
         }
     }
     

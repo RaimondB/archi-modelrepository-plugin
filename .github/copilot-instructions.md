@@ -260,3 +260,28 @@ private CompletableFuture<byte[]> readFileAsyncLimited(File file) {
     });
 }
 ```
+
+## Refactoring Notes
+
+When making changes to the Grafico I/O code, **always consult and update**:
+
+**[REFACTORING_NOTES.md](../org.archicontribs.modelrepository/src/org/archicontribs/modelrepository/grafico/REFACTORING_NOTES.md)**
+
+This document captures:
+- Design decisions that are not obvious from the code
+- Common pitfalls and how to avoid them
+- Patterns that work vs patterns that don't
+
+### When to Update REFACTORING_NOTES.md
+
+1. **When you discover a non-obvious design constraint** (e.g., "must use export's return value instead of hasChangesToCommit()")
+2. **When you fix a bug caused by a subtle issue** (document why the naive approach was wrong)
+3. **When you make a change that affects multiple files** (document the coordination required)
+4. **When timing/ordering matters** (e.g., "git status must be checked AFTER git add")
+
+### Key Entry: Change Detection
+
+The most critical lesson: **Use `exportModel()`'s return value** to detect changes, NOT `hasChangesToCommit()`. 
+
+Why? `hasChangesToCommit()` checks git status, which only shows changes after they're staged. The exporter tracks written/deleted files internally and returns `true` if any work was done.
+

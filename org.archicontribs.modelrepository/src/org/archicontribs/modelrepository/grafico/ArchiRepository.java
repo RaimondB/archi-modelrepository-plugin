@@ -418,6 +418,44 @@ public class ArchiRepository implements IArchiRepository {
     }
     
     @Override
+    public boolean exportModelToGraficoFiles(IProgressMonitor monitor) throws IOException, GitAPIException {
+        // Open the model
+        IArchimateModel model = IEditorModelManager.INSTANCE.openModel(getTempModelFile());
+        
+        if(model == null) {
+            throw new IOException(Messages.ArchiRepository_0);
+        }
+        
+        // Use SubMonitor for proper progress tracking
+        // Export gets 80%, git staging gets 20%
+        SubMonitor progress = SubMonitor.convert(monitor, 100);
+        
+        // Export model to GRAFICO format (80% of progress)
+        // IMPORTANT: exportModel() returns true if any files were written or deleted.
+        // We use this return value to determine if git add is needed.
+        // See REFACTORING_NOTES.md for details on this design decision.
+        GraficoModelExporter exporter = new GraficoModelExporter(model, getLocalRepositoryFolder());
+        boolean hasChanges = exporter.exportModel(progress.split(80));
+        
+        // Check lock file is deleted
+        checkDeleteLockFile();
+        
+        // Stage modified files to index if there are changes
+        if(hasChanges) {
+            progress.subTask(Messages.ArchiRepository_2);
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                AddCommand addCommand = git.add();
+                addCommand.addFilepattern("."); //$NON-NLS-1$
+                addCommand.setUpdate(false);
+                addCommand.call();
+            }
+        }
+        progress.worked(20);
+        
+        return hasChanges;
+    }
+    
+    @Override
     public PersonIdent getUserDetails() throws IOException {
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             StoredConfig config = git.getRepository().getConfig();

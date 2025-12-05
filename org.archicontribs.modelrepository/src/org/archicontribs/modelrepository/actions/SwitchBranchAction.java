@@ -10,19 +10,20 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
+import java.text.MessageFormat;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
+import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
-import org.eclipse.jgit.lib.Ref;
-import org.eclipse.jgit.lib.Repository;
 import org.eclipse.swt.SWT;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
@@ -52,6 +53,17 @@ public class SwitchBranchAction extends AbstractModelAction {
 
         // Keep a local reference in case of a notification event changing the current branch selection in the UI
         BranchInfo branchInfo = fBranchInfo;
+        
+        // Get current branch name for progress reporting
+        String currentBranchName;
+        try {
+            BranchInfo currentBranch = getRepository().getBranchStatus().getCurrentLocalBranch();
+            currentBranchName = currentBranch != null ? currentBranch.getShortName() : "current"; //$NON-NLS-1$
+        }
+        catch(IOException | GitAPIException ex) {
+            currentBranchName = "current"; //$NON-NLS-1$
+        }
+        final String currentBranchNameFinal = currentBranchName;
         
         // Offer to save the model if open and dirty
         // We need to do this to keep grafico and temp files in sync
@@ -84,37 +96,61 @@ public class SwitchBranchAction extends AbstractModelAction {
                     // Abort changes by resetting to HEAD
                     getRepository().resetToRef(IGraficoConstants.HEAD);
                     
-                    // Switch branch
-                    switchBranch(branchInfo, !isBranchRefSameAsCurrentBranchRef(branchInfo));
+                    // Switch branch with combined progress dialog
+                    switchBranchWithProgress(branchInfo, !isBranchRefSameAsCurrentBranchRef(branchInfo));
                     notifyChangeListeners(IRepositoryListener.BRANCHES_CHANGED);
                     
                     return;
                 }
                 catch(IOException | GitAPIException ex) {
                     displayErrorDialog(Messages.SwitchBranchAction_0, ex);
+                    return;
                 }
             }
         }
         
         boolean notifyHistoryChanged = false;
+        boolean[] hasChanges = new boolean[1];
         
         try {
-            // Do the Grafico Export first
-            getRepository().exportModelToGraficoFiles();
+            // Phase 1: Export model to check for changes AND stage them with git add
+            // We need to stage files so that:
+            // 1. hasChangesToCommit() works correctly (it checks git status)
+            // 2. offerToCommitChanges() can commit the staged changes
+            Exception[] exception = new Exception[1];
+            
+            PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+                @Override
+                public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
+                    SubMonitor progress = SubMonitor.convert(pm, 
+                            MessageFormat.format(Messages.SwitchBranchAction_18, currentBranchNameFinal), 100);
+                    try {
+                        // Export AND stage with git add - we need files staged for commit to work
+                        hasChanges[0] = getRepository().exportModelToGraficoFiles(progress.split(100));
+                    }
+                    catch(IOException | GitAPIException ex) {
+                        exception[0] = ex;
+                    }
+                }
+            });
+            
+            if(exception[0] != null) {
+                throw exception[0];
+            }
             
             // If there are changes to commit...
-            if(getRepository().hasChangesToCommit()) {
-                // Ask user
+            if(hasChanges[0]) {
+                // Ask user if they want to commit before switching
                 boolean doCommit = MessageDialog.openQuestion(fWindow.getShell(),
                         Messages.SwitchBranchAction_0,
                         Messages.SwitchBranchAction_1);
 
-                // Commit dialog
+                // Commit dialog - changes are already staged, so commit will work
                 if(doCommit && !offerToCommitChanges()) {
                     return;
                 }
 
-                // User chose "no" to commit so let's make sure we proceed
+                // User chose "no" to commit - ask if they want to lose changes
                 boolean proceed = MessageDialog.openQuestion(fWindow.getShell(),
                         Messages.SwitchBranchAction_0,
                         Messages.SwitchBranchAction_5);
@@ -123,14 +159,14 @@ public class SwitchBranchAction extends AbstractModelAction {
                     return;
                 }
                 
-                // Abort changes by resetting to HEAD
+                // Abort changes by resetting to HEAD (discards staged but uncommitted changes)
                 getRepository().resetToRef(IGraficoConstants.HEAD);
                 
                 notifyHistoryChanged = true;
             }
             
-            // Switch branch
-            switchBranch(branchInfo, !isBranchRefSameAsCurrentBranchRef(branchInfo));
+            // Phase 2 & 3: Switch branch and load model with combined progress
+            switchBranchWithProgress(branchInfo, !isBranchRefSameAsCurrentBranchRef(branchInfo));
         }
         catch(Exception ex) {
             displayErrorDialog(Messages.SwitchBranchAction_0, ex);
@@ -143,81 +179,41 @@ public class SwitchBranchAction extends AbstractModelAction {
         notifyChangeListeners(IRepositoryListener.BRANCHES_CHANGED);
     }
     
-    protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
-        // First, perform Git operations with progress feedback
-        // (checkout can take a long time if many files differ between branches)
-        performGitCheckout(branchInfo);
-        
-        // Then reload the model - GraficoModelLoader has its own progress dialog
-        if(doReloadGrafico) {
-            new GraficoModelLoader(getRepository()).loadModel();
-            
-            // Save the checksum
-            getRepository().saveChecksum();
-        }
-    }
-    
     /**
-     * Perform the Git checkout operation with progress feedback.
-     * Tries native Git first for better performance, falls back to JGit if native Git is not available.
+     * Switch branch with a single combined progress dialog for Git checkout and model import.
+     * 
+     * Note: Git checkout and file import run in a background thread, but model UI operations
+     * (save, close, open, reopen editors) MUST run on the UI thread because they trigger 
+     * property change events that update UI components (e.g., SaveAction).
      */
-    private void performGitCheckout(BranchInfo branchInfo) throws IOException, GitAPIException {
+    private void switchBranchWithProgress(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
         Exception[] exception = new Exception[1];
+        IArchimateModel[] importedModel = new IArchimateModel[1];
+        GraficoModelImporter[] importerRef = new GraficoModelImporter[1];
         
+        // Combined progress dialog for git checkout + import
         try {
             PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
                 @Override
-                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                    monitor.beginTask(Messages.SwitchBranchAction_6, IProgressMonitor.UNKNOWN);
+                public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
+                    // Allocate: 30% for git checkout, 70% for import
+                    int totalWork = doReloadGrafico ? 100 : 30;
+                    SubMonitor progress = SubMonitor.convert(pm, 
+                            MessageFormat.format(Messages.SwitchBranchAction_19, branchInfo.getShortName()), totalWork);
                     
                     try {
-                        File repoFolder = getRepository().getLocalRepositoryFolder();
+                        // Phase 1: Git checkout (30%)
+                        performGitCheckoutWithMonitor(branchInfo, progress.split(30));
                         
-                        // If the branch is remote and has no local ref, we need to create it first using JGit
-                        if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
-                            monitor.subTask(Messages.SwitchBranchAction_8);
-                            try(Git git = Git.open(repoFolder)) {
-                                git.branchCreate()
-                                        .setName(branchInfo.getShortName())
-                                        .setStartPoint(branchInfo.getFullName())
-                                        .call();
-                            }
-                        }
-                        
-                        // Determine the branch name to checkout
-                        // For JGit, we can use the full name (refs/heads/...) for local branches
-                        // For native git, we must use the short name (just the branch name)
-                        String branchForJGit = branchInfo.isLocal() ? 
-                                branchInfo.getFullName() : branchInfo.getShortName();
-                        String branchForNativeGit = branchInfo.getShortName(); // Native git needs short name
-                        
-                        // Try native Git first (much faster for many files)
-                        monitor.subTask(Messages.SwitchBranchAction_11); // "Trying native Git checkout..."
-                        boolean nativeSuccess = tryNativeGitCheckout(repoFolder, branchForNativeGit);
-                        
-                        if(!nativeSuccess) {
-                            // Fall back to JGit if native Git is not available
-                            monitor.subTask(Messages.SwitchBranchAction_12); // "Using JGit checkout (native Git not available)..."
-                            try(Git git = Git.open(repoFolder)) {
-                                git.checkout().setName(branchForJGit).call();
-                            }
-                            monitor.subTask(Messages.SwitchBranchAction_13); // "JGit checkout completed"
-                        }
-                        else {
-                            // Native checkout succeeded
-                            monitor.subTask(Messages.SwitchBranchAction_14); // "Native Git checkout completed, refreshing JGit state..."
-                            
-                            // After native Git checkout, we need to refresh JGit's state
-                            // and notify listeners about the ref changes
-                            Git.open(repoFolder);
-                            monitor.subTask(Messages.SwitchBranchAction_17); // "JGit state refresh completed"
+                        // Phase 2: Import model files (70%) - this is pure I/O, safe in background
+                        if(doReloadGrafico) {
+                            progress.subTask(MessageFormat.format(Messages.SwitchBranchAction_20, branchInfo.getShortName()));
+                            importerRef[0] = new GraficoModelImporter(getRepository().getLocalRepositoryFolder());
+                            importedModel[0] = importerRef[0].importAsModel(progress.split(70));
                         }
                     }
                     catch(IOException | GitAPIException ex) {
                         exception[0] = ex;
-                    }
-                    finally {
-                        monitor.done();
                     }
                 }
             });
@@ -226,7 +222,7 @@ public class SwitchBranchAction extends AbstractModelAction {
             throw new IOException(ex);
         }
         
-        // Re-throw any exception from the progress runnable
+        // Re-throw any exception from the background phase
         if(exception[0] != null) {
             if(exception[0] instanceof IOException) {
                 throw (IOException)exception[0];
@@ -235,6 +231,138 @@ public class SwitchBranchAction extends AbstractModelAction {
                 throw (GitAPIException)exception[0];
             }
             throw new IOException(exception[0]);
+        }
+        
+        // Phase 3: UI operations on UI thread (required because they trigger UI property changes)
+        if(doReloadGrafico && importedModel[0] != null) {
+            // Use GraficoModelLoader.openModel() to handle save, close, open, reopen editors
+            new GraficoModelLoader(getRepository()).openModel(importedModel[0], importerRef[0]);
+            
+            // Save the checksum
+            getRepository().saveChecksum();
+        }
+    }
+    
+    /**
+     * Switch branch for headless/command-line usage (no progress dialog).
+     * Also used by MergeBranchAction.
+     */
+    protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
+        switchBranch(branchInfo, doReloadGrafico, null);
+    }
+    
+    /**
+     * Switch branch with optional external progress monitor.
+     * @param branchInfo The branch to switch to
+     * @param doReloadGrafico Whether to reload the model after checkout
+     * @param monitor External progress monitor (null for headless mode)
+     */
+    protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico, IProgressMonitor monitor) throws IOException, GitAPIException {
+        // Use SubMonitor if external monitor provided
+        SubMonitor progress = monitor != null ? SubMonitor.convert(monitor, 100) : null;
+        
+        // Perform Git checkout
+        if(progress != null) {
+            performGitCheckoutWithMonitor(branchInfo, progress.split(30));
+        } else {
+            performGitCheckoutHeadless(branchInfo);
+        }
+        
+        // Reload the model if requested
+        if(doReloadGrafico) {
+            IProgressMonitor loadMonitor = progress != null ? progress.split(70) : null;
+            new GraficoModelLoader(getRepository(), monitor == null).loadModel(loadMonitor);
+            
+            // Save the checksum
+            getRepository().saveChecksum();
+        }
+    }
+    
+    /**
+     * Perform the Git checkout operation with external progress monitor.
+     * This is used when combining checkout with other operations in a single progress dialog.
+     */
+    private void performGitCheckoutWithMonitor(BranchInfo branchInfo, IProgressMonitor monitor) throws IOException, GitAPIException {
+        SubMonitor progress = SubMonitor.convert(monitor, Messages.SwitchBranchAction_6, 100);
+        
+        File repoFolder = getRepository().getLocalRepositoryFolder();
+        
+        // If the branch is remote and has no local ref, we need to create it first using JGit
+        if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
+            progress.subTask(Messages.SwitchBranchAction_8);
+            try(Git git = Git.open(repoFolder)) {
+                git.branchCreate()
+                        .setName(branchInfo.getShortName())
+                        .setStartPoint(branchInfo.getFullName())
+                        .call();
+            }
+        }
+        progress.worked(10);
+        
+        // Determine the branch name to checkout
+        // For JGit, we can use the full name (refs/heads/...) for local branches
+        // For native git, we must use the short name (just the branch name)
+        String branchForJGit = branchInfo.isLocal() ? 
+                branchInfo.getFullName() : branchInfo.getShortName();
+        String branchForNativeGit = branchInfo.getShortName(); // Native git needs short name
+        
+        // Try native Git first (much faster for many files)
+        progress.subTask(Messages.SwitchBranchAction_11); // "Trying native Git checkout..."
+        boolean nativeSuccess = tryNativeGitCheckout(repoFolder, branchForNativeGit);
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit if native Git is not available
+            progress.subTask(Messages.SwitchBranchAction_12); // "Using JGit checkout (native Git not available)..."
+            try(Git git = Git.open(repoFolder)) {
+                git.checkout().setName(branchForJGit).call();
+            }
+            progress.subTask(Messages.SwitchBranchAction_13); // "JGit checkout completed"
+        }
+        else {
+            // Native checkout succeeded
+            progress.subTask(Messages.SwitchBranchAction_14); // "Native Git checkout completed, refreshing JGit state..."
+            
+            // After native Git checkout, we need to refresh JGit's state
+            // and notify listeners about the ref changes
+            Git.open(repoFolder);
+            progress.subTask(Messages.SwitchBranchAction_17); // "JGit state refresh completed"
+        }
+        progress.worked(90);
+    }
+    
+    /**
+     * Perform the Git checkout operation for headless/command-line usage (no progress).
+     */
+    private void performGitCheckoutHeadless(BranchInfo branchInfo) throws IOException, GitAPIException {
+        File repoFolder = getRepository().getLocalRepositoryFolder();
+        
+        // If the branch is remote and has no local ref, we need to create it first using JGit
+        if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
+            try(Git git = Git.open(repoFolder)) {
+                git.branchCreate()
+                        .setName(branchInfo.getShortName())
+                        .setStartPoint(branchInfo.getFullName())
+                        .call();
+            }
+        }
+        
+        // Determine the branch name to checkout
+        String branchForJGit = branchInfo.isLocal() ? 
+                branchInfo.getFullName() : branchInfo.getShortName();
+        String branchForNativeGit = branchInfo.getShortName();
+        
+        // Try native Git first (much faster for many files)
+        boolean nativeSuccess = tryNativeGitCheckout(repoFolder, branchForNativeGit);
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit if native Git is not available
+            try(Git git = Git.open(repoFolder)) {
+                git.checkout().setName(branchForJGit).call();
+            }
+        }
+        else {
+            // After native Git checkout, refresh JGit's state
+            Git.open(repoFolder);
         }
     }
     
