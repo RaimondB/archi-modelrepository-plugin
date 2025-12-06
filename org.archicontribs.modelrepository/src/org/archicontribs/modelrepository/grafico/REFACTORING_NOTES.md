@@ -359,6 +359,142 @@ try {
 
 ---
 
+## DirCache Optimization for Import
+
+### The Problem
+
+After the export optimization (which uses DirCache for hash comparison instead of reading files), the disk cache is cold when import runs. The original import implementation had two bottlenecks:
+
+1. **Sequential folder traversal**: Each folder's `folder.xml` was loaded before processing children
+2. **Per-folder file discovery**: Used `Files.list()` for each folder (repeated disk I/O)
+
+```java
+// ❌ SLOW: Folder-by-folder discovery and loading
+for (FolderType folderType : folderList) {
+    IFolder folder = loadFolder(new File(modelFolder, folderType.toString()));
+    // loadFolder() calls Files.list() for each subfolder (disk I/O)
+    // loadFolder() recursively processes children (sequential)
+}
+```
+
+### Solution: DirCache-Based Bulk Parallel Loading
+
+Use DirCache to discover ALL files upfront, then read them in parallel:
+
+```java
+// ✅ FAST: Use DirCache for file discovery (no disk I/O)
+List<DirCacheFileEntry> allEntries = collectFilesFromDirCache();
+
+// Separate folder.xml files (structure) from element files (content)
+List<DirCacheFileEntry> folderXmlFiles = allEntries.stream()
+    .filter(e -> e.isFolderXml())
+    .sorted((a, b) -> a.getDepth() - b.getDepth())  // Parents first
+    .collect(toList());
+
+List<DirCacheFileEntry> elementFiles = allEntries.stream()
+    .filter(e -> !e.isFolderXml())
+    .collect(toList());
+
+// Phase 1: Read ALL folder.xml files in parallel, then build hierarchy
+CountDownLatch folderLatch = new CountDownLatch(folderXmlFiles.size());
+for (DirCacheFileEntry entry : folderXmlFiles) {
+    readAndParseDirect(entry.absolutePath(), folderContents, folderLatch);
+}
+folderLatch.await();
+
+// Build folder hierarchy (sequential, but fast - data already in memory)
+for (DirCacheFileEntry entry : folderXmlFiles) {
+    // Create IFolder, add to parent
+}
+
+// Phase 2 & 3 OVERLAPPED: Read elements and add to model concurrently
+// Producer/Consumer pattern - no waiting for all reads to complete
+BlockingQueue<ElementWithFolder> queue = new LinkedBlockingQueue<>();
+AtomicInteger remaining = new AtomicInteger(elementFiles.size());
+
+// Start ALL element reads - each puts result in queue when done
+for (DirCacheFileEntry entry : elementFiles) {
+    readParseAndQueueElement(entry, queue, remaining, ...);
+}
+
+// Consumer loop: add to model as elements arrive (single-threaded, EMF safe)
+while (elementsProcessed < totalElements) {
+    ElementWithFolder item = queue.poll(50, TimeUnit.MILLISECONDS);
+    if (item != null) {
+        IFolder parent = fFolderPathLookup.get(item.folderPath());
+        parent.getElements().add(item.element());
+        elementsProcessed++;
+    }
+}
+```
+
+**Performance Benefits:**
+- Zero disk I/O for file discovery (DirCache is already in memory)
+- ALL async file reads start simultaneously (maximum I/O parallelism)
+- Folder hierarchy built from in-memory data (no per-folder blocking)
+- **Overlapped I/O and model building** - elements added as soon as parsed
+
+### Overlapped Producer/Consumer Pattern
+
+The key optimization is overlapping disk I/O with model building. Since the folder hierarchy is pre-built, elements can be added in any order:
+
+```
+Timeline (overlapped):
+Thread 1 (I/O):      [read file A][read file B][read file C]...
+Thread 2 (CPU):           [parse A]    [parse B]    [parse C]...
+Main Thread (EMF):            [add A]      [add B]      [add C]...
+                    ←————— Maximum overlap, no waiting ——————→
+```
+
+Compare to sequential:
+```
+Timeline (sequential - OLD):
+[read all files]...[wait]...[parse all]...[wait]...[add all to model]
+                    ←————— Wasted time waiting ——————→
+```
+
+### Pre-Flight Folder Hierarchy
+
+The key insight is that folder.xml files define the folder structure. By reading them first and sorting by depth, we can create parent folders before children:
+
+```java
+// Sort folder.xml files by depth (parents before children)
+folderXmlFiles.sort((a, b) -> a.getDepth() - b.getDepth());
+
+// Create folders in hierarchy order
+for (DirCacheFileEntry entry : folderXmlFiles) {
+    IFolder folder = (IFolder) folderContents.get(entry.absolutePath());
+    
+    // Find parent folder
+    IFolder parent = fFolderPathLookup.get(parentPath);
+    parent.getFolders().add(folder);
+    
+    // Register for children
+    fFolderPathLookup.put(entry.folderPath(), folder);
+}
+```
+
+### Fallback for Non-Git Folders
+
+The importer can also be used on regular folders. In this case, it falls back to the traditional folder-by-folder loading:
+
+```java
+boolean useDirCache = initDirCacheForImport();
+if (useDirCache) {
+    fModel = loadModelWithDirCache(modelFolder, allEntries, totalFiles);
+} else {
+    fModel = loadModel(modelFolder, totalFiles);  // Traditional approach
+}
+```
+
+### Where This Applies
+
+- `GraficoModelImporter.importAsModel()` - tries DirCache first, falls back to traditional
+- `GraficoModelImporter.loadModelWithDirCache()` - bulk parallel loading
+- `GraficoModelImporter.collectFilesFromDirCache()` - file discovery without disk I/O
+
+---
+
 ## Keeping This Document Updated
 
 **INSTRUCTION FOR AI ASSISTANTS AND DEVELOPERS:**

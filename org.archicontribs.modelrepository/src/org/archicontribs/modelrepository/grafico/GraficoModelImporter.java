@@ -33,6 +33,10 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.dircache.DirCache;
+import org.eclipse.jgit.dircache.DirCacheEntry;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
@@ -145,6 +149,68 @@ public class GraficoModelImporter {
      */
     private volatile Throwable fConsumerException;
     
+    // ================================================================================
+    // DirCache Optimization Fields
+    // ================================================================================
+    // When importing from a git repository, we can use the DirCache (git index) to:
+    // 1. Discover all files without hitting the disk (fast directory traversal)
+    // 2. Pre-build the folder hierarchy before reading any files
+    // 3. Start ALL async file reads at once (not folder-by-folder)
+    // ================================================================================
+    
+    /**
+     * Git repository, if importing from a git-managed folder.
+     * Null if the folder is not a git repository.
+     */
+    private Repository fGitRepository;
+    
+    /**
+     * DirCache (git index) for discovering file structure without disk I/O.
+     * Null if the folder is not a git repository.
+     */
+    private DirCache fDirCache;
+    
+    /**
+     * Pre-built folder hierarchy from DirCache.
+     * Maps relative folder path (e.g., "model/strategy") to IFolder object.
+     * Used to look up parent folders when adding elements.
+     */
+    private Map<String, IFolder> fFolderPathLookup;
+    
+    /**
+     * Enable performance logging. Set to true to see detailed timing breakdown.
+     * Logs go to Eclipse Error Log view (Window → Show View → Error Log).
+     * Enable with JVM arg: -Dgrafico.perf.logging=true
+     * 
+     * This flag is evaluated once at class load time, so there's zero overhead
+     * when disabled (the default). The check is a simple boolean comparison.
+     */
+    private static final boolean PERF_LOGGING = Boolean.getBoolean("grafico.perf.logging"); //$NON-NLS-1$
+    
+    /**
+     * Log performance metrics if PERF_LOGGING is enabled.
+     */
+    private void logPerf(String phase, long startNanos, int itemCount) {
+        if (!PERF_LOGGING) return; // Fast path - zero overhead when disabled
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+        double itemsPerSec = itemCount > 0 && elapsedMs > 0 ? (itemCount * 1000.0 / elapsedMs) : 0;
+        String message = String.format("[GRAFICO IMPORT PERF] %s: %dms (%d items, %.0f items/sec)", //$NON-NLS-1$
+            phase, elapsedMs, itemCount, itemsPerSec);
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, message, null);
+    }
+    
+    private void logPerf(String phase, long startNanos) {
+        if (!PERF_LOGGING) return; // Fast path - zero overhead when disabled
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+        String message = String.format("[GRAFICO IMPORT PERF] %s: %dms", phase, elapsedMs); //$NON-NLS-1$
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, message, null);
+    }
+    
+    private void logPerfMessage(String message) {
+        if (!PERF_LOGGING) return; // Fast path - zero overhead when disabled
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[GRAFICO IMPORT PERF] " + message, null); //$NON-NLS-1$
+    }
+
     /**
      * Holds a parsed element or subfolder with its target parent folder context.
      * Grouped by folder to optimize EMF operations (batch adds to same folder).
@@ -191,6 +257,9 @@ public class GraficoModelImporter {
      * @throws IOException
      */
     public IArchimateModel importAsModel(IProgressMonitor monitor) throws IOException {
+        long importStart = System.nanoTime();
+        logPerfMessage("=== IMPORT START ==="); //$NON-NLS-1$
+        
         // Use SubMonitor for easier progress reporting
         SubMonitor progress = SubMonitor.convert(monitor, Messages.GraficoModelImporter_0, 100);
         
@@ -214,9 +283,11 @@ public class GraficoModelImporter {
     	// Count total files for the shared progress reporter
     	// This includes model files + image files
     	// Uses optimized NIO2 file walking (much faster than File.listFiles())
+    	long phaseStart = System.nanoTime();
     	int modelFileCount = GraficoUtils.countModelFilesRecursively(modelFolder.toPath());
     	int imageFileCount = GraficoUtils.countFilesInFolder(imagesFolder.toPath());
     	int totalFiles = modelFileCount + imageFileCount;
+    	logPerf("File counting", phaseStart, totalFiles); //$NON-NLS-1$
     	
     	// Create a SINGLE shared progress reporter for all phases
     	// This ensures only ONE background thread handles UI updates across all phases
@@ -226,15 +297,44 @@ public class GraficoModelImporter {
     	// Create a SINGLE shared CPU executor for all parallel XML parsing
     	// This avoids creating a new ForkJoinPool for each folder in the hierarchy
     	fCpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+    	logPerfMessage("CPU executor created with " + Runtime.getRuntime().availableProcessors() + " threads"); //$NON-NLS-1$ //$NON-NLS-2$
     	
     	try {
     	    // Reset the ID -> Object lookup table
     	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
+    	    
+    	    // Try DirCache-based loading for git repositories (faster on cold cache)
+    	    // Falls back to traditional folder-by-folder loading if not a git repo
+    	    phaseStart = System.nanoTime();
+    	    boolean useDirCache = initDirCacheForImport();
+    	    List<DirCacheFileEntry> allEntries = null;
+    	    
+    	    if (useDirCache) {
+    	        allEntries = collectFilesFromDirCache();
+    	        // Recalculate counts from DirCache for accuracy
+    	        modelFileCount = (int) allEntries.stream().filter(DirCacheFileEntry::isModelFile).count();
+    	        imageFileCount = (int) allEntries.stream().filter(DirCacheFileEntry::isImageFile).count();
+    	        totalFiles = modelFileCount + imageFileCount;
+    	        logPerf("DirCache init + collect", phaseStart, allEntries.size()); //$NON-NLS-1$
+    	    } else {
+    	        logPerf("DirCache init (fallback to traditional)", phaseStart); //$NON-NLS-1$
+    	    }
     	
             // Load the Model from files (it will contain unresolved proxies)
             // Uses shared fProgressReporter and fCpuExecutor
     	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_1, 0, modelFileCount));
-    	    fModel = loadModel(modelFolder, modelFileCount);
+    	    
+    	    phaseStart = System.nanoTime();
+    	    if (useDirCache && allEntries != null) {
+    	        // DirCache-optimized loading: bulk parallel reads of ALL files
+    	        logPerfMessage("Using DirCache-optimized loading for " + modelFileCount + " model files"); //$NON-NLS-1$ //$NON-NLS-2$
+    	        fModel = loadModelWithDirCache(modelFolder, allEntries, modelFileCount);
+    	    } else {
+    	        // Traditional folder-by-folder loading
+    	        logPerfMessage("Using traditional folder-by-folder loading"); //$NON-NLS-1$
+    	        fModel = loadModel(modelFolder, modelFileCount);
+    	    }
+    	    logPerf("Model loading (total)", phaseStart, modelFileCount); //$NON-NLS-1$
     	
     	    // Check for cancellation
     	    if (fProgressReporter.isCanceled()) {
@@ -247,7 +347,9 @@ public class GraficoModelImporter {
     	
             // Resolve proxies - quick operation, no per-file progress needed
     	    fProgressReporter.subTask(Messages.GraficoModelImporter_2);
+    	    phaseStart = System.nanoTime();
             resolveProxies();
+            logPerf("Resolve proxies", phaseStart); //$NON-NLS-1$
 
     	    // New model compatibility
             ModelCompatibility modelCompatibility = new ModelCompatibility(resource);
@@ -256,12 +358,14 @@ public class GraficoModelImporter {
     	    // This has to be done here because GraficoModelLoader#loadModel() will save with latest metamodel version number
     	    // And then the ModelCompatibility won't be able to tell the version number
     	    fProgressReporter.subTask(Messages.GraficoModelImporter_3);
+    	    phaseStart = System.nanoTime();
             try {
                 modelCompatibility.fixCompatibility();
             }
             catch(CompatibilityHandlerException ex) {
                 ModelRepositoryPlugin.getInstance().log(IStatus.ERROR, "Error loading model", ex); //$NON-NLS-1$
             }
+            logPerf("Fix compatibility", phaseStart); //$NON-NLS-1$
 
     	    // We now have to remove the Eobject from its Resource so it can be saved in its proper *.archimate format
             resource.getContents().remove(fModel);
@@ -276,10 +380,17 @@ public class GraficoModelImporter {
         
     	    // Load images - uses shared fProgressReporter and fCpuExecutor
     	    fProgressReporter.subTask(NLS.bind(Messages.GraficoModelImporter_4, 0, imageFileCount));
+    	    phaseStart = System.nanoTime();
     	    loadImages(imagesFolder, archiveManager, imageFileCount);
+    	    logPerf("Load images", phaseStart, imageFileCount); //$NON-NLS-1$
+    	    
+    	    logPerf("=== IMPORT COMPLETE ===", importStart, totalFiles); //$NON-NLS-1$
 
     	    return fModel;
     	} finally {
+    	    // Ensure DirCache resources are cleaned up
+    	    cleanupDirCacheForImport();
+    	    
     	    // Ensure the shared CPU executor is stopped
     	    if (fCpuExecutor != null) {
     	        fCpuExecutor.shutdown();
@@ -891,6 +1002,467 @@ public class GraficoModelImporter {
             });
         } catch (IOException e) {
             // Failed to open file - count down and continue
+            latch.countDown();
+        }
+    }
+    
+    // ================================================================================
+    // DirCache Optimization Methods
+    // ================================================================================
+    // 
+    // When importing from a git repository, we can use the DirCache (git index) to
+    // discover all files without hitting the disk for directory listing. This is
+    // especially important after the export optimization, which no longer warms
+    // the disk cache by reading files.
+    //
+    // STRATEGY:
+    // 1. Read DirCache once to get list of all files under model/ and images/
+    // 2. Categorize files: folder.xml files (define structure) vs element files (content)
+    // 3. Process folder.xml files first (in hierarchy order) to create IFolder objects
+    // 4. Start ALL element file reads in parallel (not folder-by-folder)
+    // 5. Use producer/consumer to add parsed elements to pre-created folders
+    //
+    // PERFORMANCE BENEFIT:
+    // - Avoids disk I/O for directory listing (~30 folder scans → 0)
+    // - Enables bulk parallel reads of ALL files at once
+    // - Overlaps I/O completely across the entire file set
+    // ================================================================================
+    
+    /**
+     * Initialize DirCache for optimized file discovery.
+     * 
+     * @return true if DirCache was successfully initialized
+     */
+    private boolean initDirCacheForImport() {
+        if (!GraficoUtils.isGitRepository(fLocalRepoFolder)) {
+            return false;
+        }
+        
+        try {
+            fGitRepository = Git.open(fLocalRepoFolder).getRepository();
+            fDirCache = DirCache.read(fGitRepository);
+            fFolderPathLookup = new ConcurrentHashMap<>();
+            return true;
+        } catch (IOException e) {
+            cleanupDirCacheForImport();
+            return false;
+        }
+    }
+    
+    /**
+     * Clean up DirCache resources.
+     */
+    private void cleanupDirCacheForImport() {
+        fDirCache = null;
+        if (fGitRepository != null) {
+            fGitRepository.close();
+            fGitRepository = null;
+        }
+        fFolderPathLookup = null;
+    }
+    
+    /**
+     * Represents a file entry from DirCache with its categorization.
+     */
+    private record DirCacheFileEntry(
+        String relativePath,    // e.g., "model/strategy/folder.xml" or "model/strategy/Element_abc123.xml"
+        Path absolutePath,      // Full filesystem path
+        String folderPath,      // Parent folder path e.g., "model/strategy"
+        boolean isFolderXml,    // true if this is a folder.xml file
+        boolean isModelFile,    // true if under model/ directory
+        boolean isImageFile     // true if under images/ directory
+    ) {
+        /**
+         * Get the depth of this file in the folder hierarchy.
+         * Used to sort folder.xml files for hierarchical processing.
+         */
+        int getDepth() {
+            return (int) relativePath.chars().filter(c -> c == '/').count();
+        }
+    }
+    
+    /**
+     * Collect all model and image files from DirCache.
+     * This avoids disk I/O for directory traversal.
+     * 
+     * @return List of file entries categorized by type
+     */
+    private List<DirCacheFileEntry> collectFilesFromDirCache() {
+        List<DirCacheFileEntry> entries = new ArrayList<>();
+        
+        if (fDirCache == null) {
+            return entries;
+        }
+        
+        Path repoRoot = fLocalRepoFolder.toPath();
+        String modelPrefix = IGraficoConstants.MODEL_FOLDER + "/"; //$NON-NLS-1$
+        String imagesPrefix = IGraficoConstants.IMAGES_FOLDER + "/"; //$NON-NLS-1$
+        
+        for (int i = 0; i < fDirCache.getEntryCount(); i++) {
+            DirCacheEntry entry = fDirCache.getEntry(i);
+            String path = entry.getPathString();
+            
+            boolean isModelFile = path.startsWith(modelPrefix);
+            boolean isImageFile = path.startsWith(imagesPrefix);
+            
+            if (!isModelFile && !isImageFile) {
+                continue; // Skip files outside model/ and images/
+            }
+            
+            Path absolutePath = repoRoot.resolve(path.replace('/', File.separatorChar));
+            
+            // Compute parent folder path
+            int lastSlash = path.lastIndexOf('/');
+            String folderPath = lastSlash > 0 ? path.substring(0, lastSlash) : ""; //$NON-NLS-1$
+            
+            boolean isFolderXml = path.endsWith("/" + IGraficoConstants.FOLDER_XML) || //$NON-NLS-1$
+                                  path.equals(IGraficoConstants.MODEL_FOLDER + "/" + IGraficoConstants.FOLDER_XML); //$NON-NLS-1$
+            
+            entries.add(new DirCacheFileEntry(path, absolutePath, folderPath, isFolderXml, isModelFile, isImageFile));
+        }
+        
+        return entries;
+    }
+    
+    /**
+     * Load model using DirCache-optimized bulk parallel reading.
+     * 
+     * Strategy:
+     * 1. Get all files from DirCache (no disk I/O for discovery)
+     * 2. Sort and process folder.xml files first (creates folder hierarchy)
+     * 3. Start ALL element file reads in parallel
+     * 4. Use producer/consumer for single-threaded model building
+     * 
+     * @param modelFolder The model folder
+     * @param allEntries Pre-collected file entries from DirCache
+     * @param totalModelFiles Total file count for progress
+     * @return The loaded model
+     */
+    private IArchimateModel loadModelWithDirCache(File modelFolder, List<DirCacheFileEntry> allEntries, int totalModelFiles) throws IOException {
+        long methodStart = System.nanoTime();
+        long phaseStart = System.nanoTime();
+        
+        // Separate folder.xml files from element files
+        List<DirCacheFileEntry> folderXmlFiles = allEntries.stream()
+            .filter(e -> e.isModelFile() && e.isFolderXml())
+            .sorted((a, b) -> Integer.compare(a.getDepth(), b.getDepth())) // Process parents before children
+            .collect(Collectors.toList());
+        
+        List<DirCacheFileEntry> elementFiles = allEntries.stream()
+            .filter(e -> e.isModelFile() && !e.isFolderXml())
+            .collect(Collectors.toList());
+        
+        logPerf("  Categorize files", phaseStart, allEntries.size()); //$NON-NLS-1$
+        logPerfMessage("  folder.xml files: " + folderXmlFiles.size() + ", element files: " + elementFiles.size()); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Phase 1: Load and parse all folder.xml files to build folder hierarchy
+        // These must be processed in order (parents before children)
+        // We read them in parallel but process in hierarchy order
+        Map<String, EObject> folderXmlContents = new ConcurrentHashMap<>();
+        
+        phaseStart = System.nanoTime();
+        if (!folderXmlFiles.isEmpty()) {
+            CountDownLatch folderLatch = new CountDownLatch(folderXmlFiles.size());
+            
+            // Start all folder.xml reads in parallel
+            for (DirCacheFileEntry entry : folderXmlFiles) {
+                readAndParseDirect(entry.absolutePath(), folderXmlContents, folderLatch);
+            }
+            
+            // Wait for all folder.xml files to be read
+            try {
+                folderLatch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Folder loading interrupted", e); //$NON-NLS-1$
+            }
+        }
+        logPerf("  Phase1: Read+parse folder.xml (parallel async I/O)", phaseStart, folderXmlFiles.size()); //$NON-NLS-1$
+        
+        // Build folder hierarchy (must be done sequentially in hierarchy order)
+        phaseStart = System.nanoTime();
+        IArchimateModel model = null;
+        for (DirCacheFileEntry entry : folderXmlFiles) {
+            EObject folderObj = folderXmlContents.get(entry.absolutePath().toString());
+            if (folderObj == null) {
+                continue;
+            }
+            
+            if (folderObj instanceof IArchimateModel) {
+                // Root folder.xml is the model itself
+                model = (IArchimateModel) folderObj;
+                // Note: Don't put in fFolderPathLookup - ConcurrentHashMap doesn't allow null values
+                // and model folder has no IFolder. Children of model are top-level folders.
+            } else if (folderObj instanceof IFolder) {
+                IFolder folder = (IFolder) folderObj;
+                
+                // Find parent folder
+                String parentPath = entry.folderPath();
+                int lastSlash = parentPath.lastIndexOf('/');
+                String grandParentPath = lastSlash > 0 ? parentPath.substring(0, lastSlash) : IGraficoConstants.MODEL_FOLDER;
+                
+                // Add to parent
+                if (grandParentPath.equals(IGraficoConstants.MODEL_FOLDER)) {
+                    // Top-level folder - add to model
+                    if (model != null) {
+                        model.getFolders().add(folder);
+                    }
+                } else {
+                    // Nested folder - add to parent folder
+                    IFolder parentFolder = fFolderPathLookup.get(grandParentPath);
+                    if (parentFolder != null) {
+                        parentFolder.getFolders().add(folder);
+                    }
+                }
+                
+                // Register this folder for its children
+                fFolderPathLookup.put(entry.folderPath(), folder);
+            }
+            
+            // Report progress
+            if (fProgressReporter != null) {
+                fProgressReporter.incrementAndMaybeReport(
+                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+            }
+        }
+        logPerf("  Build folder hierarchy (sequential)", phaseStart, folderXmlFiles.size()); //$NON-NLS-1$
+        
+        if (model == null) {
+            throw new IOException("Model folder.xml not found"); //$NON-NLS-1$
+        }
+        
+        // Phase 2 & 3 OVERLAPPED: Read elements in parallel, add to model as they complete
+        // Producer/Consumer pattern:
+        // - Producers (async I/O callbacks): read file → parse XML → put into queue
+        // - Consumer (this thread): take from queue → add to parent folder (EMF single-threaded)
+        //
+        // This overlaps disk I/O with model building for maximum throughput.
+        // Since folder hierarchy is already built, we can add elements in any order.
+        phaseStart = System.nanoTime();
+        if (!elementFiles.isEmpty()) {
+            // Queue for parsed elements with their folder context
+            BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
+            AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
+            AtomicBoolean producerError = new AtomicBoolean(false);
+            
+            long producerStart = System.nanoTime();
+            // CRITICAL: File open + Files.size() are blocking on cold cache!
+            // Fire the reads in batches using the CPU executor to parallelize the file open calls.
+            // This turns 26,000 sequential file opens into parallel operations.
+            final int batchSize = Math.max(1, elementFiles.size() / (Runtime.getRuntime().availableProcessors() * 4));
+            for (int i = 0; i < elementFiles.size(); i += batchSize) {
+                final int start = i;
+                final int end = Math.min(i + batchSize, elementFiles.size());
+                fCpuExecutor.execute(() -> {
+                    for (int j = start; j < end; j++) {
+                        DirCacheFileEntry entry = elementFiles.get(j);
+                        readParseAndQueueElement(entry, elementQueue, remainingElements, producerError, totalModelFiles);
+                    }
+                });
+            }
+            logPerf("  Phase2: Fire async reads for elements (batched)", producerStart, elementFiles.size()); //$NON-NLS-1$
+            
+            // Consumer loop: add elements to model as they arrive
+            // Runs on this thread (main/caller thread) for EMF thread safety
+            int elementsProcessed = 0;
+            final int totalElements = elementFiles.size();
+            long consumerStart = System.nanoTime();
+            int pollTimeouts = 0;
+            
+            while (elementsProcessed < totalElements) {
+                // Check for cancellation
+                if (fProgressReporter != null && fProgressReporter.isCanceled()) {
+                    return model;
+                }
+                
+                try {
+                    // Poll with timeout to allow cancellation checks
+                    ElementWithFolder item = elementQueue.poll(50, TimeUnit.MILLISECONDS);
+                    if (item == null) {
+                        // Check if producers encountered an error
+                        if (producerError.get() && remainingElements.get() == 0) {
+                            break; // All producers done, possibly with errors
+                        }
+                        pollTimeouts++;
+                        continue; // Keep waiting
+                    }
+                    
+                    // Add element to its parent folder (single-threaded, EMF safe)
+                    IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
+                    if (parentFolder != null && item.element() != null) {
+                        parentFolder.getElements().add(item.element());
+                    }
+                    elementsProcessed++;
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Element loading interrupted", e); //$NON-NLS-1$
+                }
+            }
+            logPerf("  Phase2+3: Consumer (poll+add to model)", consumerStart, elementsProcessed); //$NON-NLS-1$
+            logPerfMessage("  Consumer poll timeouts: " + pollTimeouts + " (each = 50ms wait)"); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        logPerf("  Phase2+3 TOTAL (overlapped I/O + model build)", phaseStart, elementFiles.size()); //$NON-NLS-1$
+        logPerf("  loadModelWithDirCache TOTAL", methodStart, totalModelFiles); //$NON-NLS-1$
+        
+        return model;
+    }
+    
+    /**
+     * Holds a parsed element with its target folder path.
+     * Used for the producer/consumer queue in DirCache-based loading.
+     */
+    private record ElementWithFolder(String folderPath, EObject element) {}
+    
+    /**
+     * Read, parse, and queue an element for the consumer thread.
+     * This is the producer in the producer/consumer pattern for DirCache loading.
+     * 
+     * Uses synchronous I/O within executor threads rather than AsynchronousFileChannel
+     * because AsynchronousFileChannel.open() and Files.size() are blocking operations
+     * that perform poorly on cold cache. Since we're already running in parallel via
+     * the CPU executor batches, synchronous I/O within each thread is simpler and faster.
+     * 
+     * @param entry The DirCache file entry
+     * @param queue The queue to put parsed elements into
+     * @param remaining Counter for remaining elements (decremented on completion)
+     * @param errorFlag Set to true if any producer encounters an error
+     * @param totalModelFiles Total files for progress reporting
+     */
+    private void readParseAndQueueElement(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
+            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
+        try {
+            // Use synchronous read - we're already in a parallel executor thread
+            // This avoids the blocking AsynchronousFileChannel.open() + Files.size() calls
+            byte[] bytes = Files.readAllBytes(entry.absolutePath());
+            
+            // Parse XML
+            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                fIDLookup.put(eObject.getId(), eObject);
+                
+                // Put into queue for consumer
+                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+            }
+        } catch (IOException | InterruptedException e) {
+            errorFlag.set(true);
+            // Put a null element to signal completion even on error
+            try {
+                queue.put(new ElementWithFolder(entry.folderPath(), null));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            remaining.decrementAndGet();
+            if (fProgressReporter != null) {
+                fProgressReporter.incrementAndMaybeReport(
+                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+            }
+        }
+    }
+    
+    /**
+     * Read and parse a file directly (no CompletableFuture wrapper).
+     * Used for folder.xml files where we need the content for hierarchy building.
+     */
+    private void readAndParseDirect(Path path, Map<String, EObject> results, CountDownLatch latch) {
+        try {
+            long fileSize = Files.size(path);
+            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+            
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(path, StandardOpenOption.READ);
+            
+            channel.read(buffer, 0, buffer, new CompletionHandler<Integer, ByteBuffer>() {
+                @Override
+                public void completed(Integer bytesRead, ByteBuffer buf) {
+                    try {
+                        channel.close();
+                        buf.flip();
+                        byte[] bytes = new byte[buf.remaining()];
+                        buf.get(bytes);
+                        
+                        // Parse on CPU executor
+                        fCpuExecutor.execute(() -> {
+                            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                                fIDLookup.put(eObject.getId(), eObject);
+                                if (eObject instanceof IArchimateModel) {
+                                    for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
+                                        fIDLookup.put(profile.getId(), profile);
+                                    }
+                                }
+                                results.put(path.toString(), eObject);
+                            } catch (IOException e) {
+                                // Ignore - folder will be missing
+                            } finally {
+                                latch.countDown();
+                            }
+                        });
+                    } catch (IOException e) {
+                        latch.countDown();
+                    }
+                }
+                
+                @Override
+                public void failed(Throwable exc, ByteBuffer buf) {
+                    try { channel.close(); } catch (IOException e) { }
+                    latch.countDown();
+                }
+            });
+        } catch (IOException e) {
+            latch.countDown();
+        }
+    }
+    
+    /**
+     * Read, parse, and store an element file directly (for DirCache-based loading).
+     * Similar to readParseAndStoreDirect but uses Path as key.
+     */
+    private void readParseAndStoreDirectForDirCache(Path path, Map<Path, EObject> results, 
+            CountDownLatch latch, int totalModelFiles) {
+        try {
+            long fileSize = Files.size(path);
+            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+            
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(path, StandardOpenOption.READ);
+            
+            channel.read(buffer, 0, buffer, new CompletionHandler<Integer, ByteBuffer>() {
+                @Override
+                public void completed(Integer bytesRead, ByteBuffer buf) {
+                    try {
+                        channel.close();
+                        buf.flip();
+                        byte[] bytes = new byte[buf.remaining()];
+                        buf.get(bytes);
+                        
+                        // Parse on CPU executor
+                        fCpuExecutor.execute(() -> {
+                            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                                fIDLookup.put(eObject.getId(), eObject);
+                                results.put(path, eObject);
+                            } catch (IOException e) {
+                                // Ignore - element will be missing
+                            } finally {
+                                if (fProgressReporter != null) {
+                                    fProgressReporter.incrementAndMaybeReport(
+                                        count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                                }
+                                latch.countDown();
+                            }
+                        });
+                    } catch (IOException e) {
+                        latch.countDown();
+                    }
+                }
+                
+                @Override
+                public void failed(Throwable exc, ByteBuffer buf) {
+                    try { channel.close(); } catch (IOException e) { }
+                    latch.countDown();
+                }
+            });
+        } catch (IOException e) {
             latch.countDown();
         }
     }

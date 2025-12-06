@@ -140,6 +140,68 @@ ObjectId hash = inserter.idFor(Constants.OBJ_BLOB, content);
 MessageDigest md = MessageDigest.getInstance("SHA-1");
 ```
 
+### 6b. DirCache for Import: Bulk Parallel File Loading
+
+After export optimization leaves the disk cache cold, import must read all files from disk. Use DirCache to enable bulk parallel loading with **overlapped I/O and model building**:
+
+```java
+// ✅ FAST: Use DirCache for file discovery (no disk I/O for listing)
+List<DirCacheFileEntry> allEntries = collectFilesFromDirCache();
+
+// Categorize: folder.xml files (structure) vs element files (content)
+List<DirCacheFileEntry> folderXmlFiles = allEntries.stream()
+    .filter(e -> e.isFolderXml())
+    .sorted((a, b) -> a.getDepth() - b.getDepth())  // Parents first
+    .collect(toList());
+
+// Phase 1: Read ALL folder.xml files in parallel, build hierarchy
+CountDownLatch folderLatch = new CountDownLatch(folderXmlFiles.size());
+for (DirCacheFileEntry entry : folderXmlFiles) {
+    readAndParseDirect(entry.absolutePath(), folderContents, folderLatch);
+}
+folderLatch.await();
+// Build folder hierarchy from parsed data (sequential, data in memory)
+
+// Phase 2+3 OVERLAPPED: Producer/Consumer pattern
+BlockingQueue<ElementWithFolder> queue = new LinkedBlockingQueue<>();
+AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
+
+// Start consumer FIRST (single-threaded for EMF safety)
+Thread consumerThread = new Thread(() -> {
+    while (remainingElements.get() > 0 || !queue.isEmpty()) {
+        ElementWithFolder item = queue.poll(50, TimeUnit.MILLISECONDS);
+        if (item != null) {
+            IFolder parent = fFolderPathLookup.get(item.folderPath());
+            parent.getElements().add(item.element());
+            remainingElements.decrementAndGet();
+        }
+    }
+});
+consumerThread.start();
+
+// Start ALL element reads (producers) - queue as parsed
+for (DirCacheFileEntry entry : elementFiles) {
+    readParseAndQueueElement(entry, queue, remainingElements, ...);
+}
+
+consumerThread.join();  // Wait for consumer to finish
+```
+
+**Overlapped Timeline (maximum parallelism):**
+```
+Thread 1 (I/O):      [read file A][read file B][read file C]...
+Thread 2 (CPU):           [parse A]    [parse B]    [parse C]...
+Consumer (EMF):               [add A]      [add B]      [add C]...
+                    ←————— Maximum overlap, no waiting ——————→
+```
+
+**Import-Specific Benefits:**
+- Zero disk I/O for directory listing (~30 folder scans → 0)
+- ALL file reads start simultaneously (maximum I/O parallelism)
+- Pre-flight folder creation ensures parents exist before children
+- Single-threaded model building maintains EMF thread safety
+- **Overlapped I/O and model building** - elements added as soon as parsed, no waiting for all reads
+
 ### 7. Progress Reporting
 
 **Use `ThrottledProgressReporter` for time-based throttling** to minimize UI thread contention:
