@@ -103,18 +103,41 @@ for (File file : files) {
 }
 ```
 
-### 6. Hash-Based Change Detection
+### 6. Hash-Based Change Detection with DirCache
 
-Use SHA-256 hashes (32 bytes) instead of caching full file contents:
+For git repositories, use the DirCache (git index) which already contains file hashes:
 
 ```java
-// 30,000 files × 32 bytes = 960KB (vs 240MB for full content)
-Map<File, byte[]> hashCache = new ConcurrentHashMap<>();
+// ✅ BEST: Use DirCache for git repos - no disk I/O needed!
+// The git index already stores SHA-1/SHA-256 hashes of all tracked files.
+if (fDirCache != null) {
+    ObjectId existingHash = getHashFromDirCache(file);  // O(1) lookup
+    ObjectId newHash = fObjectInserter.idFor(Constants.OBJ_BLOB, newContent);  // CPU-only
+    return !existingHash.equals(newHash);
+}
 
+// ✅ GOOD: Compute hashes for non-git folders (32 bytes per file)
+Map<File, byte[]> hashCache = new ConcurrentHashMap<>();
 private byte[] computeHash(byte[] data) {
     MessageDigest digest = MessageDigest.getInstance("SHA-256");
     return digest.digest(data);
 }
+```
+
+**DirCache Benefits:**
+- Zero disk I/O for unchanged files (typical export has 95%+ unchanged)
+- Hash computation is ~100x faster than file read on cold cache
+- Uses correct hash algorithm automatically (SHA-1 or SHA-256)
+- Leverages git's existing index data structure
+
+**IMPORTANT**: Use `ObjectInserter.idFor()` for hashing, not `MessageDigest`:
+```java
+// ✅ CORRECT: Auto-detects repository's hash algorithm
+ObjectInserter inserter = repository.newObjectInserter();
+ObjectId hash = inserter.idFor(Constants.OBJ_BLOB, content);
+
+// ❌ WRONG: May not match repository's algorithm
+MessageDigest md = MessageDigest.getInstance("SHA-1");
 ```
 
 ### 7. Progress Reporting
@@ -335,7 +358,10 @@ for (List<File> batch : batches) {
 - [ ] CPU work (serialization, hashing) uses `ForkJoinPool` sized to CPU cores
 - [ ] Files batched in groups of 100 to reduce `CompletableFuture` overhead
 - [ ] Progress uses `ThrottledProgressReporter` for time-based updates (every 250ms)
-- [ ] SHA-256 hashes used instead of full content caching
+- [ ] DirCache used for git repos (no disk read needed for hash comparison)
+- [ ] `ObjectInserter.idFor()` used for hashing (auto-detects SHA-1 vs SHA-256)
+- [ ] Fallback to file read for non-git folders
 - [ ] 64KB buffer size for I/O operations
 - [ ] Executors properly shut down in finally blocks
+- [ ] DirCache resources (Repository, ObjectInserter) cleaned up in finally blocks
 - [ ] Cancellation checked between batches

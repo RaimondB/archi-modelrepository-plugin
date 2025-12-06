@@ -31,6 +31,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.dircache.DirCache;
+import org.eclipse.jgit.dircache.DirCacheEntry;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectInserter;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
@@ -85,6 +91,27 @@ public class GraficoModelExporter {
      * Uses dedicated background thread for UI updates to prevent worker thread blocking.
      */
     private ThrottledProgressReporter fProgressReporter;
+    
+    /**
+     * Git repository, if exporting to a git-managed folder.
+     * Null if the folder is not a git repository.
+     * Must be closed after export completes.
+     */
+    private Repository fGitRepository;
+    
+    /**
+     * DirCache (git index) for the repository.
+     * Used for fast hash-based comparison instead of reading files from disk.
+     * Null if the folder is not a git repository or if DirCache loading fails.
+     */
+    private DirCache fDirCache;
+    
+    /**
+     * ObjectInserter for computing git blob hashes using the repository's hash algorithm.
+     * Git may use SHA-1 or SHA-256 depending on repository configuration.
+     * Null if the folder is not a git repository.
+     */
+    private ObjectInserter fObjectInserter;
     
     /**
      * Enable performance logging. Set to true to see detailed timing breakdown.
@@ -243,6 +270,16 @@ public class GraficoModelExporter {
             fProgressReporter.subTask(Messages.GraficoModelExporter_3);
             createAndSaveResourceForFolder(copy, modelFolder);
             logPerf("Phase: Create Resources (no I/O)", phaseStart, totalModelFiles);
+            
+            // Initialize DirCache for fast hash-based comparison (git repos only)
+            // If folder is not a git repo, we fall back to reading files from disk
+            phaseStart = System.nanoTime();
+            boolean useDirCache = initDirCache();
+            logPerf("Phase: Init DirCache", phaseStart);
+            if (useDirCache) {
+                logPerfMessage(String.format("Using DirCache optimization (%d indexed files)", 
+                    fDirCache != null ? fDirCache.getEntryCount() : 0)); //$NON-NLS-1$
+            }
 
             // MERGED PIPELINE: Read existing → Serialize → Hash both → Write if different
             // This is more efficient than separate hash and write phases because:
@@ -317,19 +354,14 @@ public class GraficoModelExporter {
                 CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
                     for (ResourceWriteTask task : batch) {
                         try {
-                            // STEP 1: Read existing file (blocking within batch - only 1 file handle at a time)
-                            byte[] existingContent = null;
-                            if (task.file.exists()) {
-                                existingContent = readFileBytes(task.file);
-                            }
-                            
-                            // STEP 2: Serialize to byte array (CPU-bound)
+                            // STEP 1: Serialize to byte array (CPU-bound)
                             ByteArrayOutputStream os = new ByteArrayOutputStream(4096);
                             task.resource.save(os, null);
                             byte[] newContent = os.toByteArray();
                             
-                            // STEP 3: Compare and write if different
-                            if (!Arrays.equals(existingContent, newContent)) {
+                            // STEP 2: Check if content changed (uses DirCache if available, else file read)
+                            // DirCache optimization: compares hashes without reading file from disk
+                            if (hasContentChanged(task.file, newContent)) {
                                 // Directories already created in createAndSaveResourceForFolder()
                                 addWrittenFile(task.file.toPath());
                                 // Blocking write within batch - keeps it simple and sequential
@@ -388,6 +420,9 @@ public class GraficoModelExporter {
             // Return true if any files were written or deleted
             return writtenFiles.size() > 0 || deletedFilesCount.get() > 0;
         } finally {
+            // Ensure DirCache resources are cleaned up
+            cleanupDirCache();
+            
             // Ensure progress reporter is always stopped
             if (fProgressReporter != null) {
                 fProgressReporter.finish(null);
@@ -1031,6 +1066,158 @@ public class GraficoModelExporter {
         }
     }
     
+    // ================================================================================
+    // DirCache Optimization Methods
+    // ================================================================================
+    // 
+    // When exporting to a git repository, we can use the DirCache (git index) to
+    // avoid reading file contents from disk. The DirCache contains SHA-1/SHA-256 
+    // hashes of all tracked files, allowing fast comparison with newly serialized
+    // content by computing the hash of the new content instead of reading the old.
+    //
+    // PERFORMANCE BENEFIT:
+    // - Avoids disk I/O for unchanged files (most files on typical export)
+    // - Hash computation is ~10x faster than file read on cold cache
+    // - Leverages git's existing index data structure
+    //
+    // ALGORITHM COMPATIBILITY:
+    // - Git repositories may use SHA-1 (legacy) or SHA-256 (modern)
+    // - We use ObjectInserter.idFor() which auto-detects the correct algorithm
+    // - This ensures hashes match what's stored in DirCache
+    // ================================================================================
+    
+    /**
+     * Initialize DirCache optimization for git repositories.
+     * Call this at the start of export to enable fast hash-based comparison.
+     * 
+     * <p>This method:</p>
+     * <ol>
+     *   <li>Checks if the export folder is a git repository</li>
+     *   <li>Opens the Repository and reads the DirCache (index)</li>
+     *   <li>Creates an ObjectInserter for computing blob hashes</li>
+     * </ol>
+     * 
+     * <p>If initialization fails (not a git repo, or any error), the exporter
+     * falls back to reading file contents from disk for comparison.</p>
+     * 
+     * @return true if DirCache was successfully initialized, false otherwise
+     */
+    private boolean initDirCache() {
+        if (!GraficoUtils.isGitRepository(fLocalRepoFolder)) {
+            logPerfMessage("DirCache: Not a git repository, using file comparison"); //$NON-NLS-1$
+            return false;
+        }
+        
+        try {
+            fGitRepository = Git.open(fLocalRepoFolder).getRepository();
+            fDirCache = DirCache.read(fGitRepository);
+            fObjectInserter = fGitRepository.newObjectInserter();
+            
+            logPerfMessage(String.format("DirCache: Initialized with %d entries", fDirCache.getEntryCount())); //$NON-NLS-1$
+            return true;
+        } catch (IOException e) {
+            // Failed to open repository or read DirCache - fall back to file comparison
+            logPerfMessage("DirCache: Failed to initialize (" + e.getMessage() + "), using file comparison"); //$NON-NLS-1$ //$NON-NLS-2$
+            cleanupDirCache();
+            return false;
+        }
+    }
+    
+    /**
+     * Clean up DirCache resources (Repository, ObjectInserter).
+     * Call this in the finally block of exportModel().
+     */
+    private void cleanupDirCache() {
+        if (fObjectInserter != null) {
+            fObjectInserter.close();
+            fObjectInserter = null;
+        }
+        // DirCache doesn't need explicit close
+        fDirCache = null;
+        if (fGitRepository != null) {
+            fGitRepository.close();
+            fGitRepository = null;
+        }
+    }
+    
+    /**
+     * Compute the git blob hash for the given content.
+     * Uses the same hash algorithm as the repository (SHA-1 or SHA-256).
+     * 
+     * <p>Git stores blobs with a header: "blob {size}\0{content}"
+     * The ObjectInserter.idFor() method handles this format automatically.</p>
+     * 
+     * @param content The file content to hash
+     * @return The ObjectId representing the blob hash, or null if not using DirCache
+     */
+    private ObjectId computeGitBlobHash(byte[] content) {
+        if (fObjectInserter == null) {
+            return null;
+        }
+        return fObjectInserter.idFor(org.eclipse.jgit.lib.Constants.OBJ_BLOB, content);
+    }
+    
+    /**
+     * Get the ObjectId (hash) of a file from the DirCache.
+     * 
+     * @param file The file to look up
+     * @return The ObjectId from the index, or null if the file is not in the index
+     */
+    private ObjectId getHashFromDirCache(File file) {
+        if (fDirCache == null) {
+            return null;
+        }
+        
+        // Compute relative path from repo root
+        java.nio.file.Path repoRoot = fLocalRepoFolder.toPath();
+        java.nio.file.Path filePath = file.toPath();
+        java.nio.file.Path relativePath;
+        try {
+            relativePath = repoRoot.relativize(filePath);
+        } catch (IllegalArgumentException e) {
+            // File is not under repo root
+            return null;
+        }
+        
+        // DirCache uses forward slashes for path separators
+        String entryPath = relativePath.toString().replace('\\', '/');
+        
+        DirCacheEntry entry = fDirCache.getEntry(entryPath);
+        if (entry != null) {
+            return entry.getObjectId();
+        }
+        return null;
+    }
+    
+    /**
+     * Check if file content has changed using DirCache hash comparison.
+     * Falls back to byte comparison if DirCache is not available.
+     * 
+     * @param file The file to check
+     * @param newContent The new content to compare against
+     * @return true if content has changed and file needs to be written
+     */
+    private boolean hasContentChanged(File file, byte[] newContent) {
+        // If DirCache is available, use hash comparison (faster, no disk I/O)
+        if (fDirCache != null && fObjectInserter != null) {
+            ObjectId existingHash = getHashFromDirCache(file);
+            if (existingHash != null) {
+                ObjectId newHash = computeGitBlobHash(newContent);
+                // If hashes match, content is unchanged
+                return !existingHash.equals(newHash);
+            }
+            // File not in index (new file) - needs to be written
+            return true;
+        }
+        
+        // Fall back to reading file and comparing bytes
+        if (!file.exists()) {
+            return true; // New file
+        }
+        byte[] existingContent = readFileBytes(file);
+        return !Arrays.equals(existingContent, newContent);
+    }
+
     /**
      * Clean up any files that were not written in this export.
      * Uses NIO2 Files.walkFileTree() for efficient single-pass deletion.

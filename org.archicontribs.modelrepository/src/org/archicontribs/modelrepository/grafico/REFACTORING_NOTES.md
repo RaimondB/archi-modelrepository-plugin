@@ -268,6 +268,97 @@ importModel(...);  // Always complete this
 
 ---
 
+## DirCache Optimization for Export
+
+### The Problem
+
+When exporting 30,000 model files, we need to compare new content with existing files to avoid unnecessary writes. The naive approach reads each file from disk:
+
+```java
+// ❌ SLOW: Reads 30,000 files from disk (240MB+ of I/O)
+byte[] existingContent = Files.readAllBytes(file.toPath());
+if (!Arrays.equals(existingContent, newContent)) {
+    Files.write(file.toPath(), newContent);
+}
+```
+
+With a cold disk cache, this causes significant latency as each file read blocks.
+
+### Solution: Use Git's DirCache (Index)
+
+When exporting to a git repository, we can use the DirCache (the `.git/index` file) which already contains SHA-1/SHA-256 hashes of all tracked files:
+
+```java
+// ✅ FAST: No disk read needed - just compute hash of new content
+ObjectId existingHash = getHashFromDirCache(file);  // From .git/index
+ObjectId newHash = computeGitBlobHash(newContent);   // CPU-only
+if (!existingHash.equals(newHash)) {
+    Files.write(file.toPath(), newContent);
+}
+```
+
+**Performance benefit:**
+- Hash computation (~10μs) vs file read on cold cache (~1ms) = 100x faster per file
+- Avoids OS file descriptor overhead
+- Leverages git's existing index data structure
+
+### Hash Algorithm Compatibility
+
+Git repositories may use SHA-1 (legacy) or SHA-256 (modern, configured in `.gitconfig`):
+
+```java
+// ✅ CORRECT: Use ObjectInserter which auto-detects repository's hash algorithm
+ObjectInserter inserter = repository.newObjectInserter();
+ObjectId hash = inserter.idFor(Constants.OBJ_BLOB, content);
+
+// ❌ WRONG: Don't hardcode MessageDigest algorithm!
+MessageDigest md = MessageDigest.getInstance("SHA-1");  // May not match repo
+```
+
+### Fallback for Non-Git Folders
+
+The exporter can also be used on regular folders (not git repositories). In this case, we fall back to reading file contents:
+
+```java
+private boolean hasContentChanged(File file, byte[] newContent) {
+    // If DirCache is available, use hash comparison
+    if (fDirCache != null && fObjectInserter != null) {
+        ObjectId existingHash = getHashFromDirCache(file);
+        if (existingHash != null) {
+            ObjectId newHash = computeGitBlobHash(newContent);
+            return !existingHash.equals(newHash);
+        }
+        return true; // File not in index (new file)
+    }
+    
+    // Fall back to reading file and comparing bytes
+    if (!file.exists()) return true;
+    return !Arrays.equals(readFileBytes(file), newContent);
+}
+```
+
+### Resource Lifecycle
+
+DirCache resources must be properly managed:
+
+```java
+// In exportModel():
+try {
+    boolean useDirCache = initDirCache();  // Opens Repository, reads index
+    // ... export logic ...
+} finally {
+    cleanupDirCache();  // MUST close ObjectInserter and Repository
+}
+```
+
+### Where This Applies
+
+- `GraficoModelExporter.exportModel()` - uses `hasContentChanged()` method
+- `GraficoModelExporter.initDirCache()` - initializes DirCache if git repo
+- `GraficoModelExporter.hasContentChanged()` - handles both git and non-git cases
+
+---
+
 ## Keeping This Document Updated
 
 **INSTRUCTION FOR AI ASSISTANTS AND DEVELOPERS:**
