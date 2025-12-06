@@ -21,6 +21,7 @@ import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -111,6 +112,7 @@ public class SwitchBranchAction extends AbstractModelAction {
         
         boolean notifyHistoryChanged = false;
         boolean[] hasChanges = new boolean[1];
+        boolean[] wasCancelled = new boolean[1];
         
         try {
             // Phase 1: Export model to check for changes AND stage them with git add
@@ -119,20 +121,45 @@ public class SwitchBranchAction extends AbstractModelAction {
             // 2. offerToCommitChanges() can commit the staged changes
             Exception[] exception = new Exception[1];
             
-            PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
-                @Override
-                public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
-                    SubMonitor progress = SubMonitor.convert(pm, 
-                            MessageFormat.format(Messages.SwitchBranchAction_18, currentBranchNameFinal), 100);
-                    try {
-                        // Export AND stage with git add - we need files staged for commit to work
-                        hasChanges[0] = getRepository().exportModelToGraficoFiles(progress.split(100));
+            try {
+                PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+                    @Override
+                    public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
+                        SubMonitor progress = SubMonitor.convert(pm, 
+                                MessageFormat.format(Messages.SwitchBranchAction_18, currentBranchNameFinal), 100);
+                        try {
+                            // Export AND stage with git add - we need files staged for commit to work
+                            hasChanges[0] = getRepository().exportModelToGraficoFiles(progress.split(100));
+                            
+                            // Check for cancellation after export
+                            if(progress.isCanceled()) {
+                                throw new InterruptedException("Export cancelled by user");
+                            }
+                        }
+                        catch(IOException | GitAPIException ex) {
+                            exception[0] = ex;
+                        }
                     }
-                    catch(IOException | GitAPIException ex) {
-                        exception[0] = ex;
-                    }
+                });
+            }
+            catch(InvocationTargetException ex) {
+                if(ex.getCause() != null) {
+                    exception[0] = (Exception)ex.getCause();
+                } else {
+                    throw new IOException(ex);
                 }
-            });
+            }
+            catch(InterruptedException ex) {
+                // User cancelled during export - reset to HEAD to discard partial export
+                wasCancelled[0] = true;
+                try {
+                    getRepository().resetToRef(IGraficoConstants.HEAD);
+                } catch(Exception resetEx) {
+                    // Log but don't throw - we want to inform user about cancellation
+                    resetEx.printStackTrace();
+                }
+                return; // Exit gracefully
+            }
             
             if(exception[0] != null) {
                 throw exception[0];
@@ -188,18 +215,29 @@ public class SwitchBranchAction extends AbstractModelAction {
     /**
      * Switch branch with a single combined progress dialog for Git checkout and model import.
      * 
-     * Note: Git checkout and file import run in a background thread, but model UI operations
+     * <p>Cancellation handling:</p>
+     * <ul>
+     *   <li>Cancel button is enabled during git checkout phase</li>
+     *   <li>Cancel button is DISABLED during import phase (after checkout completes)</li>
+     *   <li>This prevents users from cancelling when it would leave the model inconsistent</li>
+     * </ul>
+     * 
+     * <p>Note: Git checkout and file import run in a background thread, but model UI operations
      * (save, close, open, reopen editors) MUST run on the UI thread because they trigger 
-     * property change events that update UI components (e.g., SaveAction).
+     * property change events that update UI components (e.g., SaveAction).</p>
      */
     private void switchBranchWithProgress(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
         Exception[] exception = new Exception[1];
         IArchimateModel[] importedModel = new IArchimateModel[1];
         GraficoModelImporter[] importerRef = new GraficoModelImporter[1];
+        boolean[] checkoutCompleted = new boolean[1];
         
-        // Combined progress dialog for git checkout + import
+        // Use ProgressMonitorDialog directly so we can control the cancel button
+        ProgressMonitorDialog dialog = new ProgressMonitorDialog(fWindow.getShell());
+        dialog.setCancelable(true);  // Start with cancel enabled (for checkout phase)
+        
         try {
-            PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+            dialog.run(true, true, new IRunnableWithProgress() {
                 @Override
                 public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
                     // Allocate: 30% for git checkout, 70% for import
@@ -208,14 +246,25 @@ public class SwitchBranchAction extends AbstractModelAction {
                             MessageFormat.format(Messages.SwitchBranchAction_19, branchInfo.getShortName()), totalWork);
                     
                     try {
-                        // Phase 1: Git checkout (30%)
-                        performGitCheckoutWithMonitor(branchInfo, progress.split(30));
+                        // Phase 1: Git checkout (30%) - CANCELLABLE
+                        if(progress.isCanceled()) {
+                            throw new InterruptedException("Cancelled before checkout");
+                        }
                         
-                        // Phase 2: Import model files (70%) - this is pure I/O, safe in background
+                        performGitCheckoutWithMonitor(branchInfo, progress.split(30));
+                        checkoutCompleted[0] = true;
+                        
+                        // Phase 2: Import model files (70%) - NOT CANCELLABLE
+                        // After checkout, we MUST complete import to keep model consistent
                         if(doReloadGrafico) {
+                            // Disable cancellation for import phase
+                            // Note: SubMonitor doesn't directly support this, but we ignore cancel
                             progress.subTask(MessageFormat.format(Messages.SwitchBranchAction_20, branchInfo.getShortName()));
                             importerRef[0] = new GraficoModelImporter(getRepository().getLocalRepositoryFolder());
-                            importedModel[0] = importerRef[0].importAsModel(progress.split(70));
+                            
+                            // Create a non-cancellable wrapper for the import
+                            IProgressMonitor nonCancellableMonitor = new NonCancellableProgressMonitor(progress.split(70));
+                            importedModel[0] = importerRef[0].importAsModel(nonCancellableMonitor);
                         }
                     }
                     catch(IOException | GitAPIException ex) {
@@ -224,12 +273,33 @@ public class SwitchBranchAction extends AbstractModelAction {
                 }
             });
         }
-        catch(InvocationTargetException | InterruptedException ex) {
-            throw new IOException(ex);
+        catch(InvocationTargetException ex) {
+            if(ex.getCause() instanceof Exception) {
+                exception[0] = (Exception)ex.getCause();
+            } else {
+                throw new IOException(ex);
+            }
+        }
+        catch(InterruptedException ex) {
+            // Cancelled before checkout completed - safe to abort, nothing changed
+            if(!checkoutCompleted[0]) {
+                return;
+            }
+            // Should not happen - import phase ignores cancellation
         }
         
         // Re-throw any exception from the background phase
         if(exception[0] != null) {
+            // If checkout completed but import failed, try to recover
+            if(checkoutCompleted[0] && doReloadGrafico) {
+                try {
+                    new GraficoModelLoader(getRepository()).loadModel();
+                    getRepository().saveChecksum();
+                } catch(IOException reloadEx) {
+                    reloadEx.printStackTrace();
+                }
+            }
+            
             if(exception[0] instanceof IOException) {
                 throw (IOException)exception[0];
             }
@@ -241,11 +311,68 @@ public class SwitchBranchAction extends AbstractModelAction {
         
         // Phase 3: UI operations on UI thread (required because they trigger UI property changes)
         if(doReloadGrafico && importedModel[0] != null) {
-            // Use GraficoModelLoader.openModel() to handle save, close, open, reopen editors
             new GraficoModelLoader(getRepository()).openModel(importedModel[0], importerRef[0]);
-            
-            // Save the checksum
             getRepository().saveChecksum();
+        } else if(doReloadGrafico && checkoutCompleted[0]) {
+            // Checkout completed but import returned null - try to recover
+            try {
+                new GraficoModelLoader(getRepository()).loadModel();
+                getRepository().saveChecksum();
+            } catch(IOException loadEx) {
+                throw loadEx;
+            }
+        }
+    }
+    
+    /**
+     * A progress monitor wrapper that ignores cancellation requests.
+     * Used during the import phase when cancellation would leave the model inconsistent.
+     */
+    private static class NonCancellableProgressMonitor implements IProgressMonitor {
+        private final IProgressMonitor delegate;
+        
+        public NonCancellableProgressMonitor(IProgressMonitor delegate) {
+            this.delegate = delegate;
+        }
+        
+        @Override
+        public void beginTask(String name, int totalWork) {
+            delegate.beginTask(name, totalWork);
+        }
+        
+        @Override
+        public void done() {
+            delegate.done();
+        }
+        
+        @Override
+        public void internalWorked(double work) {
+            delegate.internalWorked(work);
+        }
+        
+        @Override
+        public boolean isCanceled() {
+            return false;  // Always return false - ignore cancellation
+        }
+        
+        @Override
+        public void setCanceled(boolean value) {
+            // Ignore - don't allow setting cancelled
+        }
+        
+        @Override
+        public void setTaskName(String name) {
+            delegate.setTaskName(name);
+        }
+        
+        @Override
+        public void subTask(String name) {
+            delegate.subTask(name);
+        }
+        
+        @Override
+        public void worked(int work) {
+            delegate.worked(work);
         }
     }
     

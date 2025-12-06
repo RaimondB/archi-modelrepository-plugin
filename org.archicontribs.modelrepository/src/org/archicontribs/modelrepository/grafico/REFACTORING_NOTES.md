@@ -211,6 +211,63 @@ private int calculateOptimalBatchCount(int totalFiles, int cpuThreads) {
 
 ---
 
+## Cancellation Handling in Branch Switch
+
+### The Problem
+
+When switching branches, we have multiple phases that can be cancelled:
+1. **Export phase**: Writing model to disk + git add
+2. **User decision**: Commit dialog, proceed dialog
+3. **Checkout phase**: Git checkout
+4. **Import phase**: Reading model files
+
+Each cancellation point has different stable state requirements.
+
+### Stable States
+
+| Cancellation Point | Stable State | Recovery Action |
+|-------------------|--------------|-----------------|
+| During export | Current branch, original files | `resetToRef(HEAD)` to discard partial export |
+| User cancels commit dialog | Current branch, staged changes | `resetToRef(HEAD)` to unstage and discard |
+| User cancels "proceed without commit" | Current branch, staged changes | `resetToRef(HEAD)` to unstage and discard |
+| Before git checkout | Current branch | None needed (nothing changed) |
+| During git checkout | Git handles atomically | Git will fail safely |
+| During import | NEW branch in git | **Must complete import** - don't cancel |
+
+### Critical Insight: Import Cannot Be Cancelled
+
+Once git checkout completes, the working directory is on the new branch. If we cancel the import:
+- Git state: new branch
+- Model in memory: old branch's model
+- UI: showing stale model
+
+This is an **inconsistent state** that will cause problems on next commit or refresh.
+
+**Solution**: After checkout completes, we must complete the import even if user clicked cancel.
+
+```java
+// Phase 1: Git checkout - cancellable
+if(progress.isCanceled()) {
+    throw new InterruptedException("Cancelled before checkout");
+}
+performGitCheckout(...);
+checkoutCompleted = true;
+
+// Phase 2: Import - NOT cancellable (must complete after checkout)
+if(progress.isCanceled()) {
+    wasCancelled = true;  // Note it, but continue!
+}
+importModel(...);  // Always complete this
+```
+
+### Where This Applies
+
+- `SwitchBranchAction.run()` - handles cancellation during export and user dialogs
+- `SwitchBranchAction.switchBranchWithProgress()` - handles cancellation during checkout/import
+- `MergeBranchAction` - similar pattern for merge operations
+
+---
+
 ## Keeping This Document Updated
 
 **INSTRUCTION FOR AI ASSISTANTS AND DEVELOPERS:**
