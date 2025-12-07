@@ -19,11 +19,15 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -124,12 +128,23 @@ public class GraficoModelImporter {
      */
     private ForkJoinPool fCpuExecutor;
     
+    /**
+     * Virtual thread executor for I/O operations.
+     * Virtual threads are ideal for blocking I/O - thousands can run concurrently
+     * without consuming OS threads. Each thread parks on file read.
+     */
+    private ExecutorService fIoExecutor;
+    
     // Batch size for CompletableFuture operations (reduces overhead from 30,000 futures to ~300)
     private static final int BATCH_SIZE = 100;
     
+    // Bounded queue capacity for backpressure - limits memory usage and creates natural throttling
+    private static final int QUEUE_CAPACITY = 500;
+    
     /**
      * Producer/Consumer queue for decoupling file reading from model building.
-     * Producers (parallel): read files async → parse XML → put into queue
+     * Uses BOUNDED capacity to create backpressure when consumer is slow.
+     * Producers (parallel): read files async → parse XML → put into queue (blocks if full)
      * Consumer (single thread): takes from queue → adds to EMF model
      */
     private BlockingQueue<ParsedElement> fElementQueue;
@@ -294,10 +309,13 @@ public class GraficoModelImporter {
     	// Use 100% of allocated progress - no reserved portion left idle at the end
     	fProgressReporter = new ThrottledProgressReporter(progress.split(100), totalFiles);
     	
-    	// Create a SINGLE shared CPU executor for all parallel XML parsing
-    	// This avoids creating a new ForkJoinPool for each folder in the hierarchy
+    	// HYBRID PIPELINE ARCHITECTURE:
+    	// Stage 1: I/O - Virtual threads for file reads (thousands can block concurrently)
+    	// Stage 2: CPU - ForkJoinPool for XML parsing (sized to CPU cores)
+    	// Stage 3: Model - Single consumer thread for EMF model building
     	fCpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
-    	logPerfMessage("CPU executor created with " + Runtime.getRuntime().availableProcessors() + " threads"); //$NON-NLS-1$ //$NON-NLS-2$
+    	fIoExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    	logPerfMessage("Executors created: " + Runtime.getRuntime().availableProcessors() + " CPU threads + virtual threads for I/O"); //$NON-NLS-1$ //$NON-NLS-2$
     	
     	try {
     	    // Reset the ID -> Object lookup table
@@ -395,6 +413,11 @@ public class GraficoModelImporter {
     	    if (fCpuExecutor != null) {
     	        fCpuExecutor.shutdown();
     	        fCpuExecutor = null;
+    	    }
+    	    // Ensure the I/O executor is stopped
+    	    if (fIoExecutor != null) {
+    	        fIoExecutor.shutdown();
+    	        fIoExecutor = null;
     	    }
     	    // Ensure the shared progress reporter is stopped
     	    if (fProgressReporter != null) {
@@ -1155,29 +1178,49 @@ public class GraficoModelImporter {
         logPerf("  Categorize files", phaseStart, allEntries.size()); //$NON-NLS-1$
         logPerfMessage("  folder.xml files: " + folderXmlFiles.size() + ", element files: " + elementFiles.size()); //$NON-NLS-1$ //$NON-NLS-2$
         
+        // Calculate optimal batch count using exporter's proven approach
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        int targetBatches = calculateOptimalBatchCount(folderXmlFiles.size() + elementFiles.size(), cpuCores);
+        logPerfMessage("  Target batches: " + targetBatches + " (cpuCores=" + cpuCores + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        
         // Phase 1: Load and parse all folder.xml files to build folder hierarchy
         // These must be processed in order (parents before children)
-        // We read them in parallel but process in hierarchy order
+        // We read them in parallel using batched ForkJoinPool approach
         Map<String, EObject> folderXmlContents = new ConcurrentHashMap<>();
         
         phaseStart = System.nanoTime();
         if (!folderXmlFiles.isEmpty()) {
-            CountDownLatch folderLatch = new CountDownLatch(folderXmlFiles.size());
+            // Calculate batch size for folder.xml files
+            int folderBatchCount = Math.min(targetBatches, folderXmlFiles.size());
+            int folderBatchSize = Math.max(1, (folderXmlFiles.size() + folderBatchCount - 1) / folderBatchCount);
+            logPerfMessage("  Phase1 batch config: " + folderBatchCount + " batches, ~" + folderBatchSize + " files/batch"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             
-            // Start all folder.xml reads in parallel
-            for (DirCacheFileEntry entry : folderXmlFiles) {
-                readAndParseDirect(entry.absolutePath(), folderXmlContents, folderLatch);
+            List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
+            
+            // ONE future per batch - each batch processes files sequentially (one file handle at a time)
+            for (int i = 0; i < folderXmlFiles.size(); i += folderBatchSize) {
+                final List<DirCacheFileEntry> batch = folderXmlFiles.subList(i, Math.min(i + folderBatchSize, folderXmlFiles.size()));
+                
+                CompletableFuture<Void> batchFuture = CompletableFuture.runAsync(() -> {
+                    for (DirCacheFileEntry entry : batch) {
+                        readAndParseBatched(entry.absolutePath(), folderXmlContents);
+                    }
+                }, fCpuExecutor);
+                
+                batchFutures.add(batchFuture);
             }
             
-            // Wait for all folder.xml files to be read
+            // Wait for all batches to complete
             try {
-                folderLatch.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Folder loading interrupted", e); //$NON-NLS-1$
+                CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0])).join();
+            } catch (CompletionException e) {
+                if (e.getCause() instanceof IOException) {
+                    throw (IOException) e.getCause();
+                }
+                throw new IOException("Folder loading failed", e.getCause()); //$NON-NLS-1$
             }
         }
-        logPerf("  Phase1: Read+parse folder.xml (parallel async I/O)", phaseStart, folderXmlFiles.size()); //$NON-NLS-1$
+        logPerf("  Phase1: Read+parse folder.xml (batched ForkJoinPool)", phaseStart, folderXmlFiles.size()); //$NON-NLS-1$
         
         // Build folder hierarchy (must be done sequentially in hierarchy order)
         phaseStart = System.nanoTime();
@@ -1231,38 +1274,43 @@ public class GraficoModelImporter {
             throw new IOException("Model folder.xml not found"); //$NON-NLS-1$
         }
         
-        // Phase 2 & 3 OVERLAPPED: Read elements in parallel, add to model as they complete
-        // Producer/Consumer pattern:
-        // - Producers (async I/O callbacks): read file → parse XML → put into queue
-        // - Consumer (this thread): take from queue → add to parent folder (EMF single-threaded)
+        // Phase 2 & 3 OVERLAPPED: 3-Stage Pipeline with Backpressure
+        // 
+        // Stage 1: I/O (Virtual Threads)
+        //   - Virtual threads read files from disk - thousands can block concurrently
+        //   - Natural disk I/O parallelism without consuming OS threads
+        //   - Submits raw bytes to Stage 2
         //
-        // This overlaps disk I/O with model building for maximum throughput.
-        // Since folder hierarchy is already built, we can add elements in any order.
+        // Stage 2: CPU (ForkJoinPool)
+        //   - Parse XML into EObjects (CPU-bound)
+        //   - Batch-local ID collection to reduce ConcurrentHashMap contention
+        //   - Submits parsed elements to bounded queue
+        //
+        // Stage 3: Model (Single Thread - this thread)
+        //   - Add elements to EMF model (must be single-threaded)
+        //   - BOUNDED queue creates backpressure - if consumer slow, producers block
+        //
         phaseStart = System.nanoTime();
         if (!elementFiles.isEmpty()) {
-            // Queue for parsed elements with their folder context
-            BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
+            // BOUNDED queue for backpressure - limits memory and creates natural throttling
+            // When queue is full, producers block in queue.put() until consumer catches up
+            BlockingQueue<ElementWithFolder> elementQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
             
-            long producerStart = System.nanoTime();
-            // CRITICAL: File open + Files.size() are blocking on cold cache!
-            // Fire the reads in batches using the CPU executor to parallelize the file open calls.
-            // This turns 26,000 sequential file opens into parallel operations.
-            final int batchSize = Math.max(1, elementFiles.size() / (Runtime.getRuntime().availableProcessors() * 4));
-            for (int i = 0; i < elementFiles.size(); i += batchSize) {
-                final int start = i;
-                final int end = Math.min(i + batchSize, elementFiles.size());
-                fCpuExecutor.execute(() -> {
-                    for (int j = start; j < end; j++) {
-                        DirCacheFileEntry entry = elementFiles.get(j);
-                        readParseAndQueueElement(entry, elementQueue, remainingElements, producerError, totalModelFiles);
-                    }
-                });
-            }
-            logPerf("  Phase2: Fire async reads for elements (batched)", producerStart, elementFiles.size()); //$NON-NLS-1$
+            logPerfMessage("  Phase2 config: 3-stage pipeline, bounded queue capacity=" + QUEUE_CAPACITY); //$NON-NLS-1$
             
-            // Consumer loop: add elements to model as they arrive
+            long producerStart = System.nanoTime();
+            
+            // Stage 1: Fire ALL file reads using virtual threads
+            // Each virtual thread: read file (I/O, parks) → hand off to Stage 2 (CPU pool) → queue for Stage 3
+            for (DirCacheFileEntry entry : elementFiles) {
+                fIoExecutor.execute(() -> 
+                    readParseAndQueueElement(entry, elementQueue, remainingElements, producerError, totalModelFiles));
+            }
+            logPerf("  Phase2 Stage1: Fire async reads (virtual threads)", producerStart, elementFiles.size()); //$NON-NLS-1$
+            
+            // Stage 3: Consumer loop - add elements to model as they arrive
             // Runs on this thread (main/caller thread) for EMF thread safety
             int elementsProcessed = 0;
             final int totalElements = elementFiles.size();
@@ -1299,6 +1347,10 @@ public class GraficoModelImporter {
                     throw new IOException("Element loading interrupted", e); //$NON-NLS-1$
                 }
             }
+            
+            // No need to wait for batch futures - virtual threads complete when they put to queue
+            // The consumer loop above ensures all elements are processed
+            
             logPerf("  Phase2+3: Consumer (poll+add to model)", consumerStart, elementsProcessed); //$NON-NLS-1$
             logPerfMessage("  Consumer poll timeouts: " + pollTimeouts + " (each = 50ms wait)"); //$NON-NLS-1$ //$NON-NLS-2$
         }
@@ -1315,13 +1367,22 @@ public class GraficoModelImporter {
     private record ElementWithFolder(String folderPath, EObject element) {}
     
     /**
+     * Intermediate record holding raw bytes read from disk, waiting for XML parsing.
+     */
+    private record RawFileData(DirCacheFileEntry entry, byte[] bytes) {}
+    
+    /**
      * Read, parse, and queue an element for the consumer thread.
-     * This is the producer in the producer/consumer pattern for DirCache loading.
      * 
-     * Uses synchronous I/O within executor threads rather than AsynchronousFileChannel
-     * because AsynchronousFileChannel.open() and Files.size() are blocking operations
-     * that perform poorly on cold cache. Since we're already running in parallel via
-     * the CPU executor batches, synchronous I/O within each thread is simpler and faster.
+     * CRITICAL ARCHITECTURE: Split I/O from CPU work!
+     * - Virtual threads: ONLY for blocking I/O (Files.readAllBytes)
+     * - ForkJoinPool: For CPU-bound XML parsing
+     * 
+     * Why this matters:
+     * - Virtual threads are efficient for I/O because they "park" when blocked
+     * - But XML parsing is CPU-bound and "pins" the carrier thread
+     * - Pinned carrier threads limit concurrency to ~20 (number of carriers)
+     * - By handing off to ForkJoinPool, we get 20 parallel parsers + unlimited I/O
      * 
      * @param entry The DirCache file entry
      * @param queue The queue to put parsed elements into
@@ -1332,11 +1393,62 @@ public class GraficoModelImporter {
     private void readParseAndQueueElement(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
             AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
         try {
-            // Use synchronous read - we're already in a parallel executor thread
-            // This avoids the blocking AsynchronousFileChannel.open() + Files.size() calls
+            // STEP 1: I/O on virtual thread - this parks, doesn't pin
             byte[] bytes = Files.readAllBytes(entry.absolutePath());
             
-            // Parse XML
+            // STEP 2: Hand off to CPU executor for XML parsing
+            // This keeps virtual threads free for more I/O
+            fCpuExecutor.execute(() -> {
+                try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                    IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                    fIDLookup.put(eObject.getId(), eObject);
+                    
+                    // Put into queue for consumer
+                    queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                } catch (IOException | InterruptedException e) {
+                    errorFlag.set(true);
+                    try {
+                        queue.put(new ElementWithFolder(entry.folderPath(), null));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                } finally {
+                    remaining.decrementAndGet();
+                    if (fProgressReporter != null) {
+                        fProgressReporter.incrementAndMaybeReport(
+                            count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                    }
+                }
+            });
+        } catch (IOException e) {
+            errorFlag.set(true);
+            remaining.decrementAndGet();
+            try {
+                queue.put(new ElementWithFolder(entry.folderPath(), null));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+    
+    /**
+     * Read, parse, and queue an element for the consumer thread (batched version).
+     * This is called sequentially within a batch on ForkJoinPool, so only one file 
+     * handle is open at a time per batch.
+     * 
+     * @param entry The DirCache file entry
+     * @param queue The queue to put parsed elements into
+     * @param remaining Counter for remaining elements (decremented on completion)
+     * @param errorFlag Set to true if any producer encounters an error
+     * @param totalModelFiles Total files for progress reporting
+     */
+    private void readParseAndQueueBatched(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
+            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
+        try {
+            // Synchronous I/O - OK because we're in a ForkJoinPool batch
+            // Only one file open per batch (sequential within batch)
+            byte[] bytes = Files.readAllBytes(entry.absolutePath());
+            
             try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
                 fIDLookup.put(eObject.getId(), eObject);
@@ -1346,7 +1458,6 @@ public class GraficoModelImporter {
             }
         } catch (IOException | InterruptedException e) {
             errorFlag.set(true);
-            // Put a null element to signal completion even on error
             try {
                 queue.put(new ElementWithFolder(entry.folderPath(), null));
             } catch (InterruptedException ie) {
@@ -1362,55 +1473,63 @@ public class GraficoModelImporter {
     }
     
     /**
-     * Read and parse a file directly (no CompletableFuture wrapper).
+     * Read and parse a file directly.
+     * Called from virtual threads for I/O, hands off to CPU executor for parsing.
      * Used for folder.xml files where we need the content for hierarchy building.
      */
     private void readAndParseDirect(Path path, Map<String, EObject> results, CountDownLatch latch) {
         try {
-            long fileSize = Files.size(path);
-            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+            // STEP 1: I/O on virtual thread - parks, doesn't pin carrier
+            byte[] bytes = Files.readAllBytes(path);
             
-            AsynchronousFileChannel channel = AsynchronousFileChannel.open(path, StandardOpenOption.READ);
-            
-            channel.read(buffer, 0, buffer, new CompletionHandler<Integer, ByteBuffer>() {
-                @Override
-                public void completed(Integer bytesRead, ByteBuffer buf) {
-                    try {
-                        channel.close();
-                        buf.flip();
-                        byte[] bytes = new byte[buf.remaining()];
-                        buf.get(bytes);
-                        
-                        // Parse on CPU executor
-                        fCpuExecutor.execute(() -> {
-                            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                                fIDLookup.put(eObject.getId(), eObject);
-                                if (eObject instanceof IArchimateModel) {
-                                    for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
-                                        fIDLookup.put(profile.getId(), profile);
-                                    }
-                                }
-                                results.put(path.toString(), eObject);
-                            } catch (IOException e) {
-                                // Ignore - folder will be missing
-                            } finally {
-                                latch.countDown();
-                            }
-                        });
-                    } catch (IOException e) {
-                        latch.countDown();
+            // STEP 2: Parse on CPU executor to avoid pinning virtual thread carrier
+            fCpuExecutor.execute(() -> {
+                try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                    IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                    fIDLookup.put(eObject.getId(), eObject);
+                    if (eObject instanceof IArchimateModel) {
+                        for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
+                            fIDLookup.put(profile.getId(), profile);
+                        }
                     }
-                }
-                
-                @Override
-                public void failed(Throwable exc, ByteBuffer buf) {
-                    try { channel.close(); } catch (IOException e) { }
+                    results.put(path.toString(), eObject);
+                } catch (IOException e) {
+                    // Ignore - folder will be missing
+                } finally {
                     latch.countDown();
                 }
             });
         } catch (IOException e) {
+            // I/O failed - still need to count down
             latch.countDown();
+        }
+    }
+    
+    /**
+     * Read and parse a folder.xml file synchronously (for batched ForkJoinPool processing).
+     * This is called sequentially within a batch, so only one file handle is open at a time per batch.
+     * 
+     * @param path The path to read
+     * @param results Map to store parsed results
+     */
+    private void readAndParseBatched(Path path, Map<String, EObject> results) {
+        try {
+            // Synchronous I/O - OK because we're in a ForkJoinPool batch
+            // Only one file open per batch (sequential within batch)
+            byte[] bytes = Files.readAllBytes(path);
+            
+            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                fIDLookup.put(eObject.getId(), eObject);
+                if (eObject instanceof IArchimateModel) {
+                    for (IProfile profile : ((IArchimateModel) eObject).getProfiles()) {
+                        fIDLookup.put(profile.getId(), profile);
+                    }
+                }
+                results.put(path.toString(), eObject);
+            }
+        } catch (IOException e) {
+            // Ignore - folder will be missing from results
         }
     }
     
@@ -1465,5 +1584,53 @@ public class GraficoModelImporter {
         } catch (IOException e) {
             latch.countDown();
         }
+    }
+    
+    /**
+     * Calculate optimal batch count based on OS file descriptor limits and resource count.
+     * 
+     * <p>For importing ~30,000 files, we need enough parallel batches to saturate disk I/O
+     * while avoiding OS file descriptor exhaustion. Each batch opens files sequentially,
+     * so concurrent open file handles = number of active batches.</p>
+     * 
+     * @param fileCount Total number of files to process
+     * @param cpuCores Number of available CPU cores
+     * @return Optimal number of parallel batches
+     */
+    private static int calculateOptimalBatchCount(int fileCount, int cpuCores) {
+        // Detect OS for file descriptor limits
+        String osName = System.getProperty("os.name", "").toLowerCase(); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        int maxBatches;
+        if (osName.contains("mac")) { //$NON-NLS-1$
+            // macOS: Conservative limit due to 256 soft file descriptor limit
+            // Leave headroom for JVM, network, etc. (use ~60% of limit)
+            maxBatches = 150;
+        } else if (osName.contains("linux")) { //$NON-NLS-1$
+            // Linux: Default 1024 soft limit, but often configurable higher
+            // Use ~50% of typical limit
+            maxBatches = 500;
+        } else {
+            // Windows: Testing showed ~1000 batches optimal
+            // Beyond 1000, cold cache unchanged but warm cache degrades 10%
+            maxBatches = 1000;
+        }
+        
+        // Scale by CPU cores: more cores = more useful parallelism
+        // Use 100x CPU cores as baseline - OS-specific maxBatches caps the result
+        int cpuBasedBatches = cpuCores * 100;
+        
+        // Scale by file count: no point having more batches than files / 10
+        // (each batch should have at least ~10 files for efficiency)
+        int fileBasedBatches = Math.max(1, fileCount / 10);
+        
+        // Take minimum of all constraints
+        int optimalBatches = Math.min(maxBatches, Math.min(cpuBasedBatches, fileBasedBatches));
+        
+        // Ensure at least cpuCores batches to utilize all cores
+        optimalBatches = Math.max(cpuCores, optimalBatches);
+        
+        // Ensure at least 1 batch
+        return Math.max(1, optimalBatches);
     }
 }

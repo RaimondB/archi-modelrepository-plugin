@@ -49,6 +49,19 @@ public class GraficoResourceLoader {
         features.put("http://xml.org/sax/features/external-parameter-entities", Boolean.FALSE); //$NON-NLS-1$
         PARSER_FEATURES = Collections.unmodifiableMap(features);
     }
+    
+    /**
+     * Cached load options - reused for all file loads to avoid per-file map creation.
+     * Combines encoding and parser features in a single immutable map.
+     */
+    private static final Map<Object, Object> LOAD_OPTIONS;
+    
+    static {
+        Map<Object, Object> opts = new HashMap<>();
+        opts.put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
+        opts.put(XMLResource.OPTION_PARSER_FEATURES, PARSER_FEATURES);
+        LOAD_OPTIONS = Collections.unmodifiableMap(opts);
+    }
 
     public static IIdentifier loadEObject(File file) throws IOException {
         XMLResource resource = new XMLResourceImpl(URI.createFileURI(file.getAbsolutePath()));
@@ -61,18 +74,14 @@ public class GraficoResourceLoader {
     }
     
     private static IIdentifier load(XMLResource resource, InputStream inputStream) throws IOException {
-        // Apply load options - use cached parser features
-        resource.getDefaultLoadOptions().put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
-        resource.getDefaultLoadOptions().put(XMLResource.OPTION_PARSER_FEATURES, PARSER_FEATURES);
-       
-        // Load the Resource - we'll only create ModelCompatibility if there are errors
+        // Load the Resource using cached options (avoids per-file map creation)
         try {
             if(inputStream != null) {
-                resource.load(inputStream, null);
+                resource.load(inputStream, LOAD_OPTIONS);
                 inputStream.close();
             }
             else {
-                resource.load(null);
+                resource.load(LOAD_OPTIONS);
             }
         }
         catch(IOException ex) {
