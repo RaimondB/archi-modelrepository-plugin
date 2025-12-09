@@ -207,7 +207,8 @@ Consumer (EMF):               [add A]      [add B]      [add C]...
 **Use `ThrottledProgressReporter` for time-based throttling** to minimize UI thread contention:
 
 ```java
-// Create throttled reporter - updates at most every 250ms or every 2000 files
+// Create throttled reporter - updates at most every 250ms
+// Note: Updates occur if ANY progress is made, ensuring responsiveness even on slow I/O
 ThrottledProgressReporter reporter = new ThrottledProgressReporter(
     progress.split(totalFiles), totalFiles);
 
@@ -230,7 +231,7 @@ reporter.finish(null);
 
 - Uses `LongAdder` for lock-free counting (vs `AtomicInteger` cache-line bouncing)
 - Time-based throttling: updates UI at most every 250ms
-- Count-based throttling: updates only after 2000 files processed  
+- Updates on ANY progress: ensures UI doesn't freeze during slow operations (e.g. cold cache)
 - Double-checked locking: only one thread updates UI at a time
 - Thread-safe for use in async completion handlers
 
@@ -599,207 +600,65 @@ Based on extensive isolation testing, the **optimal approach** for cold cache is
 
 This achieves **~20s on cold cache** (~1,322 files/sec for 26,679 files).
 
-### Isolation Test Results (December 2025) - FINAL
+## Import Performance: The ConcurrentHashMap Breakthrough (December 2025)
 
-**System Configuration:**
-- Java 21.0.7 (OpenJDK 64-Bit Server VM)
-- Windows 11, 20 CPU cores, 8GB heap
-- ForkJoinPool parallelism: 19
-- Test files: 26,679 files, 37.6 MB total (~1.4KB average)
+### The Problem: Hidden Synchronization
+Initial attempts to optimize import performance using Virtual Threads failed to improve upon the baseline, stalling at ~42s for 27,000 files. Isolation tests showed that pure I/O could be done in 20s, but adding parsing doubled the time.
 
-#### Cold Cache I/O Comparison (CRITICAL FINDINGS)
+Investigation revealed that `GraficoResourceLoader` was using `Collections.synchronizedMap` for its feature cache:
 
-| Test | Approach | Cold Cache Time | Rate | Key Insight |
-|------|----------|-----------------|------|-------------|
-| Sequential | `Files.readAllBytes()` loop | 95s | 279/s | Baseline - terrible |
-| parallelStream | ForkJoinPool, no batching | 44.5s | 599/s | 2.1x speedup |
-| Virtual Threads | 1000 batches | 64.5s | 413/s | SLOWER - thread pinning! |
-| AsyncFileChannel | 200 concurrent handles | 62.8s | 425/s | Peak=22 handles only |
-| **CompletableFuture + FJP** | **1000 batches, ForkJoinPool(20)** | **20.2s** | **1,322/s** | **WINNER - 4.7x speedup** |
-
-#### Warm Cache I/O Comparison
-
-| Test | Time | Rate |
-|------|------|------|
-| Sequential | 0.68s | 39,473/s |
-| ForkJoinPool parallelStream | 0.20s | 131,782/s |
-| Virtual Threads | 0.26s | 104,440/s |
-
-#### Parsing Performance (Pre-loaded Data)
-
-| Test | Time | Rate | Notes |
-|------|------|------|-------|
-| Single-threaded parsing | 2.79s | 9,557/s | EMF XMLParserPool enabled |
-| Parallel parsing (20 threads) | 0.82s | 32,379/s | 3.4x speedup (not 20x - contention) |
-
-#### Combined I/O + Parsing (Warm Cache)
-
-| Test | Time | Rate |
-|------|------|------|
-| Batched I/O + Parsing | 1.60s | 16,663/s |
-
-### Key Learnings
-
-#### 1. Virtual Threads Are SLOWER for Cold Cache File I/O
-
-**Why?** `Files.readAllBytes()` uses `FileInputStream` which has synchronized methods. When a virtual thread hits synchronized code, it **pins to the carrier thread**, eliminating the benefit of lightweight threading.
-
-```
-Virtual Threads (1000): 64.5s - PINS on synchronized I/O
-ForkJoinPool (20):      44.5s - No pinning overhead
-CompletableFuture+FJP:  20.2s - Batching + work-stealing
-```
-
-#### 2. Batching is CRITICAL for Cold Cache
-
-| Batching | Cold Cache Time |
-|----------|-----------------|
-| No batching (parallelStream) | 44.5s |
-| 1000 batches (CompletableFuture) | 20.2s |
-
-**Why?** ForkJoinPool work-stealing is more efficient with fewer, larger tasks. Each batch processes ~27 files sequentially, reducing:
-- Task scheduling overhead
-- File handle contention
-- Memory allocation pressure
-
-#### 3. AsyncFileChannel is NOT Faster
-
-Despite being "truly async", `AsynchronousFileChannel` with semaphore limiting achieved only:
-- Peak concurrent handles: 22 (not 200!)
-- Time: 62.8s (slower than ForkJoinPool)
-
-**Why?** The semaphore acquisition becomes a bottleneck, and the async callback overhead adds latency.
-
-#### 4. The 20s Floor - What's Blocking Further Improvement?
-
-With 26,679 files at 20.2s = **1,322 files/sec**.
-
-**Theoretical limits:**
-
-| Component | Time | Rate | Notes |
-|-----------|------|------|-------|
-| Pure disk read (cold) | 20.2s | 1,322/s | **CURRENT BOTTLENECK** |
-| Parsing (20 threads) | 0.82s | 32,379/s | ~25x headroom |
-| Warm cache I/O | 0.20s | 131,782/s | ~100x headroom |
-
-**What's limiting disk throughput to 1,322 files/sec?**
-
-1. **Per-file overhead**: Each file open/read/close has ~0.75ms overhead on cold cache
-   - 26,679 files × 0.75ms = 20s
-   - This is the **filesystem metadata overhead**, not data transfer
-
-2. **NTFS metadata lookups**: Each file requires:
-   - MFT (Master File Table) lookup
-   - Directory entry traversal
-   - Security descriptor check
-   - Possible antivirus scan
-
-3. **OS file cache population**: First read of each file must:
-   - Read from physical disk
-   - Allocate cache pages
-   - Copy to user space
-
-4. **20 concurrent reads max**: ForkJoinPool(20) can only have 20 files in-flight at once. If each file takes 1ms to read:
-   - 26,679 files / 20 threads × 1ms = 1.3s (theoretical)
-   - But cold cache takes 20s = 15ms average per file including overhead
-
-### Strategies to Go Below 20s
-
-#### Strategy 1: Reduce File Count (HIGHEST IMPACT)
-
-**Problem**: 26,679 small files = 26,679 metadata operations
-
-**Solution**: Bundle multiple elements per file
-- 100 elements per file → 267 files → ~0.2s metadata overhead
-- Requires GRAFICO format changes
-
-#### Strategy 2: Pre-warm Disk Cache During Export
-
-**Problem**: Export uses DirCache (no file reads), leaving cache cold
-
-**Solution**: Background thread reads files during export
 ```java
-// During export, spawn cache-warming thread
-executor.submit(() -> {
-    for (File file : allFiles) {
-        Files.readAllBytes(file.toPath()); // Just read, discard
-    }
+// ❌ BOTTLENECK: Serializes all 27,000 threads on a single lock!
+private static final Map<Object, Object> XML_NAME_TO_FEATURE_MAP = Collections.synchronizedMap(new HashMap<>());
+```
+
+With 20+ threads (or 27,000 virtual threads) all trying to look up XML features simultaneously, this single lock became a massive contention point, effectively serializing the parsing phase.
+
+### The Fix: ConcurrentHashMap
+Replacing the synchronized map with `ConcurrentHashMap` removed the blocking:
+
+```java
+// ✅ FIX: Non-blocking reads allow full parallelism
+private static final Map<Object, Object> XML_NAME_TO_FEATURE_MAP = new ConcurrentHashMap<>();
+```
+
+### Results
+After this fix, the import time dropped to **21s**, matching the theoretical I/O limit.
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Total Time | 21.05s | ~1,341 files/sec |
+| Consumer Time | 20.67s | Waiting for producers |
+| Effective Parallelism | 273 | Despite 26,680 virtual threads |
+| Peak Concurrent Threads | 378 | |
+
+### Virtual Threads vs ForkJoinPool
+With the lock contention removed, **Virtual Threads** (one per file) proved to be just as effective as the batched ForkJoinPool approach, achieving the same ~21s result. This suggests that while "thread pinning" on `Files.readAllBytes` (synchronized I/O) is real, the modern OS and SSD can handle the concurrency well enough that it's not the primary bottleneck at this scale (27,000 files).
+
+### Progress Reporting "Freeze" with Virtual Threads
+
+**Problem**: Launching 26,680 virtual threads that all report progress causes a UI freeze.
+- Even with `ThrottledProgressReporter`, the sheer volume of `incrementAndMaybeReport` calls from 26,000 threads creates massive contention.
+- The "thundering herd" of threads starting simultaneously starves the UI event loop.
+
+**Solution**: Move progress reporting to the **Consumer** thread.
+- The consumer processes elements sequentially (or in small batches) as they arrive from the queue.
+- Reporting from the consumer is single-threaded and contention-free.
+- This eliminates the UI freeze while maintaining accurate progress (since an item isn't "done" until it's in the model anyway).
+
+```java
+// ❌ WRONG: Report from producer (26,000 threads contention)
+fIoExecutor.execute(() -> {
+    readAndParse(file);
+    progress.increment(); // FREEZE!
 });
-```
-- Next import would hit warm cache (~1.6s instead of 20s)
 
-#### Strategy 3: Memory-Mapped Files
-
-**Problem**: Each `Files.readAllBytes()` allocates a new byte array
-
-**Solution**: Use `MappedByteBuffer` for zero-copy reads
-```java
-try (FileChannel channel = FileChannel.open(path, READ)) {
-    MappedByteBuffer buffer = channel.map(READ_ONLY, 0, channel.size());
-    // Parse directly from buffer
+// ✅ CORRECT: Report from consumer (single thread)
+while (queue.drainTo(buffer) > 0) {
+    for (Element e : buffer) {
+        model.add(e);
+        progress.increment(); // Smooth!
+    }
 }
 ```
-- Reduces memory allocation pressure
-- May improve OS read-ahead for sequential access
-
-#### Strategy 4: Increase Batch Concurrency
-
-**Current**: 1000 batches of ~27 files each, 20 threads
-
-**Test**: Reduce batch size to increase parallelism
-- 2000 batches of ~13 files → more concurrent I/O requests
-- Trade-off: more CompletableFuture overhead
-
-#### Strategy 5: Windows Defender Exclusion
-
-**Problem**: Antivirus may scan each file on first access
-
-**Solution**: Add repository folder to Windows Defender exclusions
-- Could provide significant speedup for cold cache
-
-#### Strategy 6: SSD/NVMe Optimization
-
-**Problem**: Many small random reads are worst case for any storage
-
-**Current**: 1.9 MB/s throughput (vs theoretical 500+ MB/s)
-
-**Solutions**:
-- Ensure files are on NVMe, not spinning disk
-- Check for disk fragmentation
-- Verify TRIM is enabled
-
-### Recommended Implementation
-
-Based on testing, the optimal import implementation is:
-
-```java
-// Use ForkJoinPool (NOT virtual threads) for cold cache I/O
-ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
-
-// 1000 batches for optimal balance
-int batchCount = 1000;
-int batchSize = (files.size() + batchCount - 1) / batchCount;
-
-List<CompletableFuture<Void>> futures = new ArrayList<>();
-for (int i = 0; i < files.size(); i += batchSize) {
-    final int start = i;
-    final int end = Math.min(i + batchSize, files.size());
-    
-    futures.add(CompletableFuture.runAsync(() -> {
-        for (int j = start; j < end; j++) {
-            byte[] data = Files.readAllBytes(files.get(j).toPath());
-            EObject element = parseElement(data);
-            queue.put(new ParsedElement(element, folder));
-        }
-    }, cpuExecutor));
-}
-
-CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-```
-
-**Key principles:**
-1. **ForkJoinPool** for I/O (not virtual threads - they pin)
-2. **1000 batches** for optimal work-stealing
-3. **Sequential within batch** to reduce contention
-4. **Producer/consumer queue** for EMF thread safety
 

@@ -52,7 +52,8 @@ public class ThrottledProgressReporter {
     private static final long DEFAULT_POLL_INTERVAL_MS = 250;
     
     // Default minimum files between updates (to avoid too frequent updates even with polling)
-    private static final int DEFAULT_FILE_INTERVAL = 500;
+    // Set to 1 to ensure updates even when processing is slow (e.g. cold cache)
+    private static final int DEFAULT_FILE_INTERVAL = 1;
     
     private final SubMonitor progress;
     private final int totalItems;
@@ -128,7 +129,9 @@ public class ThrottledProgressReporter {
         long currentCount = processedCount.sum();
         
         // Check if enough files have been processed to warrant an update
-        if (currentCount - lastReportedCount >= fileInterval || currentCount >= totalItems) {
+        // Since we are polling at a fixed interval (e.g. 250ms), we should update if ANY progress
+        // has been made, to ensure the UI doesn't appear frozen during slow operations.
+        if (currentCount > lastReportedCount || currentCount >= totalItems) {
             final int workDelta = (int) (currentCount - lastReportedCount);
             final long reportedCount = currentCount;
             

@@ -1387,6 +1387,12 @@ public class GraficoModelImporter {
                         }
                         totalAddTime += (System.nanoTime() - addToModelStart);
                         elementsProcessed++;
+                        
+                        // Report progress from consumer (single-threaded, no contention)
+                        if (fProgressReporter != null) {
+                            fProgressReporter.incrementAndMaybeReport(
+                                count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                        }
                     }
                     drainBuffer.clear();
                     
@@ -1494,10 +1500,7 @@ public class GraficoModelImporter {
             }
         } finally {
             remaining.decrementAndGet();
-            if (fProgressReporter != null) {
-                fProgressReporter.incrementAndMaybeReport(
-                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-            }
+            // Progress reporting moved to consumer to avoid contention
         }
     }
     
@@ -1541,10 +1544,7 @@ public class GraficoModelImporter {
             }
         } finally {
             remaining.decrementAndGet();
-            if (fProgressReporter != null) {
-                fProgressReporter.incrementAndMaybeReport(
-                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-            }
+            // Progress reporting moved to consumer to avoid contention
         }
     }
     
@@ -1591,10 +1591,7 @@ public class GraficoModelImporter {
                     }
                 } finally {
                     remaining.decrementAndGet();
-                    if (fProgressReporter != null) {
-                        fProgressReporter.incrementAndMaybeReport(
-                            count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-                    }
+                    // Progress reporting moved to consumer to avoid contention
                 }
             });
         } catch (IOException e) {
@@ -1648,10 +1645,7 @@ public class GraficoModelImporter {
             }
         } finally {
             remaining.decrementAndGet();
-            if (fProgressReporter != null) {
-                fProgressReporter.incrementAndMaybeReport(
-                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-            }
+            // Progress reporting moved to consumer to avoid contention
         }
     }
     
