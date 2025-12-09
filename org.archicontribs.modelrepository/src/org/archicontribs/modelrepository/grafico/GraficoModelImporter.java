@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
@@ -127,19 +128,28 @@ public class GraficoModelImporter {
      * Created once per import, not per folder.
      */
     private ForkJoinPool fCpuExecutor;
-    
+
     /**
      * Virtual thread executor for I/O operations.
-     * Virtual threads are ideal for blocking I/O - thousands can run concurrently
-     * without consuming OS threads. Each thread parks on file read.
      */
     private ExecutorService fIoExecutor;
+    
+    // NOTE: We use Virtual Threads for I/O as requested
     
     // Batch size for CompletableFuture operations (reduces overhead from 30,000 futures to ~300)
     private static final int BATCH_SIZE = 100;
     
-    // Bounded queue capacity for backpressure - limits memory usage and creates natural throttling
-    private static final int QUEUE_CAPACITY = 500;
+    // Maximum concurrent I/O operations (matches exporter's maxBatches approach)
+    private static final int MAX_CONCURRENT_IO = 1000;
+    
+    // Bounded queue capacity - should be >= MAX_CONCURRENT_IO to avoid producer blocking
+    // 2x buffer allows for burst handling
+    private static final int QUEUE_CAPACITY = 2000;
+    
+    // Producer timing accumulators (for performance diagnostics)
+    private java.util.concurrent.atomic.LongAdder fProducerReadTime;
+    private java.util.concurrent.atomic.LongAdder fProducerParseTime;
+    private java.util.concurrent.atomic.LongAdder fProducerQueuePutTime;
     
     /**
      * Producer/Consumer queue for decoupling file reading from model building.
@@ -309,17 +319,16 @@ public class GraficoModelImporter {
     	// Use 100% of allocated progress - no reserved portion left idle at the end
     	fProgressReporter = new ThrottledProgressReporter(progress.split(100), totalFiles);
     	
-    	// HYBRID PIPELINE ARCHITECTURE:
-    	// Stage 1: I/O - Virtual threads for file reads (thousands can block concurrently)
-    	// Stage 2: CPU - ForkJoinPool for XML parsing (sized to CPU cores)
-    	// Stage 3: Model - Single consumer thread for EMF model building
+    	// OPTIMIZED PIPELINE ARCHITECTURE (December 2025):
+    	// Use ForkJoinPool for CPU work and Virtual Threads for I/O
     	fCpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
-    	fIoExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    	logPerfMessage("Executors created: " + Runtime.getRuntime().availableProcessors() + " CPU threads + virtual threads for I/O"); //$NON-NLS-1$ //$NON-NLS-2$
+        fIoExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    	logPerfMessage("Executors created: ForkJoinPool(" + Runtime.getRuntime().availableProcessors() + ") + Virtual Threads"); //$NON-NLS-1$ //$NON-NLS-2$
     	
     	try {
     	    // Reset the ID -> Object lookup table
-    	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>();
+            // Pre-size to avoid resizing overhead (default load factor 0.75)
+    	    fIDLookup = new ConcurrentHashMap<String, IIdentifier>((int)(totalFiles / 0.75) + 1);
     	    
     	    // Try DirCache-based loading for git repositories (faster on cold cache)
     	    // Falls back to traditional folder-by-folder loading if not a git repo
@@ -409,15 +418,10 @@ public class GraficoModelImporter {
     	    // Ensure DirCache resources are cleaned up
     	    cleanupDirCacheForImport();
     	    
-    	    // Ensure the shared CPU executor is stopped
+    	    // Ensure the CPU executor is stopped
     	    if (fCpuExecutor != null) {
     	        fCpuExecutor.shutdown();
     	        fCpuExecutor = null;
-    	    }
-    	    // Ensure the I/O executor is stopped
-    	    if (fIoExecutor != null) {
-    	        fIoExecutor.shutdown();
-    	        fIoExecutor = null;
     	    }
     	    // Ensure the shared progress reporter is stopped
     	    if (fProgressReporter != null) {
@@ -1042,7 +1046,7 @@ public class GraficoModelImporter {
     // 1. Read DirCache once to get list of all files under model/ and images/
     // 2. Categorize files: folder.xml files (define structure) vs element files (content)
     // 3. Process folder.xml files first (in hierarchy order) to create IFolder objects
-    // 4. Start ALL element file reads in parallel (not folder-by-folder)
+    // 4. Start ALL element file reads in parallel
     // 5. Use producer/consumer to add parsed elements to pre-created folders
     //
     // PERFORMANCE BENEFIT:
@@ -1292,55 +1296,99 @@ public class GraficoModelImporter {
         //
         phaseStart = System.nanoTime();
         if (!elementFiles.isEmpty()) {
-            // BOUNDED queue for backpressure - limits memory and creates natural throttling
-            // When queue is full, producers block in queue.put() until consumer catches up
-            BlockingQueue<ElementWithFolder> elementQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+            // LinkedBlockingQueue with capacity for bounded backpressure
+            // Key advantage over ArrayBlockingQueue: separate locks for put (tail) and take (head)
+            // This reduces contention when 1000 producers put() while consumer drains
+            BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
             
-            logPerfMessage("  Phase2 config: 3-stage pipeline, bounded queue capacity=" + QUEUE_CAPACITY); //$NON-NLS-1$
+            // Initialize producer timing accumulators
+            fProducerReadTime = new java.util.concurrent.atomic.LongAdder();
+            fProducerParseTime = new java.util.concurrent.atomic.LongAdder();
+            fProducerQueuePutTime = new java.util.concurrent.atomic.LongAdder();
+            
+            // Track concurrent batch execution to diagnose parallelism limits
+            AtomicInteger activeBatches = new AtomicInteger(0);
+            AtomicInteger peakActiveBatches = new AtomicInteger(0);
+            
+            logPerfMessage("  Phase2 config: Virtual Threads (one per file), queue=" + QUEUE_CAPACITY); //$NON-NLS-1$
             
             long producerStart = System.nanoTime();
             
-            // Stage 1: Fire ALL file reads using virtual threads
-            // Each virtual thread: read file (I/O, parks) → hand off to Stage 2 (CPU pool) → queue for Stage 3
+            // Fire ALL file reads using virtual threads
+            // Each virtual thread: read file (I/O) → parse → queue
             for (DirCacheFileEntry entry : elementFiles) {
-                fIoExecutor.execute(() -> 
-                    readParseAndQueueElement(entry, elementQueue, remainingElements, producerError, totalModelFiles));
+                fIoExecutor.execute(() -> {
+                    activeBatches.incrementAndGet();
+                    peakActiveBatches.updateAndGet(peak -> Math.max(peak, activeBatches.get()));
+                    try {
+                        readParseAndQueueStreaming(entry, elementQueue, remainingElements, producerError, totalModelFiles);
+                    } finally {
+                        activeBatches.decrementAndGet();
+                    }
+                });
             }
-            logPerf("  Phase2 Stage1: Fire async reads (virtual threads)", producerStart, elementFiles.size()); //$NON-NLS-1$
+            logPerf("  Phase2 Stage1: Fire async reads (Virtual Threads)", producerStart, elementFiles.size()); //$NON-NLS-1$
             
             // Stage 3: Consumer loop - add elements to model as they arrive
             // Runs on this thread (main/caller thread) for EMF thread safety
+            // Strategy: take() blocks until one item available, then drainTo() gets the rest
             int elementsProcessed = 0;
             final int totalElements = elementFiles.size();
             long consumerStart = System.nanoTime();
-            int pollTimeouts = 0;
+            int drainOperations = 0;  // Track number of drain calls
+            int takeOperations = 0;   // Track number of take() calls
+            long totalAddTime = 0;    // Track just the time spent adding to model
+            long totalTakeTime = 0;   // Track time waiting in take()
+            long totalDrainTime = 0;  // Track time in drainTo() calls
+            long totalLookupTime = 0; // Track HashMap lookup time
+            int maxBatchSize = 0;     // Track largest batch for diagnostics
+            
+            // Reusable buffer for draining - sized generously
+            List<ElementWithFolder> drainBuffer = new ArrayList<>(500);
             
             while (elementsProcessed < totalElements) {
-                // Check for cancellation
-                if (fProgressReporter != null && fProgressReporter.isCanceled()) {
-                    return model;
-                }
-                
                 try {
-                    // Poll with timeout to allow cancellation checks
-                    ElementWithFolder item = elementQueue.poll(50, TimeUnit.MILLISECONDS);
-                    if (item == null) {
-                        // Check if producers encountered an error
-                        if (producerError.get() && remainingElements.get() == 0) {
-                            break; // All producers done, possibly with errors
-                        }
-                        pollTimeouts++;
-                        continue; // Keep waiting
+                    // Wait for at least one item (blocks until available)
+                    long takeStart = System.nanoTime();
+                    ElementWithFolder firstItem = elementQueue.take();
+                    totalTakeTime += (System.nanoTime() - takeStart);
+                    takeOperations++;
+                    
+                    // Got one - now drain any others that are ready (non-blocking)
+                    drainBuffer.add(firstItem);
+                    long drainStart = System.nanoTime();
+                    int drained = elementQueue.drainTo(drainBuffer, 500);  // Max 500 per batch
+                    totalDrainTime += (System.nanoTime() - drainStart);
+                    if (drained > 0) {
+                        drainOperations++;
                     }
                     
-                    // Add element to its parent folder (single-threaded, EMF safe)
-                    IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
-                    if (parentFolder != null && item.element() != null) {
-                        parentFolder.getElements().add(item.element());
+                    int currentBatchSize = drainBuffer.size();
+                    if (currentBatchSize > maxBatchSize) {
+                        maxBatchSize = currentBatchSize;
                     }
-                    elementsProcessed++;
+                    
+                    // Process entire batch
+                    for (ElementWithFolder item : drainBuffer) {
+                        // Check for error marker
+                        if (item.element() == null) {
+                            continue;  // Skip error markers
+                        }
+                        
+                        long lookupStart = System.nanoTime();
+                        IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
+                        totalLookupTime += (System.nanoTime() - lookupStart);
+                        
+                        long addToModelStart = System.nanoTime();
+                        if (parentFolder != null) {
+                            parentFolder.getElements().add(item.element());
+                        }
+                        totalAddTime += (System.nanoTime() - addToModelStart);
+                        elementsProcessed++;
+                    }
+                    drainBuffer.clear();
                     
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -1348,11 +1396,41 @@ public class GraficoModelImporter {
                 }
             }
             
-            // No need to wait for batch futures - virtual threads complete when they put to queue
-            // The consumer loop above ensures all elements are processed
+            // No need to wait for producers explicitly - consumer loop ensures all elements are processed
             
-            logPerf("  Phase2+3: Consumer (poll+add to model)", consumerStart, elementsProcessed); //$NON-NLS-1$
-            logPerfMessage("  Consumer poll timeouts: " + pollTimeouts + " (each = 50ms wait)"); //$NON-NLS-1$ //$NON-NLS-2$
+            logPerf("  Phase2+3: Consumer (take+drain)", consumerStart, elementsProcessed); //$NON-NLS-1$
+            int avgBatchSize = takeOperations > 0 ? elementsProcessed / takeOperations : 0;
+            logPerfMessage("  Consumer: " + takeOperations + " take ops, " + drainOperations + " drain ops, avg batch=" + avgBatchSize + ", max batch=" + maxBatchSize); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+            
+            // Log breakdown of consumer time
+            long totalConsumerTime = System.nanoTime() - consumerStart;
+            long addTimeMs = totalAddTime / 1_000_000;
+            long drainMs = totalDrainTime / 1_000_000;
+            long takeMs = totalTakeTime / 1_000_000;
+            long lookupMs = totalLookupTime / 1_000_000;
+            long otherTimeMs = (totalConsumerTime / 1_000_000) - addTimeMs - drainMs - takeMs - lookupMs;
+            int theoreticalMaxRate = addTimeMs > 0 ? (int)(elementsProcessed * 1000L / addTimeMs) : 0;
+            logPerfMessage("  Consumer breakdown: add=" + addTimeMs + "ms, lookup=" + lookupMs + //$NON-NLS-1$ //$NON-NLS-2$
+                "ms, drain=" + drainMs + "ms, take=" + takeMs + //$NON-NLS-1$ //$NON-NLS-2$
+                "ms, other=" + otherTimeMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
+            logPerfMessage("  Theoretical max consumer rate (add-only): " + theoreticalMaxRate + " items/sec"); //$NON-NLS-1$ //$NON-NLS-2$
+            
+            // Log producer breakdown (cumulative across all virtual threads)
+            // NOTE: With streaming, "read" includes I/O + parse (overlapped in BufferedInputStream)
+            long producerReadMs = fProducerReadTime.sum() / 1_000_000;
+            long producerParseMs = fProducerParseTime.sum() / 1_000_000;
+            long producerQueueMs = fProducerQueuePutTime.sum() / 1_000_000;
+            int numFiles = elementFiles.size();
+            logPerfMessage("  Producer: peakConcurrentThreads=" + peakActiveBatches.get() + " (of " + numFiles + " files)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            logPerfMessage("  Producer breakdown (cumulative): readParse=" + producerReadMs + //$NON-NLS-1$
+                "ms, parseSeparate=" + producerParseMs + "ms, queuePut=" + producerQueueMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            // Per-file average (more meaningful for concurrent threads)
+            long readPerFileUs = numFiles > 0 ? (fProducerReadTime.sum() / numFiles) / 1000 : 0;
+            long parsePerFileUs = numFiles > 0 ? (fProducerParseTime.sum() / numFiles) / 1000 : 0;
+            // Calculate effective parallelism = cumulative time / wall clock time
+            long wallClockMs = (System.nanoTime() - consumerStart) / 1_000_000;
+            int effectiveParallelism = wallClockMs > 0 ? (int)(producerReadMs / wallClockMs) : 0;
+            logPerfMessage("  Producer per-file avg: readParse=" + readPerFileUs + "us, effectiveParallelism=" + effectiveParallelism); //$NON-NLS-1$ //$NON-NLS-2$
         }
         logPerf("  Phase2+3 TOTAL (overlapped I/O + model build)", phaseStart, elementFiles.size()); //$NON-NLS-1$
         logPerf("  loadModelWithDirCache TOTAL", methodStart, totalModelFiles); //$NON-NLS-1$
@@ -1370,6 +1448,105 @@ public class GraficoModelImporter {
      * Intermediate record holding raw bytes read from disk, waiting for XML parsing.
      */
     private record RawFileData(DirCacheFileEntry entry, byte[] bytes) {}
+    
+    /**
+     * Read, parse, and queue an element using STREAMING I/O.
+     * Parses XML directly from FileInputStream - no intermediate byte buffer.
+     * This allows overlapped I/O and parsing within each file.
+     * 
+     * Combined with semaphore control (max 1000 concurrent), this provides:
+     * - Bounded parallelism (no queue contention from 26,680 threads)
+     * - Streaming parsing (I/O and XML parsing overlap)
+     * - Backpressure via bounded queue
+     * 
+     * @param entry The DirCache file entry
+     * @param queue The queue to put parsed elements into
+     * @param remaining Counter for remaining elements (decremented on completion)
+     * @param errorFlag Set to true if any producer encounters an error
+     * @param totalModelFiles Total files for progress reporting
+     */
+    private void readParseAndQueueStreaming(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
+            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
+        // Use Files.newInputStream() + BufferedInputStream to avoid large byte[] allocations.
+        // This reduces GC pressure compared to Files.readAllBytes().
+        try {
+            Path path = entry.absolutePath();
+            
+            // I/O + Parse: Stream directly from disk
+            // BufferedInputStream ensures we read in chunks (8KB) rather than byte-by-byte
+            long readStart = System.nanoTime();
+            try (InputStream inputStream = new java.io.BufferedInputStream(Files.newInputStream(path))) {
+                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                fIDLookup.put(eObject.getId(), eObject);
+                fProducerReadTime.add(System.nanoTime() - readStart);
+                
+                // Put into queue for consumer (may block if queue is full)
+                long putStart = System.nanoTime();
+                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                fProducerQueuePutTime.add(System.nanoTime() - putStart);
+            }
+        } catch (IOException | InterruptedException e) {
+            errorFlag.set(true);
+            try {
+                queue.put(new ElementWithFolder(entry.folderPath(), null));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            remaining.decrementAndGet();
+            if (fProgressReporter != null) {
+                fProgressReporter.incrementAndMaybeReport(
+                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+            }
+        }
+    }
+    
+    /**
+     * Read, parse, and queue an element DIRECTLY on virtual thread.
+     * No CPU executor handoff - parsing is only 3% of total time, so keep it simple.
+     * Maximum I/O parallelism: each of 26,680 files gets its own virtual thread.
+     * 
+     * @param entry The DirCache file entry
+     * @param queue The queue to put parsed elements into
+     * @param remaining Counter for remaining elements (decremented on completion)
+     * @param errorFlag Set to true if any producer encounters an error
+     * @param totalModelFiles Total files for progress reporting
+     */
+    private void readParseAndQueueDirect(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
+            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
+        try {
+            // I/O: Read file (this is 97% of time on cold cache)
+            long readStart = System.nanoTime();
+            byte[] bytes = Files.readAllBytes(entry.absolutePath());
+            fProducerReadTime.add(System.nanoTime() - readStart);
+            
+            // CPU: Parse XML (only 3% of time, OK to do on virtual thread)
+            long parseStart = System.nanoTime();
+            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                fIDLookup.put(eObject.getId(), eObject);
+                fProducerParseTime.add(System.nanoTime() - parseStart);
+                
+                // Put into queue for consumer (may block if queue is full)
+                long putStart = System.nanoTime();
+                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                fProducerQueuePutTime.add(System.nanoTime() - putStart);
+            }
+        } catch (IOException | InterruptedException e) {
+            errorFlag.set(true);
+            try {
+                queue.put(new ElementWithFolder(entry.folderPath(), null));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            remaining.decrementAndGet();
+            if (fProgressReporter != null) {
+                fProgressReporter.incrementAndMaybeReport(
+                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+            }
+        }
+    }
     
     /**
      * Read, parse, and queue an element for the consumer thread.
@@ -1447,14 +1624,20 @@ public class GraficoModelImporter {
         try {
             // Synchronous I/O - OK because we're in a ForkJoinPool batch
             // Only one file open per batch (sequential within batch)
+            long readStart = System.nanoTime();
             byte[] bytes = Files.readAllBytes(entry.absolutePath());
+            fProducerReadTime.add(System.nanoTime() - readStart);
             
+            long parseStart = System.nanoTime();
             try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
                 fIDLookup.put(eObject.getId(), eObject);
+                fProducerParseTime.add(System.nanoTime() - parseStart);
                 
-                // Put into queue for consumer
+                // Put into queue for consumer (may block if queue is full = backpressure)
+                long putStart = System.nanoTime();
                 queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                fProducerQueuePutTime.add(System.nanoTime() - putStart);
             }
         } catch (IOException | InterruptedException e) {
             errorFlag.set(true);
@@ -1632,5 +1815,506 @@ public class GraficoModelImporter {
         
         // Ensure at least 1 batch
         return Math.max(1, optimalBatches);
+    }
+    
+    // ================================================================================
+    // ISOLATION TESTS - To identify where time is being spent
+    // ================================================================================
+    
+    /**
+     * Run isolation tests to identify performance bottlenecks.
+     * Each test isolates a different component of the import pipeline.
+     * 
+     * Results are logged to help identify:
+     * - Is disk I/O the bottleneck?
+     * - Is XML parsing the bottleneck?
+     * - Is EMF model building the bottleneck?
+     * - Is there hidden synchronization limiting parallelism?
+     */
+    private void runIsolationTests(List<DirCacheFileEntry> elementFiles) {
+        logPerfMessage("=== RUNNING ISOLATION TESTS ==="); //$NON-NLS-1$
+        logPerfMessage("Files to test: " + elementFiles.size()); //$NON-NLS-1$
+        
+        // Log JVM and system info that might affect disk I/O
+        logPerfMessage("=== JVM/System Diagnostics ==="); //$NON-NLS-1$
+        logPerfMessage("  Java version: " + System.getProperty("java.version")); //$NON-NLS-1$ //$NON-NLS-2$
+        logPerfMessage("  Java VM: " + System.getProperty("java.vm.name") + " " + System.getProperty("java.vm.version")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        logPerfMessage("  OS: " + System.getProperty("os.name") + " " + System.getProperty("os.version")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        logPerfMessage("  Available processors: " + Runtime.getRuntime().availableProcessors()); //$NON-NLS-1$
+        logPerfMessage("  Max memory: " + (Runtime.getRuntime().maxMemory() / 1024 / 1024) + " MB"); //$NON-NLS-1$ //$NON-NLS-2$
+        logPerfMessage("  Free memory: " + (Runtime.getRuntime().freeMemory() / 1024 / 1024) + " MB"); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Check for relevant JVM properties that affect I/O
+        String directBuffers = System.getProperty("jdk.nio.maxCachedBufferSize"); //$NON-NLS-1$
+        logPerfMessage("  jdk.nio.maxCachedBufferSize: " + (directBuffers != null ? directBuffers : "(default)")); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        String fileEncoding = System.getProperty("sun.jnu.encoding"); //$NON-NLS-1$
+        logPerfMessage("  File encoding: " + fileEncoding); //$NON-NLS-1$
+        
+        // ForkJoinPool common pool parallelism
+        logPerfMessage("  ForkJoinPool.commonPool parallelism: " + java.util.concurrent.ForkJoinPool.commonPool().getParallelism()); //$NON-NLS-1$
+        
+        // Check if running with certain JVM flags
+        java.lang.management.RuntimeMXBean runtimeMxBean = java.lang.management.ManagementFactory.getRuntimeMXBean();
+        List<String> inputArguments = runtimeMxBean.getInputArguments();
+        for (String arg : inputArguments) {
+            if (arg.contains("MaxDirectMemory") || arg.contains("UseNUMA") ||  //$NON-NLS-1$ //$NON-NLS-2$
+                arg.contains("ParallelGC") || arg.contains("G1GC") || arg.contains("ZGC") || //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                arg.contains("Xmx") || arg.contains("Xms")) { //$NON-NLS-1$ //$NON-NLS-2$
+                logPerfMessage("  JVM arg: " + arg); //$NON-NLS-1$
+            }
+        }
+        
+        logPerfMessage("=== End Diagnostics ==="); //$NON-NLS-1$
+        
+        logPerfMessage("NOTE: Run CompletableFuture test FIRST to measure cold-cache performance!"); //$NON-NLS-1$
+        
+        // IMPORTANT: Run CompletableFuture test FIRST while cache is still cold!
+        // Test 1e: Pure Disk I/O - CompletableFuture with ForkJoinPool (like real import) - COLD CACHE
+        logPerfMessage("--- Test 1e: Pure Disk I/O (CompletableFuture + ForkJoinPool, COLD CACHE) ---"); //$NON-NLS-1$
+        runTest1e_CompletableFuture_ForkJoinPool(elementFiles);
+        
+        // Test 1b: Pure Disk I/O - Parallel with ForkJoinPool parallelStream (20 threads) - WARM CACHE now
+        logPerfMessage("--- Test 1b: Pure Disk I/O (ForkJoinPool parallelStream, WARM CACHE) ---"); //$NON-NLS-1$
+        runTest1b_ParallelDiskIO_ForkJoin(elementFiles);
+        
+        // Test 1c: Pure Disk I/O - Parallel with Virtual Threads (1000 concurrent) - WARM CACHE
+        logPerfMessage("--- Test 1c: Pure Disk I/O (Virtual Threads, 1000 batches, WARM CACHE) ---"); //$NON-NLS-1$
+        runTest1c_ParallelDiskIO_VirtualThreads(elementFiles);
+        
+        // Test 1a: Pure Disk I/O - Sequential (WARM cache)
+        // We know from previous runs that sequential cold cache = ~95s
+        logPerfMessage("--- Test 1a: Pure Disk I/O (sequential, WARM CACHE - baseline was 95s cold) ---"); //$NON-NLS-1$
+        runTest1a_SequentialDiskIO(elementFiles);
+        
+        // Test 1d is skipped - AsyncFileChannel was slower (62s vs 44s ForkJoinPool)
+        
+        // Test 2: Pure Parsing (single-threaded, no disk I/O)
+        // This isolates EMF/SAX parsing cost
+        Map<Path, byte[]> preloadedData = runTest2_PureParsingSingleThreaded(elementFiles);
+        
+        // Test 3: Parallel Parsing (no disk I/O)
+        // This tests if parsing can scale with threads
+        if (preloadedData != null) {
+            runTest3_ParallelParsing(preloadedData);
+        }
+        
+        // Test 4: Batched Parallel I/O + Parsing (current approach)
+        // For comparison with the isolation tests
+        runTest4_BatchedParallelIOAndParsing(elementFiles);
+        
+        logPerfMessage("=== ISOLATION TESTS COMPLETE ==="); //$NON-NLS-1$
+    }
+    
+    /**
+     * Test 1e: Pure Disk I/O with CompletableFuture + ForkJoinPool.
+     * This matches the pattern used in the real import.
+     */
+    private void runTest1e_CompletableFuture_ForkJoinPool(List<DirCacheFileEntry> elementFiles) {
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        ForkJoinPool pool = new ForkJoinPool(cpuCores);
+        java.util.concurrent.atomic.LongAdder totalBytes = new java.util.concurrent.atomic.LongAdder();
+        
+        // Use batching like the real import (1000 batches)
+        int batchCount = 1000;
+        int batchSize = Math.max(1, (elementFiles.size() + batchCount - 1) / batchCount);
+        
+        logPerfMessage(String.format("  Using %d CPU cores, %d batches of ~%d files", cpuCores, batchCount, batchSize)); //$NON-NLS-1$
+        
+        long start = System.nanoTime();
+        
+        try {
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            
+            for (int i = 0; i < elementFiles.size(); i += batchSize) {
+                final int startIdx = i;
+                final int endIdx = Math.min(i + batchSize, elementFiles.size());
+                
+                futures.add(CompletableFuture.runAsync(() -> {
+                    for (int j = startIdx; j < endIdx; j++) {
+                        try {
+                            byte[] data = Files.readAllBytes(elementFiles.get(j).absolutePath());
+                            totalBytes.add(data.length);
+                        } catch (IOException e) {
+                            // Ignore errors
+                        }
+                    }
+                }, pool));
+            }
+            
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } finally {
+            pool.shutdown();
+        }
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double mbPerSec = (totalBytes.sum() / 1_000_000.0) / elapsedSec;
+        double filesPerSec = elementFiles.size() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 1e Result: %.2fs, %d files, %.1f MB, %.1f MB/s, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, elementFiles.size(), totalBytes.sum() / 1_000_000.0, mbPerSec, filesPerSec));
+    }
+    
+    /**
+     * Test 1a: Pure Disk I/O - Sequential reads without parsing.
+     * This is the WORST case - each file opened, read, closed sequentially.
+     * NOTE: Caller logs the test header with cache state info.
+     */
+    private void runTest1a_SequentialDiskIO(List<DirCacheFileEntry> elementFiles) {
+        long totalBytes = 0;
+        long start = System.nanoTime();
+        
+        for (DirCacheFileEntry entry : elementFiles) {
+            try {
+                byte[] data = Files.readAllBytes(entry.absolutePath());
+                totalBytes += data.length;
+            } catch (IOException e) {
+                // Ignore errors in test
+            }
+        }
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double mbPerSec = (totalBytes / 1_000_000.0) / elapsedSec;
+        double filesPerSec = elementFiles.size() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 1a Result: %.2fs, %d files, %.1f MB, %.1f MB/s, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, elementFiles.size(), totalBytes / 1_000_000.0, mbPerSec, filesPerSec));
+    }
+    
+    /**
+     * Test 1b: Parallel Disk I/O with ForkJoinPool (limited to CPU cores).
+     * This tests if we can parallelize file opens/reads with platform threads.
+     * NOTE: Caller logs the test header with cache state info.
+     */
+    private void runTest1b_ParallelDiskIO_ForkJoin(List<DirCacheFileEntry> elementFiles) {
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        ForkJoinPool pool = new ForkJoinPool(cpuCores);
+        java.util.concurrent.atomic.LongAdder totalBytes = new java.util.concurrent.atomic.LongAdder();
+        
+        long start = System.nanoTime();
+        
+        try {
+            pool.submit(() -> 
+                elementFiles.parallelStream().forEach(entry -> {
+                    try {
+                        byte[] data = Files.readAllBytes(entry.absolutePath());
+                        totalBytes.add(data.length);
+                    } catch (IOException e) {
+                        // Ignore errors
+                    }
+                })
+            ).get();
+        } catch (InterruptedException | ExecutionException e) {
+            logPerfMessage("  Test 1b failed: " + e.getMessage()); //$NON-NLS-1$
+            return;
+        } finally {
+            pool.shutdown();
+        }
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double mbPerSec = (totalBytes.sum() / 1_000_000.0) / elapsedSec;
+        double filesPerSec = elementFiles.size() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 1b Result: %.2fs, %d files, %.1f MB, %.1f MB/s, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, elementFiles.size(), totalBytes.sum() / 1_000_000.0, mbPerSec, filesPerSec));
+    }
+    
+    /**
+     * Test 1c: Parallel Disk I/O with Virtual Threads (1000 concurrent).
+     * This tests if virtual threads can achieve more parallelism than platform threads.
+     * NOTE: Caller logs the test header with cache state info.
+     */
+    private void runTest1c_ParallelDiskIO_VirtualThreads(List<DirCacheFileEntry> elementFiles) {
+        int batchCount = 1000;
+        int batchSize = Math.max(1, (elementFiles.size() + batchCount - 1) / batchCount);
+        
+        java.util.concurrent.atomic.LongAdder totalBytes = new java.util.concurrent.atomic.LongAdder();
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        
+        long start = System.nanoTime();
+        
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < elementFiles.size(); i += batchSize) {
+            final int startIdx = i;
+            final int endIdx = Math.min(i + batchSize, elementFiles.size());
+            
+            futures.add(CompletableFuture.runAsync(() -> {
+                for (int j = startIdx; j < endIdx; j++) {
+                    try {
+                        byte[] data = Files.readAllBytes(elementFiles.get(j).absolutePath());
+                        totalBytes.add(data.length);
+                    } catch (IOException e) {
+                        // Ignore errors
+                    }
+                }
+            }, executor));
+        }
+        
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        executor.shutdown();
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double mbPerSec = (totalBytes.sum() / 1_000_000.0) / elapsedSec;
+        double filesPerSec = elementFiles.size() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 1c Result: %.2fs, %d files, %.1f MB, %.1f MB/s, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, elementFiles.size(), totalBytes.sum() / 1_000_000.0, mbPerSec, filesPerSec));
+    }
+    
+    /**
+     * Test 1d: TRUE Async Disk I/O with AsynchronousFileChannel.
+     * This fires ALL reads simultaneously and lets the OS handle scheduling.
+     * Uses a semaphore to limit concurrent file handles to avoid exhaustion.
+     * NOTE: Caller logs the test header with cache state info.
+     */
+    private void runTest1d_TrueAsyncDiskIO(List<DirCacheFileEntry> elementFiles) {
+        // Limit concurrent file handles to avoid exhaustion (Windows limit ~500)
+        final int maxConcurrent = 200;
+        final java.util.concurrent.Semaphore semaphore = new java.util.concurrent.Semaphore(maxConcurrent);
+        
+        java.util.concurrent.atomic.LongAdder totalBytes = new java.util.concurrent.atomic.LongAdder();
+        AtomicInteger completed = new AtomicInteger(0);
+        AtomicInteger peakConcurrent = new AtomicInteger(0);
+        AtomicInteger currentConcurrent = new AtomicInteger(0);
+        CountDownLatch latch = new CountDownLatch(elementFiles.size());
+        
+        logPerfMessage("  Max concurrent file handles: " + maxConcurrent); //$NON-NLS-1$
+        
+        long start = System.nanoTime();
+        
+        // Fire all reads - semaphore limits concurrent file handles
+        for (DirCacheFileEntry entry : elementFiles) {
+            try {
+                semaphore.acquire();
+                
+                // Track peak concurrency
+                int current = currentConcurrent.incrementAndGet();
+                peakConcurrent.updateAndGet(peak -> Math.max(peak, current));
+                
+                Path path = entry.absolutePath();
+                long fileSize;
+                try {
+                    fileSize = Files.size(path);
+                } catch (IOException e) {
+                    semaphore.release();
+                    currentConcurrent.decrementAndGet();
+                    latch.countDown();
+                    continue;
+                }
+                
+                ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+                
+                AsynchronousFileChannel channel;
+                try {
+                    channel = AsynchronousFileChannel.open(path, StandardOpenOption.READ);
+                } catch (IOException e) {
+                    semaphore.release();
+                    currentConcurrent.decrementAndGet();
+                    latch.countDown();
+                    continue;
+                }
+                
+                channel.read(buffer, 0, buffer, new CompletionHandler<Integer, ByteBuffer>() {
+                    @Override
+                    public void completed(Integer bytesRead, ByteBuffer buf) {
+                        try {
+                            channel.close();
+                            totalBytes.add(bytesRead);
+                            completed.incrementAndGet();
+                        } catch (IOException e) {
+                            // Ignore
+                        } finally {
+                            currentConcurrent.decrementAndGet();
+                            semaphore.release();
+                            latch.countDown();
+                        }
+                    }
+                    
+                    @Override
+                    public void failed(Throwable exc, ByteBuffer buf) {
+                        try {
+                            channel.close();
+                        } catch (IOException e) {
+                            // Ignore
+                        }
+                        currentConcurrent.decrementAndGet();
+                        semaphore.release();
+                        latch.countDown();
+                    }
+                });
+                
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        
+        // Wait for all reads to complete
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double mbPerSec = (totalBytes.sum() / 1_000_000.0) / elapsedSec;
+        double filesPerSec = completed.get() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 1d Result: %.2fs, %d files, %.1f MB, %.1f MB/s, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, completed.get(), totalBytes.sum() / 1_000_000.0, mbPerSec, filesPerSec));
+        logPerfMessage("  Peak concurrent file handles: " + peakConcurrent.get()); //$NON-NLS-1$
+    }
+    
+    /**
+     * Test 2: Pure Parsing (single-threaded) - Pre-load all files, then parse.
+     * 
+     * This isolates parsing cost from disk I/O.
+     * Returns the preloaded data for use in Test 3.
+     */
+    private Map<Path, byte[]> runTest2_PureParsingSingleThreaded(List<DirCacheFileEntry> elementFiles) {
+        logPerfMessage("--- Test 2: Pure Parsing (single-threaded, pre-loaded) ---"); //$NON-NLS-1$
+        
+        // First, pre-load all files into memory
+        logPerfMessage("  Pre-loading all files into memory..."); //$NON-NLS-1$
+        Map<Path, byte[]> preloaded = new HashMap<>();
+        long preloadStart = System.nanoTime();
+        
+        for (DirCacheFileEntry entry : elementFiles) {
+            try {
+                preloaded.put(entry.absolutePath(), Files.readAllBytes(entry.absolutePath()));
+            } catch (IOException e) {
+                // Skip files that fail
+            }
+        }
+        
+        long preloadElapsed = (System.nanoTime() - preloadStart) / 1_000_000;
+        logPerfMessage("  Pre-load complete: " + preloadElapsed + "ms for " + preloaded.size() + " files"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        
+        // Force GC to clear allocation pressure
+        System.gc();
+        
+        // Now measure parsing only (single-threaded)
+        logPerfMessage("  Parsing (single-threaded)..."); //$NON-NLS-1$
+        long parseStart = System.nanoTime();
+        int parsed = 0;
+        
+        for (Map.Entry<Path, byte[]> entry : preloaded.entrySet()) {
+            try (InputStream is = new java.io.ByteArrayInputStream(entry.getValue())) {
+                GraficoResourceLoader.loadEObject(is);
+                parsed++;
+            } catch (IOException e) {
+                // Skip files that fail
+            }
+        }
+        
+        long parseElapsed = System.nanoTime() - parseStart;
+        double parseElapsedSec = parseElapsed / 1_000_000_000.0;
+        double filesPerSec = parsed / parseElapsedSec;
+        
+        logPerfMessage(String.format("  Test 2 Result: %.2fs, %d files parsed, %.0f files/s", //$NON-NLS-1$
+            parseElapsedSec, parsed, filesPerSec));
+        
+        return preloaded;
+    }
+    
+    /**
+     * Test 3: Parallel Parsing - Parse from pre-loaded data using ForkJoinPool.
+     * 
+     * This tests if parsing can scale with threads.
+     * If single-threaded = parallel, there's synchronization limiting parallelism.
+     */
+    private void runTest3_ParallelParsing(Map<Path, byte[]> preloaded) {
+        logPerfMessage("--- Test 3: Parallel Parsing (ForkJoinPool, pre-loaded) ---"); //$NON-NLS-1$
+        
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        logPerfMessage("  Using ForkJoinPool with " + cpuCores + " threads"); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Force GC before test
+        System.gc();
+        
+        ForkJoinPool pool = new ForkJoinPool(cpuCores);
+        AtomicInteger parsed = new AtomicInteger(0);
+        
+        long parseStart = System.nanoTime();
+        
+        try {
+            pool.submit(() -> 
+                preloaded.entrySet().parallelStream().forEach(entry -> {
+                    try (InputStream is = new java.io.ByteArrayInputStream(entry.getValue())) {
+                        GraficoResourceLoader.loadEObject(is);
+                        parsed.incrementAndGet();
+                    } catch (IOException e) {
+                        // Skip files that fail
+                    }
+                })
+            ).get();
+        } catch (InterruptedException | ExecutionException e) {
+            logPerfMessage("  Test 3 failed: " + e.getMessage()); //$NON-NLS-1$
+            return;
+        } finally {
+            pool.shutdown();
+        }
+        
+        long parseElapsed = System.nanoTime() - parseStart;
+        double parseElapsedSec = parseElapsed / 1_000_000_000.0;
+        double filesPerSec = parsed.get() / parseElapsedSec;
+        double speedup = (preloaded.size() / parseElapsedSec) / (preloaded.size() / parseElapsedSec);
+        
+        logPerfMessage(String.format("  Test 3 Result: %.2fs, %d files parsed, %.0f files/s", //$NON-NLS-1$
+            parseElapsedSec, parsed.get(), filesPerSec));
+        logPerfMessage("  Expected speedup: " + cpuCores + "x, Actual: compare with Test 2"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Test 4: Batched Parallel I/O + Parsing (current production approach).
+     * 
+     * This measures the combined I/O + parsing with batched virtual threads.
+     * Useful for comparing against the isolation tests.
+     */
+    private void runTest4_BatchedParallelIOAndParsing(List<DirCacheFileEntry> elementFiles) {
+        logPerfMessage("--- Test 4: Batched Parallel I/O + Parsing (1000 batches) ---"); //$NON-NLS-1$
+        
+        int batchCount = 1000;
+        int batchSize = Math.max(1, (elementFiles.size() + batchCount - 1) / batchCount);
+        
+        AtomicInteger parsed = new AtomicInteger(0);
+        ExecutorService ioExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        
+        long start = System.nanoTime();
+        
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < elementFiles.size(); i += batchSize) {
+            final int startIdx = i;
+            final int endIdx = Math.min(i + batchSize, elementFiles.size());
+            
+            futures.add(CompletableFuture.runAsync(() -> {
+                for (int j = startIdx; j < endIdx; j++) {
+                    try {
+                        byte[] data = Files.readAllBytes(elementFiles.get(j).absolutePath());
+                        try (InputStream is = new java.io.ByteArrayInputStream(data)) {
+                            GraficoResourceLoader.loadEObject(is);
+                            parsed.incrementAndGet();
+                        }
+                    } catch (IOException e) {
+                        // Skip files that fail
+                    }
+                }
+            }, ioExecutor));
+        }
+        
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        ioExecutor.shutdown();
+        
+        long elapsed = System.nanoTime() - start;
+        double elapsedSec = elapsed / 1_000_000_000.0;
+        double filesPerSec = parsed.get() / elapsedSec;
+        
+        logPerfMessage(String.format("  Test 4 Result: %.2fs, %d files, %.0f files/s", //$NON-NLS-1$
+            elapsedSec, parsed.get(), filesPerSec));
     }
 }

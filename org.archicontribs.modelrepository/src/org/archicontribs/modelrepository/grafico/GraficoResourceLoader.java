@@ -11,12 +11,15 @@ import java.io.InputStream;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.common.util.URI;
 import org.eclipse.emf.ecore.EObject;
+import org.eclipse.emf.ecore.xmi.XMLParserPool;
 import org.eclipse.emf.ecore.xmi.XMLResource;
+import org.eclipse.emf.ecore.xmi.impl.XMLParserPoolImpl;
 import org.eclipse.emf.ecore.xmi.impl.XMLResourceImpl;
 
 import com.archimatetool.editor.model.compatibility.IncompatibleModelException;
@@ -30,7 +33,12 @@ import com.archimatetool.model.IIdentifier;
  * <ul>
  *   <li>Parser features map is cached as a static immutable map (not recreated per file)</li>
  *   <li>Load options are applied efficiently without creating new maps per call</li>
+ *   <li>SAXParser pooling via {@code OPTION_USE_PARSER_POOL} eliminates parser creation overhead</li>
+ *   <li>XML name to feature map caching via {@code OPTION_USE_XML_NAME_TO_FEATURE_MAP} speeds up schema lookups</li>
+ *   <li>Handler caching reuses XMLDefaultHandler instances across parse operations</li>
  * </ul>
+ * 
+ * <p>The parser pool is thread-safe and sized for concurrent access (2x CPU cores).</p>
  */
 public class GraficoResourceLoader {
     
@@ -51,8 +59,25 @@ public class GraficoResourceLoader {
     }
     
     /**
+     * Thread-safe parser pool for SAXParser reuse.
+     * Sized to match typical concurrency level (2x CPU cores).
+     * This dramatically improves performance by avoiding SAXParserFactory synchronization.
+     */
+    private static final XMLParserPool PARSER_POOL = new XMLParserPoolImpl(
+        Runtime.getRuntime().availableProcessors() * 2,  // Pool size matches concurrency
+        true  // Also cache XMLDefaultHandler instances
+    );
+    
+    /**
+     * Cached feature map for XML name to EStructuralFeature lookups.
+     * Shared across all loads to cache schema lookups.
+     * Thread-safe and non-blocking for reads (unlike synchronizedMap).
+     */
+    private static final Map<Object, Object> XML_NAME_TO_FEATURE_MAP = new ConcurrentHashMap<>();
+    
+    /**
      * Cached load options - reused for all file loads to avoid per-file map creation.
-     * Combines encoding and parser features in a single immutable map.
+     * Combines encoding, parser features, parser pool, and feature caching.
      */
     private static final Map<Object, Object> LOAD_OPTIONS;
     
@@ -60,6 +85,17 @@ public class GraficoResourceLoader {
         Map<Object, Object> opts = new HashMap<>();
         opts.put(XMLResource.OPTION_ENCODING, "UTF-8"); //$NON-NLS-1$
         opts.put(XMLResource.OPTION_PARSER_FEATURES, PARSER_FEATURES);
+        
+        // Performance optimizations - see PERFORMANCE_ARCHITECTURE.md
+        // Parser pool eliminates SAXParserFactory synchronization (~100-1000μs per parse saved)
+        opts.put(XMLResource.OPTION_USE_PARSER_POOL, PARSER_POOL);
+        
+        // Cache XML element name -> EStructuralFeature lookups (significant for repeated schema elements)
+        opts.put(XMLResource.OPTION_USE_XML_NAME_TO_FEATURE_MAP, XML_NAME_TO_FEATURE_MAP);
+        
+        // Required when using parser pool - uses modern namespace-aware code paths
+        opts.put(XMLResource.OPTION_USE_DEPRECATED_METHODS, Boolean.FALSE);
+        
         LOAD_OPTIONS = Collections.unmodifiableMap(opts);
     }
 

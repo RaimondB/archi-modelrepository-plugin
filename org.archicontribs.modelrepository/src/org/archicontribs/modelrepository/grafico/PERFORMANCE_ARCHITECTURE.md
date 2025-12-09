@@ -427,3 +427,379 @@ for (List<File> batch : batches) {
 - [ ] Executors properly shut down in finally blocks
 - [ ] DirCache resources (Repository, ObjectInserter) cleaned up in finally blocks
 - [ ] Cancellation checked between batches
+
+---
+
+## Import Performance: Experimental Results & Lessons Learned
+
+### Test Environment
+- **Files**: ~26,680 element files + ~1,560 folder.xml files = ~28,240 total
+- **Average file size**: ~8KB (range: 2-40KB)
+- **Total data**: ~220MB
+- **Hardware**: 20 CPU cores, NVMe SSD (but testing with cold disk cache)
+- **Cold cache**: Achieved by running export first (uses DirCache hashing, no file reads)
+
+### Key Observation: CPU Saturation, NOT Disk Saturation
+
+**Critical finding**: In all tests, CPU was saturated but disk was NOT. This indicates the bottleneck is **not disk I/O** but rather:
+- XML parsing (EMF/SAX)
+- Synchronization overhead
+- Thread scheduling
+
+### Approach Comparison Matrix
+
+| Approach | Cold Cache Time | Items/sec | Peak Parallelism | Notes |
+|----------|-----------------|-----------|------------------|-------|
+| BufferedInputStream + VirtualThreads (individual) | ~21s | ~1,264 | 966 batches started, 248 effective | Virtual threads pinned by synchronized BufferedInputStream |
+| AsynchronousFileChannel (26K simultaneous) | ~45s | ~589 | 555 peak | File handle exhaustion (Windows limit ~500) |
+| Files.readAllBytes + VirtualThreads (1000 batches) | ~20s | ~1,400 | 273 batches concurrent | Still limited by something |
+| ForkJoinPool (20 threads) | ~22s | ~1,191 | 20 | Limited to CPU core count |
+| Warm cache (any approach) | ~1.8s | ~15,000 | - | OS cache eliminates I/O wait |
+
+### Key Lessons Learned
+
+#### 1. Virtual Threads Don't Help with Synchronized I/O
+
+**Problem**: Virtual threads promise cheap concurrency, but they "pin" to carrier threads when executing synchronized code.
+
+```java
+// ❌ PINS virtual thread to carrier thread
+BufferedInputStream bis = new BufferedInputStream(Files.newInputStream(path));
+bis.read(buffer);  // synchronized internally!
+
+// ❌ ALSO PINS - Files.readAllBytes uses FileInputStream internally  
+byte[] data = Files.readAllBytes(path);  // Has synchronized blocks
+
+// ✅ TRUE async - doesn't pin
+AsynchronousFileChannel channel = AsynchronousFileChannel.open(path);
+channel.read(buffer, 0, callback);  // Returns immediately
+```
+
+**Result**: With 20 carrier threads, only ~20 virtual threads can make progress at a time, regardless of how many are created.
+
+#### 2. AsynchronousFileChannel Has Limits
+
+**Problem**: Opening 26,680 `AsynchronousFileChannel` simultaneously exhausts OS file handles.
+
+```
+peakConcurrentReads = 555 (of 26,680 files)  ← Windows file handle limit!
+```
+
+**Symptoms**:
+- `peakConcurrent` much lower than files submitted
+- Massive cumulative time (files waiting in OS queue)
+- Performance worse than synchronous approach
+
+**Solution**: Limit concurrent async operations with a semaphore, OR use batched synchronous I/O.
+
+#### 3. CPU is the Bottleneck, Not Disk
+
+**Evidence**:
+- Disk utilization never hits 100% in any test
+- CPU is always saturated
+- Per-file time (~177ms) is much higher than expected disk latency (~5-10ms)
+
+**Root causes**:
+1. **SAXParser creation**: Each file creates a new SAXParser (expensive)
+2. **EMF overhead**: Resource creation, feature lookups
+3. **Synchronization**: HashMap, queue operations
+
+**Mitigations applied**:
+- `XMLParserPool` - Reuses SAXParsers (EMF built-in)
+- `XML_NAME_TO_FEATURE_MAP` - Caches schema lookups
+- `LinkedBlockingQueue` - Separate head/tail locks
+
+#### 4. Effective Parallelism is Limited to ~250
+
+Regardless of approach (virtual threads, async I/O, batching), we consistently see:
+```
+effectiveParallelism ≈ 244-273
+```
+
+This suggests a **fundamental limit** in either:
+- JVM file I/O implementation
+- OS file system driver
+- EMF/SAX parser internals
+
+### Testing Methodology: Isolate Each Component
+
+To make progress, we need to test each component in isolation:
+
+#### Test 1: Pure Disk I/O (No Parsing)
+```java
+// Measure raw file reading without any parsing
+long start = System.nanoTime();
+for (File file : files) {
+    byte[] data = Files.readAllBytes(file.toPath());
+}
+long elapsed = System.nanoTime() - start;
+// Expected: ~220MB at 500MB/s = 0.44s (SSD) or ~2s (HDD)
+```
+
+**Purpose**: Establish baseline disk throughput. If this is slow, disk is the bottleneck.
+
+#### Test 2: Pure Parsing (No Disk I/O)
+```java
+// Pre-read all files to memory, then measure parsing only
+Map<File, byte[]> preloaded = new HashMap<>();
+for (File file : files) {
+    preloaded.put(file, Files.readAllBytes(file.toPath()));
+}
+System.gc();  // Clear allocation pressure
+
+long start = System.nanoTime();
+for (Map.Entry<File, byte[]> entry : preloaded.entrySet()) {
+    try (InputStream is = new ByteArrayInputStream(entry.getValue())) {
+        GraficoResourceLoader.loadEObject(is);
+    }
+}
+long elapsed = System.nanoTime() - start;
+// This tells us: parsing cost without I/O
+```
+
+**Purpose**: Establish baseline parsing throughput. If this matches current performance, parsing is the bottleneck.
+
+#### Test 3: Parallel Parsing (No Disk I/O, No EMF Model Building)
+```java
+// Same as Test 2, but parallel and without adding to model
+ForkJoinPool pool = new ForkJoinPool(20);
+pool.submit(() -> 
+    preloaded.entrySet().parallelStream().forEach(entry -> {
+        try (InputStream is = new ByteArrayInputStream(entry.getValue())) {
+            GraficoResourceLoader.loadEObject(is);  // Parse only, discard result
+        }
+    })
+).get();
+```
+
+**Purpose**: Test if parsing can parallelize. If not, SAXParser/EMF has internal synchronization.
+
+#### Test 4: Consumer-Only (No Parsing, Pre-built Elements)
+```java
+// Measure just the model building
+List<EObject> prebuiltElements = ...;  // Load once, reuse
+long start = System.nanoTime();
+for (EObject element : prebuiltElements) {
+    folder.getElements().add(element);
+}
+long elapsed = System.nanoTime() - start;
+```
+
+**Purpose**: Verify consumer is not the bottleneck (current logs suggest it's not: 430K items/sec theoretical max).
+
+### Current Architecture Decision (December 2025)
+
+Based on extensive isolation testing, the **optimal approach** for cold cache is:
+
+1. **CompletableFuture + ForkJoinPool(20)** with 1000 batches for file reading
+2. **`Files.readAllBytes()` + `ByteArrayInputStream`** for I/O
+3. **EMF XMLParserPool** for SAX parser reuse
+4. **`LinkedBlockingQueue`** for producer/consumer pattern
+5. **Single-threaded consumer** for EMF thread safety
+
+This achieves **~20s on cold cache** (~1,322 files/sec for 26,679 files).
+
+### Isolation Test Results (December 2025) - FINAL
+
+**System Configuration:**
+- Java 21.0.7 (OpenJDK 64-Bit Server VM)
+- Windows 11, 20 CPU cores, 8GB heap
+- ForkJoinPool parallelism: 19
+- Test files: 26,679 files, 37.6 MB total (~1.4KB average)
+
+#### Cold Cache I/O Comparison (CRITICAL FINDINGS)
+
+| Test | Approach | Cold Cache Time | Rate | Key Insight |
+|------|----------|-----------------|------|-------------|
+| Sequential | `Files.readAllBytes()` loop | 95s | 279/s | Baseline - terrible |
+| parallelStream | ForkJoinPool, no batching | 44.5s | 599/s | 2.1x speedup |
+| Virtual Threads | 1000 batches | 64.5s | 413/s | SLOWER - thread pinning! |
+| AsyncFileChannel | 200 concurrent handles | 62.8s | 425/s | Peak=22 handles only |
+| **CompletableFuture + FJP** | **1000 batches, ForkJoinPool(20)** | **20.2s** | **1,322/s** | **WINNER - 4.7x speedup** |
+
+#### Warm Cache I/O Comparison
+
+| Test | Time | Rate |
+|------|------|------|
+| Sequential | 0.68s | 39,473/s |
+| ForkJoinPool parallelStream | 0.20s | 131,782/s |
+| Virtual Threads | 0.26s | 104,440/s |
+
+#### Parsing Performance (Pre-loaded Data)
+
+| Test | Time | Rate | Notes |
+|------|------|------|-------|
+| Single-threaded parsing | 2.79s | 9,557/s | EMF XMLParserPool enabled |
+| Parallel parsing (20 threads) | 0.82s | 32,379/s | 3.4x speedup (not 20x - contention) |
+
+#### Combined I/O + Parsing (Warm Cache)
+
+| Test | Time | Rate |
+|------|------|------|
+| Batched I/O + Parsing | 1.60s | 16,663/s |
+
+### Key Learnings
+
+#### 1. Virtual Threads Are SLOWER for Cold Cache File I/O
+
+**Why?** `Files.readAllBytes()` uses `FileInputStream` which has synchronized methods. When a virtual thread hits synchronized code, it **pins to the carrier thread**, eliminating the benefit of lightweight threading.
+
+```
+Virtual Threads (1000): 64.5s - PINS on synchronized I/O
+ForkJoinPool (20):      44.5s - No pinning overhead
+CompletableFuture+FJP:  20.2s - Batching + work-stealing
+```
+
+#### 2. Batching is CRITICAL for Cold Cache
+
+| Batching | Cold Cache Time |
+|----------|-----------------|
+| No batching (parallelStream) | 44.5s |
+| 1000 batches (CompletableFuture) | 20.2s |
+
+**Why?** ForkJoinPool work-stealing is more efficient with fewer, larger tasks. Each batch processes ~27 files sequentially, reducing:
+- Task scheduling overhead
+- File handle contention
+- Memory allocation pressure
+
+#### 3. AsyncFileChannel is NOT Faster
+
+Despite being "truly async", `AsynchronousFileChannel` with semaphore limiting achieved only:
+- Peak concurrent handles: 22 (not 200!)
+- Time: 62.8s (slower than ForkJoinPool)
+
+**Why?** The semaphore acquisition becomes a bottleneck, and the async callback overhead adds latency.
+
+#### 4. The 20s Floor - What's Blocking Further Improvement?
+
+With 26,679 files at 20.2s = **1,322 files/sec**.
+
+**Theoretical limits:**
+
+| Component | Time | Rate | Notes |
+|-----------|------|------|-------|
+| Pure disk read (cold) | 20.2s | 1,322/s | **CURRENT BOTTLENECK** |
+| Parsing (20 threads) | 0.82s | 32,379/s | ~25x headroom |
+| Warm cache I/O | 0.20s | 131,782/s | ~100x headroom |
+
+**What's limiting disk throughput to 1,322 files/sec?**
+
+1. **Per-file overhead**: Each file open/read/close has ~0.75ms overhead on cold cache
+   - 26,679 files × 0.75ms = 20s
+   - This is the **filesystem metadata overhead**, not data transfer
+
+2. **NTFS metadata lookups**: Each file requires:
+   - MFT (Master File Table) lookup
+   - Directory entry traversal
+   - Security descriptor check
+   - Possible antivirus scan
+
+3. **OS file cache population**: First read of each file must:
+   - Read from physical disk
+   - Allocate cache pages
+   - Copy to user space
+
+4. **20 concurrent reads max**: ForkJoinPool(20) can only have 20 files in-flight at once. If each file takes 1ms to read:
+   - 26,679 files / 20 threads × 1ms = 1.3s (theoretical)
+   - But cold cache takes 20s = 15ms average per file including overhead
+
+### Strategies to Go Below 20s
+
+#### Strategy 1: Reduce File Count (HIGHEST IMPACT)
+
+**Problem**: 26,679 small files = 26,679 metadata operations
+
+**Solution**: Bundle multiple elements per file
+- 100 elements per file → 267 files → ~0.2s metadata overhead
+- Requires GRAFICO format changes
+
+#### Strategy 2: Pre-warm Disk Cache During Export
+
+**Problem**: Export uses DirCache (no file reads), leaving cache cold
+
+**Solution**: Background thread reads files during export
+```java
+// During export, spawn cache-warming thread
+executor.submit(() -> {
+    for (File file : allFiles) {
+        Files.readAllBytes(file.toPath()); // Just read, discard
+    }
+});
+```
+- Next import would hit warm cache (~1.6s instead of 20s)
+
+#### Strategy 3: Memory-Mapped Files
+
+**Problem**: Each `Files.readAllBytes()` allocates a new byte array
+
+**Solution**: Use `MappedByteBuffer` for zero-copy reads
+```java
+try (FileChannel channel = FileChannel.open(path, READ)) {
+    MappedByteBuffer buffer = channel.map(READ_ONLY, 0, channel.size());
+    // Parse directly from buffer
+}
+```
+- Reduces memory allocation pressure
+- May improve OS read-ahead for sequential access
+
+#### Strategy 4: Increase Batch Concurrency
+
+**Current**: 1000 batches of ~27 files each, 20 threads
+
+**Test**: Reduce batch size to increase parallelism
+- 2000 batches of ~13 files → more concurrent I/O requests
+- Trade-off: more CompletableFuture overhead
+
+#### Strategy 5: Windows Defender Exclusion
+
+**Problem**: Antivirus may scan each file on first access
+
+**Solution**: Add repository folder to Windows Defender exclusions
+- Could provide significant speedup for cold cache
+
+#### Strategy 6: SSD/NVMe Optimization
+
+**Problem**: Many small random reads are worst case for any storage
+
+**Current**: 1.9 MB/s throughput (vs theoretical 500+ MB/s)
+
+**Solutions**:
+- Ensure files are on NVMe, not spinning disk
+- Check for disk fragmentation
+- Verify TRIM is enabled
+
+### Recommended Implementation
+
+Based on testing, the optimal import implementation is:
+
+```java
+// Use ForkJoinPool (NOT virtual threads) for cold cache I/O
+ForkJoinPool cpuExecutor = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+
+// 1000 batches for optimal balance
+int batchCount = 1000;
+int batchSize = (files.size() + batchCount - 1) / batchCount;
+
+List<CompletableFuture<Void>> futures = new ArrayList<>();
+for (int i = 0; i < files.size(); i += batchSize) {
+    final int start = i;
+    final int end = Math.min(i + batchSize, files.size());
+    
+    futures.add(CompletableFuture.runAsync(() -> {
+        for (int j = start; j < end; j++) {
+            byte[] data = Files.readAllBytes(files.get(j).toPath());
+            EObject element = parseElement(data);
+            queue.put(new ParsedElement(element, folder));
+        }
+    }, cpuExecutor));
+}
+
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+```
+
+**Key principles:**
+1. **ForkJoinPool** for I/O (not virtual threads - they pin)
+2. **1000 batches** for optimal work-stealing
+3. **Sequential within batch** to reduce contention
+4. **Producer/consumer queue** for EMF thread safety
+

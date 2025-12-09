@@ -495,6 +495,244 @@ if (useDirCache) {
 
 ---
 
+## Executor Choice: ForkJoinPool vs Virtual Threads for I/O
+
+### The Problem
+
+When processing 26,680 files with 1000 batches, choosing the wrong executor drastically limits throughput:
+
+| Executor | Concurrent Operations | Cold Cache Result |
+|----------|----------------------|-------------------|
+| `ForkJoinPool(20)` | 20 (CPU cores) | 1,191 items/sec |
+| Virtual Threads | 1000 (batch count) | 1,721 items/sec |
+
+**Why ForkJoinPool failed**: It's sized for CPU-bound work (cores = 20). With 1000 batches submitted, only 20 could run concurrently. Each file read takes ~17ms on cold cache, so throughput was limited to:
+
+```
+20 threads × (1000ms / 17ms per file) ≈ 1,176 files/sec
+```
+
+This matched the observed 1,191 items/sec exactly.
+
+### Solution: Use Virtual Threads for I/O-Bound Batches
+
+```java
+// ❌ WRONG: ForkJoinPool limits concurrent I/O to CPU core count
+batchFutures.add(CompletableFuture.runAsync(() -> {
+    for (int j = start; j < end; j++) {
+        readParseAndQueueStreaming(elementFiles.get(j), ...);
+    }
+}, fCpuExecutor));  // Only 20 concurrent batches!
+
+// ✅ CORRECT: Virtual threads allow all 1000 batches to run concurrently
+batchFutures.add(CompletableFuture.runAsync(() -> {
+    for (int j = start; j < end; j++) {
+        readParseAndQueueStreaming(elementFiles.get(j), ...);
+    }
+}, fIoExecutor));  // 1000 concurrent batches, each blocking on I/O
+```
+
+### Performance Results (Cold Cache, 26,680 files)
+
+| Approach | Time | Rate | Improvement |
+|----------|------|------|-------------|
+| ForkJoinPool(20) | 22.4s | 1,191/sec | baseline |
+| Virtual Threads (1000 batches) | 15.5s | 1,721/sec | **+44%** |
+
+### Key Metrics to Watch
+
+From the performance logs:
+
+1. **`readParse` cumulative time**: Total time spent reading/parsing across all threads
+   - Virtual threads: 3,813,430ms cumulative / 1000 batches ≈ 3.8s per batch
+   - Divided by wall-clock 15.5s = high parallelism achieved
+
+2. **`queuePut` cumulative time**: 4,936,127ms indicates queue contention is now the bottleneck
+   - 1000 producers fighting for `ArrayBlockingQueue(2000)` lock
+   - Next optimization: consider `LinkedBlockingQueue` or larger capacity
+
+3. **`pollSuccess` time**: 15,333ms - consumer spends most time waiting for queue
+   - Consumer is NOT the bottleneck (add=130ms, lookup=34ms are fast)
+   - Producers aren't filling queue fast enough (queue contention from put())
+
+### The Pipeline Math
+
+With virtual threads:
+```
+readParse cumulative = 3,813,430ms
+Number of files = 26,680
+Per-file average = 142,932μs ≈ 143ms (includes I/O wait + parse)
+
+Wall clock = 15.5s
+Effective parallelism = 3,813,430ms / 15,500ms ≈ 246 concurrent operations
+```
+
+This is lower than expected 1000 - the `ArrayBlockingQueue` put() contention limits actual parallelism.
+
+### Remaining Bottleneck: Queue Contention
+
+The `queuePut` cumulative time (4,936,127ms) exceeds even `readParse` time (3,813,430ms). This indicates:
+- 1000 virtual threads competing for queue lock
+- `ArrayBlockingQueue` uses a single `ReentrantLock` for all operations
+- Each put() must acquire the lock, even when queue isn't full
+
+**Future optimization**: Consider:
+1. `LinkedBlockingQueue` - separate locks for head/tail
+2. `ConcurrentLinkedQueue` with separate counter - lock-free
+3. Multiple queues (one per N batches) - reduces contention
+
+### Where This Applies
+
+- `GraficoModelImporter.loadModelWithDirCache()` - Phase2 element loading
+- Any future bulk file I/O operations
+
+---
+
+## EMF Parser Pool and Feature Map Caching
+
+### The Problem
+
+When parsing 26,679 XML files concurrently, two bottlenecks emerged:
+
+1. **SAXParserFactory synchronization**: Each parse calls `SAXParserFactory.newInstance()` which is synchronized
+2. **Repeated schema lookups**: EMF resolves XML element names to EStructuralFeature for each element, each file
+
+With virtual threads (1000 concurrent batches), the synchronized SAXParserFactory became a bottleneck:
+- Only ~20-30 effective parallel operations despite 1000 virtual threads
+- CPU exhausted but disk NOT saturated (classic CPU-bound bottleneck)
+
+### Solution
+
+EMF provides built-in options for parser and handler pooling:
+
+```java
+// Thread-safe parser pool - sized for concurrent access
+private static final XMLParserPool PARSER_POOL = new XMLParserPoolImpl(
+    Runtime.getRuntime().availableProcessors() * 2,  // Pool size matches concurrency
+    true  // Also cache XMLDefaultHandler instances
+);
+
+// Feature map caching - shared across all loads
+private static final Map<Object, Object> XML_NAME_TO_FEATURE_MAP = 
+    Collections.synchronizedMap(new HashMap<>());
+
+// Add to LOAD_OPTIONS
+opts.put(XMLResource.OPTION_USE_PARSER_POOL, PARSER_POOL);
+opts.put(XMLResource.OPTION_USE_XML_NAME_TO_FEATURE_MAP, XML_NAME_TO_FEATURE_MAP);
+opts.put(XMLResource.OPTION_USE_DEPRECATED_METHODS, Boolean.FALSE);  // Required with pool
+```
+
+**Key benefits:**
+- `OPTION_USE_PARSER_POOL`: Eliminates SAXParser creation overhead (~100-1000μs per file)
+- `OPTION_USE_XML_NAME_TO_FEATURE_MAP`: Caches schema lookups (significant for repeated elements)
+- `OPTION_USE_DEPRECATED_METHODS = false`: Required when using parser pool, uses modern code paths
+
+### Important Considerations
+
+1. **Parser pool is thread-safe**: `XMLParserPoolImpl` is explicitly documented as thread-safe
+2. **Pool sizing**: Size should match max concurrency (we use 2x CPU cores)
+3. **Handler caching**: Set `useHandlerCache=true` for additional optimization
+4. **Feature map is shared**: All loads benefit from cached schema lookups
+
+### Where This Applies
+
+- `GraficoResourceLoader.java` - Static LOAD_OPTIONS with pool configuration
+- Any EMF XMLResource loading that needs high throughput
+
+---
+
+## Executor Choice: Lessons from Import Optimization (UPDATED December 2025)
+
+### The Problem
+
+When optimizing the import of ~26,680 files, we tried multiple concurrency approaches. Each had different tradeoffs:
+
+| Approach | Cold Cache Time | Rate | Why |
+|----------|-----------------|------|-----|
+| Sequential | 95s | 279/s | Baseline - no parallelism |
+| parallelStream (no batching) | 44.5s | 599/s | 2.1x speedup |
+| Virtual Threads (1000 batches) | 64.5s | 413/s | **SLOWER** - thread pinning! |
+| AsyncFileChannel (200 handles) | 62.8s | 425/s | Peak=22 handles only |
+| **CompletableFuture + ForkJoinPool** | **20.2s** | **1,322/s** | **WINNER - 4.7x speedup** |
+
+### Key Findings (CRITICAL)
+
+1. **Virtual Threads are SLOWER than ForkJoinPool for cold cache file I/O!**
+   - `Files.readAllBytes()` uses synchronized methods
+   - Virtual threads PIN to carrier threads on synchronized code
+   - Result: Only ~20 effective threads despite 1000 virtual threads
+
+2. **Batching is CRITICAL for performance**
+   - parallelStream (no batching): 44.5s
+   - CompletableFuture with 1000 batches: 20.2s
+   - **2x improvement from batching alone!**
+
+3. **AsyncFileChannel doesn't help**
+   - Despite "true async", semaphore overhead makes it slower
+   - Peak concurrent handles: 22 (not 200 as configured)
+
+4. **The 20s floor is disk metadata overhead**
+   - 26,679 files × ~0.75ms per file = 20s
+   - This is NTFS MFT lookups, not data transfer
+   - Throughput: 1.9 MB/s (vs 500+ MB/s theoretical)
+
+### Current Recommendation (CHANGED)
+
+Use **CompletableFuture + ForkJoinPool** (NOT virtual threads):
+
+```java
+ForkJoinPool pool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
+int batchCount = 1000;
+int batchSize = (files.size() + batchCount - 1) / batchCount;
+
+List<CompletableFuture<Void>> futures = new ArrayList<>();
+for (int i = 0; i < files.size(); i += batchSize) {
+    final int start = i;
+    final int end = Math.min(i + batchSize, files.size());
+    
+    futures.add(CompletableFuture.runAsync(() -> {
+        for (int j = start; j < end; j++) {
+            byte[] data = Files.readAllBytes(files.get(j).toPath());
+            // Process data...
+        }
+    }, pool));
+}
+
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+```
+
+**Key principles:**
+1. **ForkJoinPool** for I/O (not virtual threads - they pin on synchronized I/O)
+2. **1000 batches** for optimal work-stealing
+3. **Sequential within batch** to reduce contention
+4. **Producer/consumer queue** for EMF thread safety
+
+### Performance Comparison (Cold Cache)
+
+| Executor | Batching | Time | Rate |
+|----------|----------|------|------|
+| ForkJoinPool + parallelStream | No | 44.5s | 599/s |
+| Virtual Threads | 1000 batches | 64.5s | 413/s |
+| **ForkJoinPool + CompletableFuture** | **1000 batches** | **20.2s** | **1,322/s** |
+
+### Strategies to Go Below 20s
+
+The 20s floor is caused by per-file metadata overhead. Possible solutions:
+
+1. **Reduce file count** - Bundle elements (requires format change)
+2. **Pre-warm cache during export** - Background thread reads files
+3. **Windows Defender exclusion** - May reduce scanning overhead
+4. **Memory-mapped files** - `MappedByteBuffer` for zero-copy
+5. **Increase batch concurrency** - Test with more batches
+
+### Where This Applies
+
+- `GraficoModelImporter.loadModelWithDirCache()` - Phase2 element loading
+- `GraficoModelImporter.readParseAndQueueStreaming()` - File reading method
+- Any future bulk file I/O operations
+
+---
+
 ## Keeping This Document Updated
 
 **INSTRUCTION FOR AI ASSISTANTS AND DEVELOPERS:**
