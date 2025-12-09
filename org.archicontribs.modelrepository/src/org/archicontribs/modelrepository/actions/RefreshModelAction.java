@@ -17,6 +17,7 @@ import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
+import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -171,6 +172,8 @@ public class RefreshModelAction extends AbstractModelAction {
         // Then offer to Commit
         if(getRepository().hasChangesToCommit()) {
             if(!offerToCommitChanges()) {
+                // User cancelled commit dialog - reset staged changes
+                getRepository().resetToRef(IGraficoConstants.HEAD);
                 return USER_CANCEL;
             }
             notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);

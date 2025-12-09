@@ -8,6 +8,7 @@ package org.archicontribs.modelrepository.actions;
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
+import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.ui.IWorkbenchWindow;
@@ -68,6 +69,10 @@ public class CommitModelAction extends AbstractModelAction {
             if(getRepository().hasChangesToCommit()) {
                 if(offerToCommitChanges()) {
                     notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
+                }
+                else {
+                    // User cancelled commit dialog - reset staged changes
+                    getRepository().resetToRef(IGraficoConstants.HEAD);
                 }
             }
             else {

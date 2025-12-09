@@ -10,6 +10,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
@@ -17,6 +18,8 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 
@@ -36,7 +39,6 @@ import org.eclipse.jgit.api.PullCommand;
 import org.eclipse.jgit.api.PullResult;
 import org.eclipse.jgit.api.PushCommand;
 import org.eclipse.jgit.api.RemoteAddCommand;
-import org.eclipse.jgit.api.ResetCommand;
 import org.eclipse.jgit.api.ResetCommand.ResetType;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -169,10 +171,8 @@ public class ArchiRepository implements IArchiRepository {
             checkDeleteLockFile();
             
             // Add modified files to index
-            AddCommand addCommand = git.add();
-            addCommand.addFilepattern(".");
-            addCommand.setUpdate(false);
-            addCommand.call();
+            // Try native Git first (much faster for large repos), falls back to JGit automatically
+            gitAdd();
             
             // Add missing files to index
             for(String s : status.getMissing()) {
@@ -191,6 +191,23 @@ public class ArchiRepository implements IArchiRepository {
     
     @Override
     public void cloneModel(String repoURL, UsernamePassword npw, ProgressMonitor monitor) throws GitAPIException, IOException {
+        // Try native Git for SSH repositories (faster and credentials handled by SSH agent/config)
+        // For HTTPS, we need JGit's credential handling
+        boolean useNativeGit = GraficoUtils.isSSH(repoURL);
+        
+        if(useNativeGit) {
+            try {
+                // Use native git + JGit state sync
+                nativeGitClone(repoURL, getLocalRepositoryFolder(), 
+                    repository -> setDefaultConfigSettings(repository));
+                return; // Success with native git
+            }
+            catch(IOException ex) {
+                // Native git failed, fall through to JGit
+            }
+        }
+        
+        // Fall back to JGit (or HTTPS which requires credential handling)
         CloneCommand cloneCommand = Git.cloneRepository();
         cloneCommand.setDirectory(getLocalRepositoryFolder());
         cloneCommand.setURI(repoURL);
@@ -317,21 +334,20 @@ public class ArchiRepository implements IArchiRepository {
     }
 
     @Override
-    public void resetToRef(String ref) throws IOException, GitAPIException {
+    public void resetToRef(String ref, ResetType resetType) throws IOException, GitAPIException {
         // Check lock file is deleted
         checkDeleteLockFile();
         
-        try(Git git = Git.open(getLocalRepositoryFolder())) {
-            // Reset to master
-            ResetCommand resetCommand = git.reset();
-            resetCommand.setRef(ref);
-            resetCommand.setMode(ResetType.HARD);
-            resetCommand.call();
-            
-            // Clean extra files
-            CleanCommand cleanCommand = git.clean();
-            cleanCommand.setCleanDirectories(true);
-            cleanCommand.call();
+        // Reset using local method (tries native git, falls back to JGit automatically)
+        gitReset(ref, resetType);
+        
+        // Clean extra files only for HARD resets
+        if(resetType == ResetType.HARD) {
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                CleanCommand cleanCommand = git.clean();
+                cleanCommand.setCleanDirectories(true);
+                cleanCommand.call();
+            }
         }
     }
     
@@ -391,12 +407,10 @@ public class ArchiRepository implements IArchiRepository {
                         // Stage modified files to index (20% of progress)
                         // This can take a long time for large repos!
                         progress.subTask(Messages.ArchiRepository_2);
-                        try(Git git = Git.open(getLocalRepositoryFolder())) {
-                            AddCommand addCommand = git.add();
-                            addCommand.addFilepattern("."); //$NON-NLS-1$
-                            addCommand.setUpdate(false);
-                            addCommand.call();
-                        }
+                        
+                        // Try native Git first (much faster for large repos), falls back to JGit automatically
+                        gitAdd();
+                        
                         progress.worked(20);
                     }
                     catch(IOException | GitAPIException ex) {
@@ -653,6 +667,370 @@ public class ArchiRepository implements IArchiRepository {
         File lockFile = new File(getLocalGitFolder(), "index.lock");
         if(lockFile.exists() && lockFile.canWrite()) {
             lockFile.delete();
+        }
+    }
+    
+    // ====================================================================================
+    // Native Git Utility Methods
+    // ====================================================================================
+    
+    /**
+     * Checkout a branch using native Git (faster) or JGit fallback.
+     * After successful native operation, opens the repository to sync JGit state.
+     * 
+     * @param branchName the branch name to checkout (can be full ref like "refs/heads/main" or short name like "main")
+     * @throws IOException if the checkout command failed
+     * @throws GitAPIException if JGit fallback fails
+     */
+    public void checkoutBranch(String branchName) throws IOException, GitAPIException {
+        // Native git needs short name (e.g., "main"), JGit can use full ref (e.g., "refs/heads/main")
+        String shortName = extractShortBranchName(branchName);
+        
+        boolean nativeSuccess = tryNativeGitCheckout(shortName);
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit - can use either full or short name
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                git.checkout().setName(branchName).call();
+            }
+        }
+        else {
+            // After native Git operation, open repository to sync JGit state
+            // This is critical for triggering UI updates and ensuring JGit sees the changes
+            Git.open(getLocalRepositoryFolder()).close();
+        }
+    }
+    
+    /**
+     * Extract short branch name from full ref or return as-is if already short.
+     * Examples:
+     *   "refs/heads/main" -> "main"
+     *   "refs/remotes/origin/main" -> "main"
+     *   "main" -> "main"
+     * 
+     * @param branchName full ref or short name
+     * @return short branch name
+     */
+    private String extractShortBranchName(String branchName) {
+        if(branchName == null) {
+            return null;
+        }
+        
+        // Strip "refs/heads/" prefix
+        if(branchName.startsWith("refs/heads/")) { //$NON-NLS-1$
+            return branchName.substring("refs/heads/".length()); //$NON-NLS-1$
+        }
+        
+        // Strip "refs/remotes/origin/" prefix
+        if(branchName.startsWith("refs/remotes/origin/")) { //$NON-NLS-1$
+            return branchName.substring("refs/remotes/origin/".length()); //$NON-NLS-1$
+        }
+        
+        // Strip any other "refs/remotes/<remote>/" prefix
+        if(branchName.startsWith("refs/remotes/")) { //$NON-NLS-1$
+            int slashAfterRemote = branchName.indexOf('/', "refs/remotes/".length()); //$NON-NLS-1$
+            if(slashAfterRemote > 0 && slashAfterRemote < branchName.length() - 1) {
+                return branchName.substring(slashAfterRemote + 1);
+            }
+        }
+        
+        // Already a short name
+        return branchName;
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for checkout (much faster than JGit for many files).
+     * 
+     * @param branchName the branch name to checkout
+     * @return true if native Git checkout succeeded, false if native Git is not available
+     * @throws IOException if the checkout command failed
+     */
+    private boolean tryNativeGitCheckout(String branchName) throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "checkout", branchName); //$NON-NLS-1$ //$NON-NLS-2$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read output to prevent blocking
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git checkout failed: " + output.toString()); //$NON-NLS-1$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            // Check if this is because git is not found
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                // Native Git not available, fall back to JGit
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git checkout interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Add all files to the index using native Git (faster) or JGit fallback.
+     * After successful native operation, opens the repository to sync JGit state.
+     * 
+     * @throws IOException if the add command failed
+     * @throws GitAPIException if JGit fallback fails
+     */
+    private void gitAdd() throws IOException, GitAPIException {
+        boolean nativeSuccess = tryNativeGitAdd();
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                AddCommand addCommand = git.add();
+                addCommand.addFilepattern("."); //$NON-NLS-1$
+                addCommand.setUpdate(false);
+                addCommand.call();
+            }
+        }
+        else {
+            // After native Git operation, open repository to sync JGit state
+            // This is critical for triggering UI updates and ensuring JGit sees the changes
+            Git.open(getLocalRepositoryFolder()).close();
+        }
+    }
+    
+    /**
+     * Reset the repository to a specific ref using native Git (faster) or JGit fallback.
+     * After successful native operation, opens the repository to sync JGit state.
+     * 
+     * @param ref the ref to reset to (e.g., "HEAD", "HEAD~1", commit SHA)
+     * @param resetType the type of reset (HARD, MIXED, SOFT)
+     * @throws IOException if the reset command failed
+     * @throws GitAPIException if JGit fallback fails
+     */
+    private void gitReset(String ref, ResetType resetType) throws IOException, GitAPIException {
+        // Map JGit ResetType to native git --hard/--mixed/--soft
+        String resetMode = null;
+        switch(resetType) {
+            case HARD:
+                resetMode = "--hard"; //$NON-NLS-1$
+                break;
+            case MIXED:
+                resetMode = "--mixed"; //$NON-NLS-1$
+                break;
+            case SOFT:
+                resetMode = "--soft"; //$NON-NLS-1$
+                break;
+            default:
+                resetMode = "--mixed"; //$NON-NLS-1$
+        }
+        
+        boolean nativeSuccess = tryNativeGitReset(ref, resetMode);
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                git.reset()
+                    .setRef(ref)
+                    .setMode(resetType)
+                    .call();
+            }
+        }
+        else {
+            // After native Git operation, open repository to sync JGit state
+            // This is critical for triggering UI updates and ensuring JGit sees the changes
+            Git.open(getLocalRepositoryFolder()).close();
+        }
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for reset.
+     * 
+     * @param ref the ref to reset to
+     * @param resetMode the reset mode flag (--hard, --mixed, --soft)
+     * @return true if native Git reset succeeded, false if native Git is not available
+     * @throws IOException if the reset command failed
+     */
+    private boolean tryNativeGitReset(String ref, String resetMode) throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "reset", resetMode, ref); //$NON-NLS-1$ //$NON-NLS-2$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read output to prevent blocking
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git reset failed: " + output.toString()); //$NON-NLS-1$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            // Check if this is because git is not found
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                // Native Git not available, fall back to JGit
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git reset interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for adding files (much faster than JGit for many files).
+     * 
+     * @return true if native Git add succeeded, false if native Git is not available
+     * @throws IOException if the add command failed
+     */
+    private boolean tryNativeGitAdd() throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "add", "."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read output to prevent blocking
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git add failed: " + output.toString()); //$NON-NLS-1$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            // Check if this is because git is not found
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                // Native Git not available, fall back to JGit
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git add interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Clone a repository using native Git for SSH URLs (faster) or JGit for HTTPS (credential handling).
+     * Falls back to JGit if native Git is not available.
+     * After successful clone, opens the repository to sync JGit state and applies default config settings.
+     * 
+     * @param repoURL the repository URL to clone from
+     * @param targetFolder the target folder where to clone
+     * @param configCallback callback to set default config after clone (can be null)
+     * @throws IOException if the clone command failed
+     */
+    private void nativeGitClone(String repoURL, File targetFolder, ConfigCallback configCallback) 
+            throws IOException {
+        boolean nativeSuccess = tryNativeGitClone(repoURL, targetFolder);
+        
+        if(!nativeSuccess) {
+            // Native Git not available - caller must use JGit fallback
+            throw new IOException("Native Git not available"); //$NON-NLS-1$
+        }
+        
+        // After native git clone, open repository to sync JGit state and apply config
+        try(Git git = Git.open(targetFolder)) {
+            if(configCallback != null) {
+                configCallback.setConfig(git.getRepository());
+            }
+        }
+    }
+    
+    /**
+     * Callback interface for setting repository configuration after clone.
+     */
+    private interface ConfigCallback {
+        void setConfig(Repository repository) throws IOException;
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for cloning (much faster than JGit for large repositories).
+     * 
+     * @param repoURL the repository URL to clone from
+     * @param targetFolder the target folder where to clone
+     * @return true if native Git clone succeeded, false if native Git is not available
+     * @throws IOException if the clone command failed
+     */
+    private boolean tryNativeGitClone(String repoURL, File targetFolder) throws IOException {
+        try {
+            // Build command: git clone <url> <target>
+            List<String> command = new ArrayList<>();
+            command.add("git"); //$NON-NLS-1$
+            command.add("clone"); //$NON-NLS-1$
+            command.add(repoURL);
+            command.add(targetFolder.getAbsolutePath());
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.directory(targetFolder.getParentFile());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read output to prevent blocking
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git clone failed: " + output.toString()); //$NON-NLS-1$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            // Check if this is because git is not found
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                // Native Git not available, fall back to JGit
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git clone interrupted", ex); //$NON-NLS-1$
         }
     }
 }

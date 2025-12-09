@@ -16,6 +16,7 @@ import org.archicontribs.modelrepository.authentication.internal.EncryptedCreden
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
+import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
@@ -109,6 +110,8 @@ public class MergeBranchAction extends AbstractModelAction {
         // Then offer to Commit
         if(getRepository().hasChangesToCommit()) {
             if(!offerToCommitChanges()) {
+                // User cancelled commit dialog - reset staged changes
+                getRepository().resetToRef(IGraficoConstants.HEAD);
                 return;
             }
         }

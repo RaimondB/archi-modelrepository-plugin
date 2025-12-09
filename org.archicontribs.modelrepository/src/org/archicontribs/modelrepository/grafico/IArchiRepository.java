@@ -144,12 +144,31 @@ public interface IArchiRepository extends IGraficoConstants {
     String getWorkingTreeFileContents(String path) throws IOException;
 
     /**
-     * Do a HARD reset to the given ref
+     * Reset to the given ref with the specified reset type
+     * @param ref can be "refs/heads/master" for local, "origin/master" for remote ref, "HEAD", "HEAD^", etc.
+     * @param resetType the type of reset (HARD, MIXED, or SOFT)
+     * @throws IOException
+     * @throws GitAPIException
+     */
+    void resetToRef(String ref, org.eclipse.jgit.api.ResetCommand.ResetType resetType) throws IOException, GitAPIException;
+
+    /**
+     * Do a HARD reset to the given ref (convenience method)
      * @param ref can be "refs/heads/master" for local, or "origin/master" for remote ref
      * @throws IOException
      * @throws GitAPIException
      */
-    void resetToRef(String ref) throws IOException, GitAPIException;
+    default void resetToRef(String ref) throws IOException, GitAPIException {
+        resetToRef(ref, org.eclipse.jgit.api.ResetCommand.ResetType.HARD);
+    }
+    
+    /**
+     * Checkout a branch using native Git (faster) or JGit fallback.
+     * @param branchName the branch name to checkout (can be full ref like "refs/heads/main" or short name like "main")
+     * @throws IOException if the checkout command failed
+     * @throws GitAPIException if JGit fallback fails
+     */
+    void checkoutBranch(String branchName) throws IOException, GitAPIException;
 
     /**
      * @return if the latest local HEAD commit and the remote commit are the same

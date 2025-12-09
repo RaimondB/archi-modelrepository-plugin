@@ -5,10 +5,8 @@
  */
 package org.archicontribs.modelrepository.actions;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.lang.reflect.InvocationTargetException;
 import java.text.MessageFormat;
 
@@ -435,31 +433,14 @@ public class SwitchBranchAction extends AbstractModelAction {
         // Determine the branch name to checkout
         // For JGit, we can use the full name (refs/heads/...) for local branches
         // For native git, we must use the short name (just the branch name)
-        String branchForJGit = branchInfo.isLocal() ? 
+        String branchName = branchInfo.isLocal() ? 
                 branchInfo.getFullName() : branchInfo.getShortName();
-        String branchForNativeGit = branchInfo.getShortName(); // Native git needs short name
         
-        // Try native Git first (much faster for many files)
-        progress.subTask(Messages.SwitchBranchAction_11); // "Trying native Git checkout..."
-        boolean nativeSuccess = tryNativeGitCheckout(repoFolder, branchForNativeGit);
+        // Perform checkout using repository method (tries native git, falls back to JGit automatically)
+        progress.subTask(Messages.SwitchBranchAction_11); // "Checking out branch..."
+        getRepository().checkoutBranch(branchName);
+        progress.subTask(Messages.SwitchBranchAction_17); // "Checkout completed"
         
-        if(!nativeSuccess) {
-            // Fall back to JGit if native Git is not available
-            progress.subTask(Messages.SwitchBranchAction_12); // "Using JGit checkout (native Git not available)..."
-            try(Git git = Git.open(repoFolder)) {
-                git.checkout().setName(branchForJGit).call();
-            }
-            progress.subTask(Messages.SwitchBranchAction_13); // "JGit checkout completed"
-        }
-        else {
-            // Native checkout succeeded
-            progress.subTask(Messages.SwitchBranchAction_14); // "Native Git checkout completed, refreshing JGit state..."
-            
-            // After native Git checkout, we need to refresh JGit's state
-            // and notify listeners about the ref changes
-            Git.open(repoFolder);
-            progress.subTask(Messages.SwitchBranchAction_17); // "JGit state refresh completed"
-        }
         progress.worked(90);
     }
     
@@ -480,69 +461,11 @@ public class SwitchBranchAction extends AbstractModelAction {
         }
         
         // Determine the branch name to checkout
-        String branchForJGit = branchInfo.isLocal() ? 
+        String branchName = branchInfo.isLocal() ? 
                 branchInfo.getFullName() : branchInfo.getShortName();
-        String branchForNativeGit = branchInfo.getShortName();
         
-        // Try native Git first (much faster for many files)
-        boolean nativeSuccess = tryNativeGitCheckout(repoFolder, branchForNativeGit);
-        
-        if(!nativeSuccess) {
-            // Fall back to JGit if native Git is not available
-            try(Git git = Git.open(repoFolder)) {
-                git.checkout().setName(branchForJGit).call();
-            }
-        }
-        else {
-            // After native Git checkout, refresh JGit's state
-            Git.open(repoFolder);
-        }
-    }
-    
-    /**
-     * Try to use native Git for checkout (much faster than JGit for many files).
-     * @param repoFolder the repository folder
-     * @param branchName the branch name to checkout
-     * @return true if native Git checkout succeeded, false if native Git is not available
-     * @throws IOException if the checkout command failed
-     */
-    private boolean tryNativeGitCheckout(File repoFolder, String branchName) throws IOException {
-        try {
-            ProcessBuilder pb = new ProcessBuilder("git", "checkout", branchName); //$NON-NLS-1$ //$NON-NLS-2$
-            pb.directory(repoFolder);
-            pb.redirectErrorStream(true);
-            
-            Process process = pb.start();
-            
-            // Read output to prevent blocking
-            StringBuilder output = new StringBuilder();
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while((line = reader.readLine()) != null) {
-                    output.append(line).append("\n"); //$NON-NLS-1$
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("Git checkout failed: " + output.toString()); //$NON-NLS-1$
-            }
-            
-            return true;
-        }
-        catch(IOException ex) {
-            // Check if this is because git is not found
-            String message = ex.getMessage();
-            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
-                // Native Git not available, fall back to JGit
-                return false;
-            }
-            throw ex;
-        }
-        catch(InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Git checkout interrupted", ex); //$NON-NLS-1$
-        }
+        // Perform checkout using repository method (tries native git, falls back to JGit automatically)
+        getRepository().checkoutBranch(branchName);
     }
     
     private boolean isBranchRefSameAsCurrentBranchRef(BranchInfo branchInfo) {
