@@ -100,8 +100,13 @@ public class GraficoModelLoader {
             }
         } else if(!bHeadless) {
             // No external monitor, not headless - create our own dialog
+            // Use ProgressMonitorDialog instead of busyCursorWhile() to ensure
+            // the event loop is pumped and asyncExec runnables are processed
             try {
-                PlatformUI.getWorkbench().getProgressService().busyCursorWhile(new IRunnableWithProgress() {
+                org.eclipse.jface.dialogs.ProgressMonitorDialog dialog = 
+                    new org.eclipse.jface.dialogs.ProgressMonitorDialog(
+                        PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell());
+                dialog.run(true, true, new IRunnableWithProgress() {
                     @Override
                     public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
                         try {

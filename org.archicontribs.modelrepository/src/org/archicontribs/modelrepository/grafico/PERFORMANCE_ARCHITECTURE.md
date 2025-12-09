@@ -213,10 +213,10 @@ ThrottledProgressReporter reporter = new ThrottledProgressReporter(
     progress.split(totalFiles), totalFiles);
 
 // In async callbacks (called from many threads):
-reporter.incrementAndMaybeReport(
-    count -> String.format("Processing %d of %d files...", count, totalFiles));
+// Only bump the counter - avoid setting the message from thousands of virtual threads
+reporter.incrementBy(batchSize);
 
-// At end - ensures final progress is reported:
+// At end - ensures final progress is reported and the last message is flushed:
 reporter.finish(null);
 ```
 
@@ -232,6 +232,7 @@ reporter.finish(null);
 - Uses `LongAdder` for lock-free counting (vs `AtomicInteger` cache-line bouncing)
 - Time-based throttling: updates UI at most every 250ms
 - Updates on ANY progress: ensures UI doesn't freeze during slow operations (e.g. cold cache)
+- Hybrid reporting: producers call `incrementBy(...)`, consumer sets the message via `maybeReport(...)`
 - Double-checked locking: only one thread updates UI at a time
 - Thread-safe for use in async completion handlers
 

@@ -34,6 +34,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -102,6 +104,18 @@ public class GraficoModelImporter {
     private Map<String, IIdentifier> fIDLookup;
     
     /**
+     * ThreadLocal batch buffer for producers to reduce queue contention.
+     * Each virtual thread accumulates up to PRODUCER_BATCH_SIZE items before
+     * flushing to the queue. This reduces queue.put() operations from 26,679
+     * to ~1,300 (20x reduction), dramatically reducing lock contention.
+     * 
+     * CRITICAL: Must flush remaining items when thread completes or on last file.
+     */
+    private static final int PRODUCER_BATCH_SIZE = 20;
+    private static final ThreadLocal<List<ElementWithFolder>> PRODUCER_BATCH_BUFFER = 
+        ThreadLocal.withInitial(() -> new ArrayList<>(PRODUCER_BATCH_SIZE));
+    
+    /**
      * Unresolved missing objects
      */
     private List<UnresolvedObject> fUnresolvedObjects;
@@ -119,8 +133,9 @@ public class GraficoModelImporter {
     /**
      * Shared progress reporter for all phases of import.
      * Uses a dedicated background thread for UI updates - worker threads never block.
+     * MUST be volatile to ensure visibility across virtual threads on different CPU cores.
      */
-    private ThrottledProgressReporter fProgressReporter;
+    private volatile ThrottledProgressReporter fProgressReporter;
     
     /**
      * Shared CPU executor for parallel XML parsing across all folders.
@@ -506,6 +521,7 @@ public class GraficoModelImporter {
                 
                 // Report progress after batch completes
                 if (fProgressReporter != null) {
+                    fProgressReporter.incrementProducedBy(batch.size());
                     fProgressReporter.incrementBy(batch.size());
                     fProgressReporter.maybeReport(
                         count -> NLS.bind(Messages.GraficoModelImporter_4, count, totalImages));
@@ -647,16 +663,19 @@ public class GraficoModelImporter {
 		            }
 		            
 		            // Add to appropriate parent - all EMF modifications on this thread
-		            if (item.isTopLevelFolder()) {
-		                // Add top-level folder to model
-		                item.targetModel().getFolders().add((IFolder) item.element());
-		            } else if (item.isSubfolder()) {
-		                // Add subfolder to parent folder
-		                item.targetFolder().getFolders().add((IFolder) item.element());
-		            } else {
-		                // Add element to folder
-		                item.targetFolder().getElements().add(item.element());
-		            }
+                    if (item.isTopLevelFolder()) {
+                        // Add top-level folder to model
+                        item.targetModel().getFolders().add((IFolder) item.element());
+                    } else if (item.isSubfolder()) {
+                        // Add subfolder to parent folder
+                        item.targetFolder().getFolders().add((IFolder) item.element());
+                    } else {
+                        // Add element to folder
+                        item.targetFolder().getElements().add(item.element());
+                    }
+                    if (fProgressReporter != null) {
+                        fProgressReporter.increment();
+                    }
 		        }
 		    } catch (InterruptedException e) {
 		        Thread.currentThread().interrupt();
@@ -682,7 +701,10 @@ public class GraficoModelImporter {
     		    if(tmpFolder != null) {
     		        // Queue top-level folder for consumer - all EMF mods on consumer thread
     		        try {
-    		            fElementQueue.put(ParsedElement.forTopLevelFolder(model, tmpFolder));
+                        fElementQueue.put(ParsedElement.forTopLevelFolder(model, tmpFolder));
+                        if (fProgressReporter != null) {
+                            fProgressReporter.incrementProduced();
+                        }
     		        } catch (InterruptedException e) {
     		            Thread.currentThread().interrupt();
     		            throw new IOException("Interrupted while queueing top-level folder", e); //$NON-NLS-1$
@@ -786,6 +808,9 @@ public class GraficoModelImporter {
                 if (element != null) {
                     try {
                         fElementQueue.put(ParsedElement.forElement(currentFolder, element));
+                        if (fProgressReporter != null) {
+                            fProgressReporter.incrementProduced();
+                        }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new IOException("Interrupted while queueing element", e); //$NON-NLS-1$
@@ -806,6 +831,9 @@ public class GraficoModelImporter {
                 // Queue subfolder addition for consumer thread
                 try {
                     fElementQueue.put(ParsedElement.forSubfolder(currentFolder, loadedFolder));
+                    if (fProgressReporter != null) {
+                        fProgressReporter.incrementProduced();
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Interrupted while queueing subfolder", e); //$NON-NLS-1$
@@ -1004,11 +1032,7 @@ public class GraficoModelImporter {
                             } catch (IOException e) {
                                 // Log but continue - element will be missing
                             } finally {
-                                // Report progress and signal completion
-                                if (fProgressReporter != null) {
-                                    fProgressReporter.incrementAndMaybeReport(
-                                        count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-                                }
+                                // Signal completion for this file
                                 latch.countDown();
                             }
                         });
@@ -1266,9 +1290,9 @@ public class GraficoModelImporter {
                 fFolderPathLookup.put(entry.folderPath(), folder);
             }
             
-            // Report progress
+            // Update progress message (counts handled when files were read)
             if (fProgressReporter != null) {
-                fProgressReporter.incrementAndMaybeReport(
+                fProgressReporter.maybeReport(
                     count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
             }
         }
@@ -1296,12 +1320,19 @@ public class GraficoModelImporter {
         //
         phaseStart = System.nanoTime();
         if (!elementFiles.isEmpty()) {
-            // LinkedBlockingQueue with capacity for bounded backpressure
-            // Key advantage over ArrayBlockingQueue: separate locks for put (tail) and take (head)
-            // This reduces contention when 1000 producers put() while consumer drains
-            BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+            // UNBOUNDED LinkedBlockingQueue - no capacity limit
+            // With ThreadLocal batching, producers accumulate 20 items before adding to queue.
+            // This reduces queue operations from 26,679 to ~1,334.
+            // Making queue unbounded eliminates the last contention point: producers waiting for space.
+            // Memory impact: 26,679 items × ~2KB = ~50MB peak (acceptable for faster throughput)
+            BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
+            
+            // Wire up queue size diagnostics for progress reporter
+            if (fProgressReporter != null) {
+                fProgressReporter.setQueueSizeSupplier(() -> elementQueue.size());
+            }
             
             // Initialize producer timing accumulators
             fProducerReadTime = new java.util.concurrent.atomic.LongAdder();
@@ -1312,8 +1343,110 @@ public class GraficoModelImporter {
             AtomicInteger activeBatches = new AtomicInteger(0);
             AtomicInteger peakActiveBatches = new AtomicInteger(0);
             
-            logPerfMessage("  Phase2 config: Virtual Threads (one per file), queue=" + QUEUE_CAPACITY); //$NON-NLS-1$
+            logPerfMessage("  Phase2 config: Virtual Threads (one per file), queue=UNBOUNDED"); //$NON-NLS-1$
             
+            // CRITICAL: Start consumer thread FIRST, then fire producers
+            // Consumer must run concurrently with producers to drain queue as items arrive
+            final int totalElements = elementFiles.size();
+            AtomicInteger elementsProcessed = new AtomicInteger(0);
+            AtomicReference<Throwable> consumerException = new AtomicReference<>();
+            
+            // Consumer tracking for diagnostics
+            AtomicInteger drainOperations = new AtomicInteger(0);
+            AtomicInteger takeOperations = new AtomicInteger(0);
+            AtomicLong totalAddTime = new AtomicLong(0);
+            AtomicLong totalTakeTime = new AtomicLong(0);
+            AtomicLong totalDrainTime = new AtomicLong(0);
+            AtomicLong totalLookupTime = new AtomicLong(0);
+            AtomicInteger maxBatchSize = new AtomicInteger(0);
+            
+            long consumerStart = System.nanoTime();
+            
+            // Start consumer thread BEFORE firing producers
+            Thread consumerThread = new Thread(() -> {
+                List<ElementWithFolder> drainBuffer = new ArrayList<>(500);
+                
+                try {
+                    while (elementsProcessed.get() < totalElements) {
+                        long takeStart = System.nanoTime();
+                        ElementWithFolder firstItem = elementQueue.poll(2, TimeUnit.SECONDS);
+                        totalTakeTime.addAndGet(System.nanoTime() - takeStart);
+                        
+                        if (firstItem == null) {
+                            // Timeout - check if producers are done
+                            if (remainingElements.get() == 0 && elementQueue.isEmpty()) {
+                                break;  // All done
+                            }
+                            logPerfMessage("  CONSUMER POLL TIMEOUT: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                            continue;
+                        }
+                        
+                        takeOperations.incrementAndGet();
+                        
+                        // Drain all available items
+                        drainBuffer.add(firstItem);
+                        long drainStart = System.nanoTime();
+                        int drained = elementQueue.drainTo(drainBuffer);
+                        totalDrainTime.addAndGet(System.nanoTime() - drainStart);
+                        if (drained > 0) {
+                            drainOperations.incrementAndGet();
+                        }
+                        
+                        int currentBatchSize = drainBuffer.size();
+                        maxBatchSize.updateAndGet(max -> Math.max(max, currentBatchSize));
+                        
+                        // Process batch
+                        for (ElementWithFolder item : drainBuffer) {
+                            if (item.element() == null) {
+                                elementsProcessed.incrementAndGet();
+                                if (fProgressReporter != null) {
+                                    fProgressReporter.increment();
+                                }
+                                continue;
+                            }
+                            
+                            long lookupStart = System.nanoTime();
+                            IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
+                            totalLookupTime.addAndGet(System.nanoTime() - lookupStart);
+                            
+                            long addStart = System.nanoTime();
+                            if (parentFolder != null) {
+                                parentFolder.getElements().add(item.element());
+                            }
+                            totalAddTime.addAndGet(System.nanoTime() - addStart);
+                            
+                            elementsProcessed.incrementAndGet();
+                            if (fProgressReporter != null) {
+                                fProgressReporter.increment();
+                            }
+                            
+                            // Log progress every 5000 elements
+                            int processed = elementsProcessed.get();
+                            if (processed % 5000 == 0) {
+                                logPerfMessage("  CONSUMER PROGRESS: processed=" + processed + //$NON-NLS-1$
+                                    ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                            }
+                            
+                            // Report progress
+                            if (fProgressReporter != null) {
+                                fProgressReporter.maybeReport(
+                                    count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                            }
+                        }
+                        drainBuffer.clear();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    consumerException.set(new IOException("Consumer interrupted", e)); //$NON-NLS-1$
+                } catch (Exception e) {
+                    consumerException.set(e);
+                }
+            }, "GraficoModelImporter-DirCache-Consumer"); //$NON-NLS-1$
+            
+            consumerThread.start();
+            
+            // NOW fire producers - consumer is already running and ready to drain
             long producerStart = System.nanoTime();
             
             // Fire ALL file reads using virtual threads
@@ -1329,93 +1462,44 @@ public class GraficoModelImporter {
                     }
                 });
             }
-            logPerf("  Phase2 Stage1: Fire async reads (Virtual Threads)", producerStart, elementFiles.size()); //$NON-NLS-1$
             
-            // Stage 3: Consumer loop - add elements to model as they arrive
-            // Runs on this thread (main/caller thread) for EMF thread safety
-            // Strategy: take() blocks until one item available, then drainTo() gets the rest
-            int elementsProcessed = 0;
-            final int totalElements = elementFiles.size();
-            long consumerStart = System.nanoTime();
-            int drainOperations = 0;  // Track number of drain calls
-            int takeOperations = 0;   // Track number of take() calls
-            long totalAddTime = 0;    // Track just the time spent adding to model
-            long totalTakeTime = 0;   // Track time waiting in take()
-            long totalDrainTime = 0;  // Track time in drainTo() calls
-            long totalLookupTime = 0; // Track HashMap lookup time
-            int maxBatchSize = 0;     // Track largest batch for diagnostics
+            // Calculate how long it took to fire all producer tasks
+            long producerFireTime = System.nanoTime() - producerStart;
             
-            // Reusable buffer for draining - sized generously
-            List<ElementWithFolder> drainBuffer = new ArrayList<>(500);
-            
-            while (elementsProcessed < totalElements) {
-                try {
-                    // Wait for at least one item (blocks until available)
-                    long takeStart = System.nanoTime();
-                    ElementWithFolder firstItem = elementQueue.take();
-                    totalTakeTime += (System.nanoTime() - takeStart);
-                    takeOperations++;
-                    
-                    // Got one - now drain any others that are ready (non-blocking)
-                    drainBuffer.add(firstItem);
-                    long drainStart = System.nanoTime();
-                    int drained = elementQueue.drainTo(drainBuffer, 500);  // Max 500 per batch
-                    totalDrainTime += (System.nanoTime() - drainStart);
-                    if (drained > 0) {
-                        drainOperations++;
-                    }
-                    
-                    int currentBatchSize = drainBuffer.size();
-                    if (currentBatchSize > maxBatchSize) {
-                        maxBatchSize = currentBatchSize;
-                    }
-                    
-                    // Process entire batch
-                    for (ElementWithFolder item : drainBuffer) {
-                        // Check for error marker
-                        if (item.element() == null) {
-                            continue;  // Skip error markers
-                        }
-                        
-                        long lookupStart = System.nanoTime();
-                        IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
-                        totalLookupTime += (System.nanoTime() - lookupStart);
-                        
-                        long addToModelStart = System.nanoTime();
-                        if (parentFolder != null) {
-                            parentFolder.getElements().add(item.element());
-                        }
-                        totalAddTime += (System.nanoTime() - addToModelStart);
-                        elementsProcessed++;
-                        
-                        // Report progress from consumer (single-threaded, no contention)
-                        if (fProgressReporter != null) {
-                            fProgressReporter.incrementAndMaybeReport(
-                                count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
-                        }
-                    }
-                    drainBuffer.clear();
-                    
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Element loading interrupted", e); //$NON-NLS-1$
-                }
+            // Wait for consumer thread to finish
+            try {
+                consumerThread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Consumer thread interrupted", e); //$NON-NLS-1$
             }
             
-            // No need to wait for producers explicitly - consumer loop ensures all elements are processed
+            // Check for consumer exception
+            if (consumerException.get() != null) {
+                Throwable ex = consumerException.get();
+                if (ex instanceof IOException) {
+                    throw (IOException) ex;
+                }
+                throw new IOException("Consumer thread failed", ex); //$NON-NLS-1$
+            }
             
-            logPerf("  Phase2+3: Consumer (take+drain)", consumerStart, elementsProcessed); //$NON-NLS-1$
-            int avgBatchSize = takeOperations > 0 ? elementsProcessed / takeOperations : 0;
-            logPerfMessage("  Consumer: " + takeOperations + " take ops, " + drainOperations + " drain ops, avg batch=" + avgBatchSize + ", max batch=" + maxBatchSize); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+            // Log producer startup time (how long to fire all 26,680 tasks)
+            logPerfMessage("  Phase2 Stage1: Fire async reads (Virtual Threads): " + (producerFireTime / 1_000_000) + //$NON-NLS-1$
+                "ms (" + elementFiles.size() + " items, " + (elementFiles.size() * 1000000000L / producerFireTime) + " items/sec)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            
+            long totalConsumerTime = System.nanoTime() - consumerStart;
+            logPerf("  Phase2+3: Consumer (take+drain)", consumerStart, elementsProcessed.get()); //$NON-NLS-1$
+            int avgBatchSize = takeOperations.get() > 0 ? elementsProcessed.get() / takeOperations.get() : 0;
+            logPerfMessage("  Consumer: " + takeOperations.get() + " take ops, " + drainOperations.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                " drain ops, avg batch=" + avgBatchSize + ", max batch=" + maxBatchSize.get()); //$NON-NLS-1$ //$NON-NLS-2$
             
             // Log breakdown of consumer time
-            long totalConsumerTime = System.nanoTime() - consumerStart;
-            long addTimeMs = totalAddTime / 1_000_000;
-            long drainMs = totalDrainTime / 1_000_000;
-            long takeMs = totalTakeTime / 1_000_000;
-            long lookupMs = totalLookupTime / 1_000_000;
+            long addTimeMs = totalAddTime.get() / 1_000_000;
+            long drainMs = totalDrainTime.get() / 1_000_000;
+            long takeMs = totalTakeTime.get() / 1_000_000;
+            long lookupMs = totalLookupTime.get() / 1_000_000;
             long otherTimeMs = (totalConsumerTime / 1_000_000) - addTimeMs - drainMs - takeMs - lookupMs;
-            int theoreticalMaxRate = addTimeMs > 0 ? (int)(elementsProcessed * 1000L / addTimeMs) : 0;
+            int theoreticalMaxRate = addTimeMs > 0 ? (int)(elementsProcessed.get() * 1000L / addTimeMs) : 0;
             logPerfMessage("  Consumer breakdown: add=" + addTimeMs + "ms, lookup=" + lookupMs + //$NON-NLS-1$ //$NON-NLS-2$
                 "ms, drain=" + drainMs + "ms, take=" + takeMs + //$NON-NLS-1$ //$NON-NLS-2$
                 "ms, other=" + otherTimeMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
@@ -1478,28 +1562,84 @@ public class GraficoModelImporter {
         try {
             Path path = entry.absolutePath();
             
+            // PROFILING: Break down the 205ms per-file average
+            long ioStart = System.nanoTime();
+            
             // I/O + Parse: Stream directly from disk
             // BufferedInputStream ensures we read in chunks (8KB) rather than byte-by-byte
             long readStart = System.nanoTime();
             try (InputStream inputStream = new java.io.BufferedInputStream(Files.newInputStream(path))) {
+                long parseStart = System.nanoTime();
+                long ioTime = parseStart - ioStart;  // Time to open stream
+                
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                long parseEnd = System.nanoTime();
+                long parseTime = parseEnd - parseStart;
+                
                 fIDLookup.put(eObject.getId(), eObject);
                 fProducerReadTime.add(System.nanoTime() - readStart);
                 
-                // Put into queue for consumer (may block if queue is full)
+                // Increment produced BEFORE batching to ensure count reflects items about to enter queue
+                if (fProgressReporter != null) {
+                    fProgressReporter.incrementProduced();
+                }
+                
+                // BATCHING: Add to thread-local buffer instead of directly to queue
+                // This reduces queue.put() operations from 26,679 to ~1,300 (20x reduction)
                 long putStart = System.nanoTime();
-                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
-                fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
+                localBatch.add(new ElementWithFolder(entry.folderPath(), eObject));
+                
+                int remainingCount = remaining.get();
+                
+                // Flush when batch is full OR this is one of the last files
+                if (localBatch.size() >= PRODUCER_BATCH_SIZE || remainingCount <= PRODUCER_BATCH_SIZE) {
+                    queue.addAll(localBatch);  // ONE lock for entire batch!
+                    localBatch.clear();
+                }
+                
+                long putEnd = System.nanoTime();
+                long putTime = putEnd - putStart;
+                
+                fProducerQueuePutTime.add(putTime);
+                
+                // Every 1000 files, log breakdown to identify bottleneck
+                if (remainingCount % 1000 == 0) {
+                    logPerfMessage(String.format("  PRODUCER BREAKDOWN: I/O=%dms, Parse=%dms, QueuePut=%dms, BatchSize=%d (remaining=%d)", //$NON-NLS-1$
+                        ioTime / 1_000_000, parseTime / 1_000_000, putTime / 1_000_000, localBatch.size(), remainingCount));
+                }
             }
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
             errorFlag.set(true);
             try {
+                // Flush any pending batch on error
+                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
+                if (!localBatch.isEmpty()) {
+                    queue.addAll(localBatch);
+                    localBatch.clear();
+                }
                 queue.put(new ElementWithFolder(entry.folderPath(), null));
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
         } finally {
             remaining.decrementAndGet();
+            
+            // CRITICAL: Flush any remaining items in thread-local batch when thread completes
+            // This ensures the last 0-19 items don't get stuck in the buffer
+            try {
+                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
+                if (!localBatch.isEmpty()) {
+                    queue.addAll(localBatch);
+                    localBatch.clear();
+                }
+            } catch (Exception e) {
+                // Ignore - queue might be closed or thread interrupted
+            }
+            
+            // Clean up thread-local to avoid memory leak
+            PRODUCER_BATCH_BUFFER.remove();
+            
             // Progress reporting moved to consumer to avoid contention
         }
     }
@@ -1534,6 +1674,9 @@ public class GraficoModelImporter {
                 long putStart = System.nanoTime();
                 queue.put(new ElementWithFolder(entry.folderPath(), eObject));
                 fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                if (fProgressReporter != null) {
+                    fProgressReporter.incrementProduced();
+                }
             }
         } catch (IOException | InterruptedException e) {
             errorFlag.set(true);
@@ -1582,6 +1725,9 @@ public class GraficoModelImporter {
                     
                     // Put into queue for consumer
                     queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                    if (fProgressReporter != null) {
+                        fProgressReporter.incrementProduced();
+                    }
                 } catch (IOException | InterruptedException e) {
                     errorFlag.set(true);
                     try {
@@ -1635,6 +1781,9 @@ public class GraficoModelImporter {
                 long putStart = System.nanoTime();
                 queue.put(new ElementWithFolder(entry.folderPath(), eObject));
                 fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                if (fProgressReporter != null) {
+                    fProgressReporter.incrementProduced();
+                }
             }
         } catch (IOException | InterruptedException e) {
             errorFlag.set(true);
@@ -1704,6 +1853,9 @@ public class GraficoModelImporter {
                     }
                 }
                 results.put(path.toString(), eObject);
+                if (fProgressReporter != null) {
+                    fProgressReporter.incrementBy(1);
+                }
             }
         } catch (IOException e) {
             // Ignore - folder will be missing from results
@@ -1741,8 +1893,7 @@ public class GraficoModelImporter {
                                 // Ignore - element will be missing
                             } finally {
                                 if (fProgressReporter != null) {
-                                    fProgressReporter.incrementAndMaybeReport(
-                                        count -> NLS.bind(Messages.GraficoModelImporter_1, count, totalModelFiles));
+                                    fProgressReporter.incrementBy(1);
                                 }
                                 latch.countDown();
                             }

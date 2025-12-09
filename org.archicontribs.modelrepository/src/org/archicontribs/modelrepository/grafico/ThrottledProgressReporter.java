@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.swt.widgets.Display;
 
@@ -25,12 +27,18 @@ import org.eclipse.swt.widgets.Display;
  * 
  * <p>Key optimizations:</p>
  * <ul>
- *   <li>Uses {@link LongAdder} for lock-free counting with minimal cache-line bouncing</li>
+ *   <li>Uses {@link LongAdder} for produced count (many producers - contention matters)</li>
+ *   <li>Uses {@link AtomicLong} for consumed count (accurate reads needed for UI updates)</li>
  *   <li>Dedicated reporter thread - worker threads NEVER block on UI synchronization</li>
  *   <li>Time-based polling - checks for updates every N milliseconds</li>
  *   <li>Worker threads only increment counters and set message generator (non-blocking)</li>
  *   <li>Uses {@link Display#asyncExec} for all UI updates - safe from ANY thread</li>
  * </ul>
+ * 
+ * <p>Note on counter types: We use {@link AtomicLong} for the consumed count because
+ * {@link LongAdder#sum()} can return stale values during high-concurrency updates,
+ * which caused the progress UI to freeze when it thought no progress was being made.
+ * The consumed counter has a single writer (consumer thread) so contention is not an issue.</p>
  * 
  * <p>Usage:</p>
  * <pre>
@@ -60,11 +68,17 @@ public class ThrottledProgressReporter {
     private final long pollIntervalMs;
     private final int fileInterval;
     
-    // Use LongAdder for minimal contention across many threads
-    private final LongAdder processedCount = new LongAdder();
+    // Use LongAdder for produced count (many concurrent producers - contention matters)
+    private final LongAdder producedCount = new LongAdder();
     
-    // Last reported count - only accessed by reporter thread
-    private long lastReportedCount = 0;
+    // Use volatile for consumed count (single consumer thread writes, reporter thread reads)
+    // AtomicLong.get() was returning stale values in ScheduledExecutorService threads.
+    // Volatile provides a memory barrier that ensures visibility across threads.
+    private volatile long consumedCount = 0;
+    
+    // Last reported counts - only accessed by reporter thread
+    private long lastReportedConsumed = 0;
+    private long lastReportedProduced = 0;
     
     // Current message generator - set by worker threads, read by reporter thread
     private final AtomicReference<Function<Long, String>> messageGenerator = new AtomicReference<>();
@@ -74,6 +88,9 @@ public class ThrottledProgressReporter {
     
     // Dedicated reporter thread
     private final ScheduledExecutorService reporterThread;
+    
+    // Optional queue size supplier for diagnostics
+    private volatile java.util.function.IntSupplier queueSizeSupplier;
     
     /**
      * Create a throttled progress reporter with default intervals.
@@ -117,45 +134,84 @@ public class ThrottledProgressReporter {
         reporterThread.scheduleAtFixedRate(this::pollAndReport, pollIntervalMs, pollIntervalMs, TimeUnit.MILLISECONDS);
     }
     
+    // Track poll invocations for diagnostics
+    private final LongAdder pollCount = new LongAdder();
+    private final LongAdder asyncExecCount = new LongAdder();
+    
     /**
      * Called by the reporter thread to check for and send progress updates.
      * Uses Display.asyncExec() to ensure UI operations run on the UI thread.
      */
     private void pollAndReport() {
+        pollCount.increment();
+        
         if (progress == null || finished.get()) {
             return;
         }
         
-        long currentCount = processedCount.sum();
+        long currentConsumed = consumedCount;  // volatile read
+        long currentProduced = producedCount.sum();
+        
+        // Log every 10 polls (every ~2.5 seconds) to diagnose stalls
+        if (pollCount.sum() % 10 == 0) {
+            int queueSize = queueSizeSupplier != null ? queueSizeSupplier.getAsInt() : -1;
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO,
+                "[PROGRESS REPORTER] poll #" + pollCount.sum() +  //$NON-NLS-1$
+                ": produced=" + currentProduced + ", consumed=" + currentConsumed +  //$NON-NLS-1$
+                ", queueSize=" + queueSize + //$NON-NLS-1$
+                ", asyncExecs=" + asyncExecCount.sum() + ", finished=" + finished.get(), null); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
+    boolean producedChanged = currentProduced != lastReportedProduced;
+    boolean consumedChanged = currentConsumed != lastReportedConsumed;
+    boolean reachedTotal = currentConsumed >= totalItems;
         
         // Check if enough files have been processed to warrant an update
         // Since we are polling at a fixed interval (e.g. 250ms), we should update if ANY progress
         // has been made, to ensure the UI doesn't appear frozen during slow operations.
-        if (currentCount > lastReportedCount || currentCount >= totalItems) {
-            final int workDelta = (int) (currentCount - lastReportedCount);
-            final long reportedCount = currentCount;
+        if (producedChanged || consumedChanged || reachedTotal) {
+            final int workDelta = consumedChanged ? (int) (currentConsumed - lastReportedConsumed) : 0;
+            final long reportedConsumed = currentConsumed;
+            final long reportedProduced = currentProduced;
             
-            // Get message if set
+            // Get message if set; fallback always includes produced/consumed diagnostics
             Function<Long, String> msgGen = messageGenerator.get();
-            final String message = (msgGen != null) ? msgGen.apply(currentCount) : null;
+            final String baseMessage = (msgGen != null) ? msgGen.apply(currentConsumed) : null;
+            final String message = buildStatusMessage(baseMessage, reportedProduced, reportedConsumed);
             
-            if (workDelta > 0 || message != null) {
-                // Update last reported count now to avoid duplicate updates
-                lastReportedCount = reportedCount;
-                
-                // Schedule UI update on the UI thread
+            // Update last reported counts now to avoid duplicate updates
+            lastReportedConsumed = reportedConsumed;
+            lastReportedProduced = reportedProduced;
+            
+            // Schedule UI update on the UI thread
+            Display display = Display.getDefault();
+            if (display != null && !display.isDisposed()) {
+                asyncExecCount.increment();
+                display.asyncExec(() -> {
+                    if (progress == null || finished.get()) {
+                        return;
+                    }
+                    if (workDelta > 0) {
+                        progress.worked(workDelta);
+                    }
+                    if (message != null) {
+                        progress.subTask(message);
+                    }
+                });
+            }
+        } else {
+            // No count changes - still update message if a generator is set and UI thread is alive
+            Function<Long, String> msgGen = messageGenerator.get();
+            if (msgGen != null) {
+                final String message = buildStatusMessage(msgGen.apply(currentConsumed), currentProduced, currentConsumed);
                 Display display = Display.getDefault();
                 if (display != null && !display.isDisposed()) {
+                    asyncExecCount.increment();
                     display.asyncExec(() -> {
                         if (progress == null || finished.get()) {
                             return;
                         }
-                        if (workDelta > 0) {
-                            progress.worked(workDelta);
-                        }
-                        if (message != null) {
-                            progress.subTask(message);
-                        }
+                        progress.subTask(message);
                     });
                 }
             }
@@ -167,7 +223,7 @@ public class ThrottledProgressReporter {
      * This is NON-BLOCKING - the reporter thread will pick up the update.
      */
     public void increment() {
-        processedCount.increment();
+        consumedCount++;  // volatile write
     }
     
     /**
@@ -177,7 +233,24 @@ public class ThrottledProgressReporter {
      * @param delta The amount to increment by
      */
     public void incrementBy(int delta) {
-        processedCount.add(delta);
+        consumedCount += delta;  // volatile write
+    }
+
+    /**
+     * Increment the produced count by one.
+     * Use this when a producer thread has finished preparing an item for consumption.
+     */
+    public void incrementProduced() {
+        producedCount.increment();
+    }
+    
+    /**
+     * Increment the produced count by a specific amount.
+     * 
+     * @param delta Amount to increment by
+     */
+    public void incrementProducedBy(int delta) {
+        producedCount.add(delta);
     }
     
     /**
@@ -191,6 +264,16 @@ public class ThrottledProgressReporter {
     }
     
     /**
+     * Set a supplier for queue size diagnostics.
+     * Used to log actual queue size in diagnostic polls.
+     * 
+     * @param supplier Supplier that returns current queue size, or null to disable
+     */
+    public void setQueueSizeSupplier(java.util.function.IntSupplier supplier) {
+        this.queueSizeSupplier = supplier;
+    }
+    
+    /**
      * Increment and set message generator in one call (convenience method).
      * This is NON-BLOCKING - the reporter thread will pick up the update.
      * 
@@ -198,7 +281,7 @@ public class ThrottledProgressReporter {
      * @param generator Function to generate the progress message from current count
      */
     public void incrementByAndSetMessage(int delta, Function<Long, String> generator) {
-        processedCount.add(delta);
+        consumedCount += delta;  // volatile write
         messageGenerator.set(generator);
     }
     
@@ -209,7 +292,7 @@ public class ThrottledProgressReporter {
      * @param generator Function to generate the progress message from current count
      */
     public void incrementAndMaybeReport(Function<Long, String> generator) {
-        processedCount.increment();
+        consumedCount++;  // volatile write
         messageGenerator.set(generator);
     }
     
@@ -249,7 +332,7 @@ public class ThrottledProgressReporter {
      * @param work The amount of work done
      */
     public void worked(int work) {
-        processedCount.add(work);
+        consumedCount += work;  // volatile write
     }
     
     /**
@@ -281,8 +364,9 @@ public class ThrottledProgressReporter {
         
         // Report any remaining work on the UI thread
         final String message = finalMessage;
-        final long currentCount = processedCount.sum();
-        final int remaining = totalItems - (int) lastReportedCount;
+    final long currentConsumed = consumedCount;  // volatile read
+    final long currentProduced = producedCount.sum();
+    final int remaining = totalItems - (int) lastReportedConsumed;
         
         Display display = Display.getDefault();
         if (display != null && !display.isDisposed()) {
@@ -290,8 +374,9 @@ public class ThrottledProgressReporter {
                 if (remaining > 0) {
                     progress.worked(remaining);
                 }
-                if (message != null) {
-                    progress.subTask(message);
+                final String finalStatus = buildStatusMessage(message, currentProduced, currentConsumed);
+                if (finalStatus != null) {
+                    progress.subTask(finalStatus);
                 }
             });
         }
@@ -303,7 +388,16 @@ public class ThrottledProgressReporter {
      * @return The number of items processed so far
      */
     public long getProcessedCount() {
-        return processedCount.sum();
+        return consumedCount;  // volatile read
+    }
+
+    /**
+     * Get the current produced count.
+     * 
+     * @return The number of items produced so far
+     */
+    public long getProducedCount() {
+        return producedCount.sum();
     }
     
     /**
@@ -313,5 +407,13 @@ public class ThrottledProgressReporter {
      */
     public boolean isCanceled() {
         return progress != null && progress.isCanceled();
+    }
+    
+    private String buildStatusMessage(String baseMessage, long produced, long consumed) {
+        String diagnostics = String.format("Produced %d | Consumed %d / %d", produced, consumed, totalItems);
+        if (baseMessage == null || baseMessage.isBlank()) {
+            return diagnostics;
+        }
+        return baseMessage + " [" + diagnostics + "]"; //$NON-NLS-1$ //$NON-NLS-2$
     }
 }
