@@ -246,6 +246,18 @@ public class GraficoModelImporter {
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, message, null);
     }
     
+    /**
+     * Log START/COMPLETE messages that are ALWAYS visible (even when PERF_LOGGING disabled).
+     * Use this for high-level phase timing that users should always see.
+     */
+    private void logTiming(String phase, long startNanos, int itemCount) {
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+        double itemsPerSec = itemCount > 0 && elapsedMs > 0 ? (itemCount * 1000.0 / elapsedMs) : 0;
+        String message = String.format("[GRAFICO IMPORT] %s: %dms (%d items, %.0f items/sec)", //$NON-NLS-1$
+            phase, elapsedMs, itemCount, itemsPerSec);
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, message, null);
+    }
+    
     private void logPerfMessage(String message) {
         if (!PERF_LOGGING) return; // Fast path - zero overhead when disabled
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[GRAFICO IMPORT PERF] " + message, null); //$NON-NLS-1$
@@ -1329,19 +1341,21 @@ public class GraficoModelImporter {
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
             
-            // Wire up queue size diagnostics for progress reporter
-            if (fProgressReporter != null) {
+            // Wire up queue size diagnostics for progress reporter (only if perf logging enabled)
+            if (PERF_LOGGING && fProgressReporter != null) {
                 fProgressReporter.setQueueSizeSupplier(() -> elementQueue.size());
             }
             
-            // Initialize producer timing accumulators
-            fProducerReadTime = new java.util.concurrent.atomic.LongAdder();
-            fProducerParseTime = new java.util.concurrent.atomic.LongAdder();
-            fProducerQueuePutTime = new java.util.concurrent.atomic.LongAdder();
+            // Initialize producer timing accumulators (only if perf logging enabled)
+            if (PERF_LOGGING) {
+                fProducerReadTime = new java.util.concurrent.atomic.LongAdder();
+                fProducerParseTime = new java.util.concurrent.atomic.LongAdder();
+                fProducerQueuePutTime = new java.util.concurrent.atomic.LongAdder();
+            }
             
-            // Track concurrent batch execution to diagnose parallelism limits
-            AtomicInteger activeBatches = new AtomicInteger(0);
-            AtomicInteger peakActiveBatches = new AtomicInteger(0);
+            // Track concurrent batch execution to diagnose parallelism limits (only if perf logging enabled)
+            final AtomicInteger activeBatches = PERF_LOGGING ? new AtomicInteger(0) : null;
+            final AtomicInteger peakActiveBatches = PERF_LOGGING ? new AtomicInteger(0) : null;
             
             logPerfMessage("  Phase2 config: Virtual Threads (one per file), queue=UNBOUNDED"); //$NON-NLS-1$
             
@@ -1351,14 +1365,14 @@ public class GraficoModelImporter {
             AtomicInteger elementsProcessed = new AtomicInteger(0);
             AtomicReference<Throwable> consumerException = new AtomicReference<>();
             
-            // Consumer tracking for diagnostics
-            AtomicInteger drainOperations = new AtomicInteger(0);
-            AtomicInteger takeOperations = new AtomicInteger(0);
-            AtomicLong totalAddTime = new AtomicLong(0);
-            AtomicLong totalTakeTime = new AtomicLong(0);
-            AtomicLong totalDrainTime = new AtomicLong(0);
-            AtomicLong totalLookupTime = new AtomicLong(0);
-            AtomicInteger maxBatchSize = new AtomicInteger(0);
+            // Consumer tracking for diagnostics (only if perf logging enabled)
+            final AtomicInteger drainOperations = PERF_LOGGING ? new AtomicInteger(0) : null;
+            final AtomicInteger takeOperations = PERF_LOGGING ? new AtomicInteger(0) : null;
+            final AtomicLong totalAddTime = PERF_LOGGING ? new AtomicLong(0) : null;
+            final AtomicLong totalTakeTime = PERF_LOGGING ? new AtomicLong(0) : null;
+            final AtomicLong totalDrainTime = PERF_LOGGING ? new AtomicLong(0) : null;
+            final AtomicLong totalLookupTime = PERF_LOGGING ? new AtomicLong(0) : null;
+            final AtomicInteger maxBatchSize = PERF_LOGGING ? new AtomicInteger(0) : null;
             
             long consumerStart = System.nanoTime();
             
@@ -1368,33 +1382,46 @@ public class GraficoModelImporter {
                 
                 try {
                     while (elementsProcessed.get() < totalElements) {
-                        long takeStart = System.nanoTime();
+                        long takeStart = PERF_LOGGING ? System.nanoTime() : 0;
                         ElementWithFolder firstItem = elementQueue.poll(2, TimeUnit.SECONDS);
-                        totalTakeTime.addAndGet(System.nanoTime() - takeStart);
+                        if (PERF_LOGGING && totalTakeTime != null) {
+                            totalTakeTime.addAndGet(System.nanoTime() - takeStart);
+                        }
                         
                         if (firstItem == null) {
                             // Timeout - check if producers are done
                             if (remainingElements.get() == 0 && elementQueue.isEmpty()) {
                                 break;  // All done
                             }
-                            logPerfMessage("  CONSUMER POLL TIMEOUT: processed=" + elementsProcessed.get() + //$NON-NLS-1$
-                                ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                            if (PERF_LOGGING) {
+                                logPerfMessage("  CONSUMER POLL TIMEOUT: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                    ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                            }
                             continue;
                         }
                         
-                        takeOperations.incrementAndGet();
+                        if (PERF_LOGGING && takeOperations != null) {
+                            takeOperations.incrementAndGet();
+                        }
                         
                         // Drain all available items
                         drainBuffer.add(firstItem);
-                        long drainStart = System.nanoTime();
-                        int drained = elementQueue.drainTo(drainBuffer);
-                        totalDrainTime.addAndGet(System.nanoTime() - drainStart);
-                        if (drained > 0) {
-                            drainOperations.incrementAndGet();
+                        if (PERF_LOGGING) {
+                            long drainStart = System.nanoTime();
+                            int drained = elementQueue.drainTo(drainBuffer);
+                            if (totalDrainTime != null) {
+                                totalDrainTime.addAndGet(System.nanoTime() - drainStart);
+                            }
+                            if (drained > 0 && drainOperations != null) {
+                                drainOperations.incrementAndGet();
+                            }
+                            int currentBatchSize = drainBuffer.size();
+                            if (maxBatchSize != null) {
+                                maxBatchSize.updateAndGet(max -> Math.max(max, currentBatchSize));
+                            }
+                        } else {
+                            elementQueue.drainTo(drainBuffer);
                         }
-                        
-                        int currentBatchSize = drainBuffer.size();
-                        maxBatchSize.updateAndGet(max -> Math.max(max, currentBatchSize));
                         
                         // Process batch
                         for (ElementWithFolder item : drainBuffer) {
@@ -1406,26 +1433,43 @@ public class GraficoModelImporter {
                                 continue;
                             }
                             
-                            long lookupStart = System.nanoTime();
-                            IFolder parentFolder = fFolderPathLookup.get(item.folderPath());
-                            totalLookupTime.addAndGet(System.nanoTime() - lookupStart);
-                            
-                            long addStart = System.nanoTime();
-                            if (parentFolder != null) {
-                                parentFolder.getElements().add(item.element());
+                            IFolder parentFolder;
+                            if (PERF_LOGGING) {
+                                long lookupStart = System.nanoTime();
+                                parentFolder = fFolderPathLookup.get(item.folderPath());
+                                if (totalLookupTime != null) {
+                                    totalLookupTime.addAndGet(System.nanoTime() - lookupStart);
+                                }
+                            } else {
+                                parentFolder = fFolderPathLookup.get(item.folderPath());
                             }
-                            totalAddTime.addAndGet(System.nanoTime() - addStart);
+                            
+                            if (PERF_LOGGING) {
+                                long addStart = System.nanoTime();
+                                if (parentFolder != null) {
+                                    parentFolder.getElements().add(item.element());
+                                }
+                                if (totalAddTime != null) {
+                                    totalAddTime.addAndGet(System.nanoTime() - addStart);
+                                }
+                            } else {
+                                if (parentFolder != null) {
+                                    parentFolder.getElements().add(item.element());
+                                }
+                            }
                             
                             elementsProcessed.incrementAndGet();
                             if (fProgressReporter != null) {
                                 fProgressReporter.increment();
                             }
                             
-                            // Log progress every 5000 elements
-                            int processed = elementsProcessed.get();
-                            if (processed % 5000 == 0) {
-                                logPerfMessage("  CONSUMER PROGRESS: processed=" + processed + //$NON-NLS-1$
-                                    ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                            // Log progress every 5000 elements (only if perf logging enabled)
+                            if (PERF_LOGGING) {
+                                int processed = elementsProcessed.get();
+                                if (processed % 5000 == 0) {
+                                    logPerfMessage("  CONSUMER PROGRESS: processed=" + processed + //$NON-NLS-1$
+                                        ", queueSize=" + elementQueue.size() + ", remaining=" + remainingElements.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                                }
                             }
                             
                             // Report progress
@@ -1453,12 +1497,16 @@ public class GraficoModelImporter {
             // Each virtual thread: read file (I/O) → parse → queue
             for (DirCacheFileEntry entry : elementFiles) {
                 fIoExecutor.execute(() -> {
-                    activeBatches.incrementAndGet();
-                    peakActiveBatches.updateAndGet(peak -> Math.max(peak, activeBatches.get()));
+                    if (PERF_LOGGING && activeBatches != null && peakActiveBatches != null) {
+                        activeBatches.incrementAndGet();
+                        peakActiveBatches.updateAndGet(peak -> Math.max(peak, activeBatches.get()));
+                    }
                     try {
                         readParseAndQueueStreaming(entry, elementQueue, remainingElements, producerError, totalModelFiles);
                     } finally {
-                        activeBatches.decrementAndGet();
+                        if (PERF_LOGGING && activeBatches != null) {
+                            activeBatches.decrementAndGet();
+                        }
                     }
                 });
             }
@@ -1483,47 +1531,57 @@ public class GraficoModelImporter {
                 throw new IOException("Consumer thread failed", ex); //$NON-NLS-1$
             }
             
-            // Log producer startup time (how long to fire all 26,680 tasks)
-            logPerfMessage("  Phase2 Stage1: Fire async reads (Virtual Threads): " + (producerFireTime / 1_000_000) + //$NON-NLS-1$
-                "ms (" + elementFiles.size() + " items, " + (elementFiles.size() * 1000000000L / producerFireTime) + " items/sec)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            
-            long totalConsumerTime = System.nanoTime() - consumerStart;
-            logPerf("  Phase2+3: Consumer (take+drain)", consumerStart, elementsProcessed.get()); //$NON-NLS-1$
-            int avgBatchSize = takeOperations.get() > 0 ? elementsProcessed.get() / takeOperations.get() : 0;
-            logPerfMessage("  Consumer: " + takeOperations.get() + " take ops, " + drainOperations.get() + //$NON-NLS-1$ //$NON-NLS-2$
-                " drain ops, avg batch=" + avgBatchSize + ", max batch=" + maxBatchSize.get()); //$NON-NLS-1$ //$NON-NLS-2$
-            
-            // Log breakdown of consumer time
-            long addTimeMs = totalAddTime.get() / 1_000_000;
-            long drainMs = totalDrainTime.get() / 1_000_000;
-            long takeMs = totalTakeTime.get() / 1_000_000;
-            long lookupMs = totalLookupTime.get() / 1_000_000;
-            long otherTimeMs = (totalConsumerTime / 1_000_000) - addTimeMs - drainMs - takeMs - lookupMs;
-            int theoreticalMaxRate = addTimeMs > 0 ? (int)(elementsProcessed.get() * 1000L / addTimeMs) : 0;
-            logPerfMessage("  Consumer breakdown: add=" + addTimeMs + "ms, lookup=" + lookupMs + //$NON-NLS-1$ //$NON-NLS-2$
-                "ms, drain=" + drainMs + "ms, take=" + takeMs + //$NON-NLS-1$ //$NON-NLS-2$
-                "ms, other=" + otherTimeMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
-            logPerfMessage("  Theoretical max consumer rate (add-only): " + theoreticalMaxRate + " items/sec"); //$NON-NLS-1$ //$NON-NLS-2$
-            
-            // Log producer breakdown (cumulative across all virtual threads)
-            // NOTE: With streaming, "read" includes I/O + parse (overlapped in BufferedInputStream)
-            long producerReadMs = fProducerReadTime.sum() / 1_000_000;
-            long producerParseMs = fProducerParseTime.sum() / 1_000_000;
-            long producerQueueMs = fProducerQueuePutTime.sum() / 1_000_000;
-            int numFiles = elementFiles.size();
-            logPerfMessage("  Producer: peakConcurrentThreads=" + peakActiveBatches.get() + " (of " + numFiles + " files)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            logPerfMessage("  Producer breakdown (cumulative): readParse=" + producerReadMs + //$NON-NLS-1$
-                "ms, parseSeparate=" + producerParseMs + "ms, queuePut=" + producerQueueMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            // Per-file average (more meaningful for concurrent threads)
-            long readPerFileUs = numFiles > 0 ? (fProducerReadTime.sum() / numFiles) / 1000 : 0;
-            long parsePerFileUs = numFiles > 0 ? (fProducerParseTime.sum() / numFiles) / 1000 : 0;
-            // Calculate effective parallelism = cumulative time / wall clock time
-            long wallClockMs = (System.nanoTime() - consumerStart) / 1_000_000;
-            int effectiveParallelism = wallClockMs > 0 ? (int)(producerReadMs / wallClockMs) : 0;
-            logPerfMessage("  Producer per-file avg: readParse=" + readPerFileUs + "us, effectiveParallelism=" + effectiveParallelism); //$NON-NLS-1$ //$NON-NLS-2$
+            // Log diagnostics (only if PERF_LOGGING enabled)
+            if (PERF_LOGGING) {
+                // Log producer startup time (how long to fire all 26,680 tasks)
+                logPerfMessage("  Phase2 Stage1: Fire async reads (Virtual Threads): " + (producerFireTime / 1_000_000) + //$NON-NLS-1$
+                    "ms (" + elementFiles.size() + " items, " + (elementFiles.size() * 1000000000L / producerFireTime) + " items/sec)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                
+                long totalConsumerTime = System.nanoTime() - consumerStart;
+                logPerf("  Phase2+3: Consumer (take+drain)", consumerStart, elementsProcessed.get()); //$NON-NLS-1$
+                
+                if (takeOperations != null && drainOperations != null && maxBatchSize != null) {
+                    int avgBatchSize = takeOperations.get() > 0 ? elementsProcessed.get() / takeOperations.get() : 0;
+                    logPerfMessage("  Consumer: " + takeOperations.get() + " take ops, " + drainOperations.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                        " drain ops, avg batch=" + avgBatchSize + ", max batch=" + maxBatchSize.get()); //$NON-NLS-1$ //$NON-NLS-2$
+                }
+                
+                // Log breakdown of consumer time
+                if (totalAddTime != null && totalDrainTime != null && totalTakeTime != null && totalLookupTime != null) {
+                    long addTimeMs = totalAddTime.get() / 1_000_000;
+                    long drainMs = totalDrainTime.get() / 1_000_000;
+                    long takeMs = totalTakeTime.get() / 1_000_000;
+                    long lookupMs = totalLookupTime.get() / 1_000_000;
+                    long otherTimeMs = (totalConsumerTime / 1_000_000) - addTimeMs - drainMs - takeMs - lookupMs;
+                    int theoreticalMaxRate = addTimeMs > 0 ? (int)(elementsProcessed.get() * 1000L / addTimeMs) : 0;
+                    logPerfMessage("  Consumer breakdown: add=" + addTimeMs + "ms, lookup=" + lookupMs + //$NON-NLS-1$ //$NON-NLS-2$
+                        "ms, drain=" + drainMs + "ms, take=" + takeMs + //$NON-NLS-1$ //$NON-NLS-2$
+                        "ms, other=" + otherTimeMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
+                    logPerfMessage("  Theoretical max consumer rate (add-only): " + theoreticalMaxRate + " items/sec"); //$NON-NLS-1$ //$NON-NLS-2$
+                }
+                
+                // Log producer breakdown (cumulative across all virtual threads)
+                // NOTE: With streaming, "read" includes I/O + parse (overlapped in BufferedInputStream)
+                if (fProducerReadTime != null && fProducerParseTime != null && fProducerQueuePutTime != null && peakActiveBatches != null) {
+                    long producerReadMs = fProducerReadTime.sum() / 1_000_000;
+                    long producerParseMs = fProducerParseTime.sum() / 1_000_000;
+                    long producerQueueMs = fProducerQueuePutTime.sum() / 1_000_000;
+                    int numFiles = elementFiles.size();
+                    logPerfMessage("  Producer: peakConcurrentThreads=" + peakActiveBatches.get() + " (of " + numFiles + " files)"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    logPerfMessage("  Producer breakdown (cumulative): readParse=" + producerReadMs + //$NON-NLS-1$
+                        "ms, parseSeparate=" + producerParseMs + "ms, queuePut=" + producerQueueMs + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    // Per-file average (more meaningful for concurrent threads)
+                    long readPerFileUs = numFiles > 0 ? (fProducerReadTime.sum() / numFiles) / 1000 : 0;
+                    long parsePerFileUs = numFiles > 0 ? (fProducerParseTime.sum() / numFiles) / 1000 : 0;
+                    // Calculate effective parallelism = cumulative time / wall clock time
+                    long wallClockMs = (System.nanoTime() - consumerStart) / 1_000_000;
+                    int effectiveParallelism = wallClockMs > 0 ? (int)(producerReadMs / wallClockMs) : 0;
+                    logPerfMessage("  Producer per-file avg: readParse=" + readPerFileUs + "us, effectiveParallelism=" + effectiveParallelism); //$NON-NLS-1$ //$NON-NLS-2$
+                }
+            }
         }
-        logPerf("  Phase2+3 TOTAL (overlapped I/O + model build)", phaseStart, elementFiles.size()); //$NON-NLS-1$
-        logPerf("  loadModelWithDirCache TOTAL", methodStart, totalModelFiles); //$NON-NLS-1$
+        logTiming("  Phase2+3 TOTAL (overlapped I/O + model build)", phaseStart, elementFiles.size()); //$NON-NLS-1$
+        logTiming("  loadModelWithDirCache TOTAL", methodStart, totalModelFiles); //$NON-NLS-1$
         
         return model;
     }
@@ -1563,21 +1621,23 @@ public class GraficoModelImporter {
             Path path = entry.absolutePath();
             
             // PROFILING: Break down the 205ms per-file average
-            long ioStart = System.nanoTime();
+            long ioStart = PERF_LOGGING ? System.nanoTime() : 0;
             
             // I/O + Parse: Stream directly from disk
             // BufferedInputStream ensures we read in chunks (8KB) rather than byte-by-byte
-            long readStart = System.nanoTime();
+            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
             try (InputStream inputStream = new java.io.BufferedInputStream(Files.newInputStream(path))) {
-                long parseStart = System.nanoTime();
-                long ioTime = parseStart - ioStart;  // Time to open stream
+                long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
+                long ioTime = PERF_LOGGING ? (parseStart - ioStart) : 0;  // Time to open stream
                 
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                long parseEnd = System.nanoTime();
-                long parseTime = parseEnd - parseStart;
+                long parseEnd = PERF_LOGGING ? System.nanoTime() : 0;
+                long parseTime = PERF_LOGGING ? (parseEnd - parseStart) : 0;
                 
                 fIDLookup.put(eObject.getId(), eObject);
-                fProducerReadTime.add(System.nanoTime() - readStart);
+                if (PERF_LOGGING && fProducerReadTime != null) {
+                    fProducerReadTime.add(System.nanoTime() - readStart);
+                }
                 
                 // Increment produced BEFORE batching to ensure count reflects items about to enter queue
                 if (fProgressReporter != null) {
@@ -1586,7 +1646,7 @@ public class GraficoModelImporter {
                 
                 // BATCHING: Add to thread-local buffer instead of directly to queue
                 // This reduces queue.put() operations from 26,679 to ~1,300 (20x reduction)
-                long putStart = System.nanoTime();
+                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
                 List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
                 localBatch.add(new ElementWithFolder(entry.folderPath(), eObject));
                 
@@ -1598,13 +1658,15 @@ public class GraficoModelImporter {
                     localBatch.clear();
                 }
                 
-                long putEnd = System.nanoTime();
-                long putTime = putEnd - putStart;
+                long putEnd = PERF_LOGGING ? System.nanoTime() : 0;
+                long putTime = PERF_LOGGING ? (putEnd - putStart) : 0;
                 
-                fProducerQueuePutTime.add(putTime);
+                if (PERF_LOGGING && fProducerQueuePutTime != null) {
+                    fProducerQueuePutTime.add(putTime);
+                }
                 
                 // Every 1000 files, log breakdown to identify bottleneck
-                if (remainingCount % 1000 == 0) {
+                if (PERF_LOGGING && remainingCount % 1000 == 0) {
                     logPerfMessage(String.format("  PRODUCER BREAKDOWN: I/O=%dms, Parse=%dms, QueuePut=%dms, BatchSize=%d (remaining=%d)", //$NON-NLS-1$
                         ioTime / 1_000_000, parseTime / 1_000_000, putTime / 1_000_000, localBatch.size(), remainingCount));
                 }
@@ -1659,21 +1721,27 @@ public class GraficoModelImporter {
             AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
         try {
             // I/O: Read file (this is 97% of time on cold cache)
-            long readStart = System.nanoTime();
+            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
             byte[] bytes = Files.readAllBytes(entry.absolutePath());
-            fProducerReadTime.add(System.nanoTime() - readStart);
+            if (PERF_LOGGING && fProducerReadTime != null) {
+                fProducerReadTime.add(System.nanoTime() - readStart);
+            }
             
             // CPU: Parse XML (only 3% of time, OK to do on virtual thread)
-            long parseStart = System.nanoTime();
+            long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
             try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
                 fIDLookup.put(eObject.getId(), eObject);
-                fProducerParseTime.add(System.nanoTime() - parseStart);
+                if (PERF_LOGGING && fProducerParseTime != null) {
+                    fProducerParseTime.add(System.nanoTime() - parseStart);
+                }
                 
                 // Put into queue for consumer (may block if queue is full)
-                long putStart = System.nanoTime();
+                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
                 queue.put(new ElementWithFolder(entry.folderPath(), eObject));
-                fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                if (PERF_LOGGING && fProducerQueuePutTime != null) {
+                    fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                }
                 if (fProgressReporter != null) {
                     fProgressReporter.incrementProduced();
                 }
@@ -1767,20 +1835,26 @@ public class GraficoModelImporter {
         try {
             // Synchronous I/O - OK because we're in a ForkJoinPool batch
             // Only one file open per batch (sequential within batch)
-            long readStart = System.nanoTime();
+            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
             byte[] bytes = Files.readAllBytes(entry.absolutePath());
-            fProducerReadTime.add(System.nanoTime() - readStart);
+            if (PERF_LOGGING && fProducerReadTime != null) {
+                fProducerReadTime.add(System.nanoTime() - readStart);
+            }
             
-            long parseStart = System.nanoTime();
+            long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
             try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
                 fIDLookup.put(eObject.getId(), eObject);
-                fProducerParseTime.add(System.nanoTime() - parseStart);
+                if (PERF_LOGGING && fProducerParseTime != null) {
+                    fProducerParseTime.add(System.nanoTime() - parseStart);
+                }
                 
                 // Put into queue for consumer (may block if queue is full = backpressure)
-                long putStart = System.nanoTime();
+                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
                 queue.put(new ElementWithFolder(entry.folderPath(), eObject));
-                fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                if (PERF_LOGGING && fProducerQueuePutTime != null) {
+                    fProducerQueuePutTime.add(System.nanoTime() - putStart);
+                }
                 if (fProgressReporter != null) {
                     fProgressReporter.incrementProduced();
                 }

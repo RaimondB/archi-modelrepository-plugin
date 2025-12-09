@@ -56,6 +56,9 @@ import org.eclipse.swt.widgets.Display;
  */
 public class ThrottledProgressReporter {
     
+    // Performance logging flag - matches GraficoModelImporter
+    private static final boolean PERF_LOGGING = Boolean.getBoolean("grafico.perf.logging"); //$NON-NLS-1$
+    
     // Default polling interval for the reporter thread (milliseconds)
     private static final long DEFAULT_POLL_INTERVAL_MS = 250;
     
@@ -152,8 +155,8 @@ public class ThrottledProgressReporter {
         long currentConsumed = consumedCount;  // volatile read
         long currentProduced = producedCount.sum();
         
-        // Log every 10 polls (every ~2.5 seconds) to diagnose stalls
-        if (pollCount.sum() % 10 == 0) {
+        // Log every 10 polls (every ~2.5 seconds) to diagnose stalls (only if perf logging enabled)
+        if (PERF_LOGGING && pollCount.sum() % 10 == 0) {
             int queueSize = queueSizeSupplier != null ? queueSizeSupplier.getAsInt() : -1;
             ModelRepositoryPlugin.getInstance().log(IStatus.INFO,
                 "[PROGRESS REPORTER] poll #" + pollCount.sum() +  //$NON-NLS-1$
