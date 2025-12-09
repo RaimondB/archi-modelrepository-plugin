@@ -642,6 +642,8 @@ public class GraficoModelImporter {
 	private IArchimateModel loadModel(File folder, int totalModelFiles) throws IOException {
 		IArchimateModel model = (IArchimateModel)loadElement(new File(folder, IGraficoConstants.FOLDER_XML));
 		
+		// Define the correct folder order as per Archi's folder structure
+		// This ensures folders appear in the model tree in the expected order
 		List<FolderType> folderList = new ArrayList<FolderType>();
 		folderList.add(FolderType.STRATEGY);
 		folderList.add(FolderType.BUSINESS);
@@ -652,6 +654,7 @@ public class GraficoModelImporter {
 		folderList.add(FolderType.OTHER);
 		folderList.add(FolderType.RELATIONS);
 		folderList.add(FolderType.DIAGRAMS);
+		// Note: USER folders are handled separately at the end
 
 		// Initialize producer/consumer infrastructure
 		fElementQueue = new LinkedBlockingQueue<>();
@@ -1193,6 +1196,51 @@ public class GraficoModelImporter {
     }
     
     /**
+     * Get the canonical order for a folder type based on its path.
+     * This ensures top-level folders appear in the correct order in the model tree:
+     * STRATEGY, BUSINESS, APPLICATION, TECHNOLOGY, MOTIVATION, IMPLEMENTATION_MIGRATION,
+     * OTHER, RELATIONS, DIAGRAMS (views), and finally USER folders.
+     * 
+     * For nested folders (below top-level), returns a neutral value so they sort alphabetically.
+     * 
+     * @param entry The folder entry
+     * @return Order index (lower = earlier in the list), or -1 for alphabetical sorting
+     */
+    private int getFolderTypeOrder(DirCacheFileEntry entry) {
+        String path = entry.folderPath();
+        
+        // Extract the top-level folder name (e.g., "model/strategy" -> "strategy")
+        if (path.startsWith(IGraficoConstants.MODEL_FOLDER + "/")) { //$NON-NLS-1$
+            String remaining = path.substring(IGraficoConstants.MODEL_FOLDER.length() + 1);
+            int slashIndex = remaining.indexOf('/');
+            
+            // If there's a slash, this is a nested folder - use alphabetical sorting
+            if (slashIndex > 0) {
+                return -1; // Signal for alphabetical sort
+            }
+            
+            // Top-level folder - use canonical order
+            String topLevelFolder = remaining;
+            
+            // Map to canonical order
+            return switch (topLevelFolder.toLowerCase()) {
+                case "strategy" -> 0; //$NON-NLS-1$
+                case "business" -> 1; //$NON-NLS-1$
+                case "application" -> 2; //$NON-NLS-1$
+                case "technology" -> 3; //$NON-NLS-1$
+                case "motivation" -> 4; //$NON-NLS-1$
+                case "implementation_migration" -> 5; //$NON-NLS-1$
+                case "other" -> 6; //$NON-NLS-1$
+                case "relations" -> 7; //$NON-NLS-1$
+                case "diagrams" -> 8; //$NON-NLS-1$
+                default -> 999; // USER folders or unknown - sort last
+            };
+        }
+        
+        return -1; // Not under model/ folder - use alphabetical sort
+    }
+    
+    /**
      * Load model using DirCache-optimized bulk parallel reading.
      * 
      * Strategy:
@@ -1213,7 +1261,30 @@ public class GraficoModelImporter {
         // Separate folder.xml files from element files
         List<DirCacheFileEntry> folderXmlFiles = allEntries.stream()
             .filter(e -> e.isModelFile() && e.isFolderXml())
-            .sorted((a, b) -> Integer.compare(a.getDepth(), b.getDepth())) // Process parents before children
+            .sorted((a, b) -> {
+                // Sort by depth first (parents before children)
+                int depthCompare = Integer.compare(a.getDepth(), b.getDepth());
+                if (depthCompare != 0) {
+                    return depthCompare;
+                }
+                
+                // Within same depth, sort by folder type order (top-level) or alphabetically (nested)
+                int orderA = getFolderTypeOrder(a);
+                int orderB = getFolderTypeOrder(b);
+                
+                // If both are -1 (nested folders), sort alphabetically by folder name
+                if (orderA == -1 && orderB == -1) {
+                    return a.folderPath().compareTo(b.folderPath());
+                }
+                
+                // If one is -1 and the other isn't, this shouldn't happen at same depth
+                // but handle it by treating -1 as lowest priority
+                if (orderA == -1) return 1;
+                if (orderB == -1) return -1;
+                
+                // Both have explicit order - use canonical order
+                return Integer.compare(orderA, orderB);
+            })
             .collect(Collectors.toList());
         
         List<DirCacheFileEntry> elementFiles = allEntries.stream()
