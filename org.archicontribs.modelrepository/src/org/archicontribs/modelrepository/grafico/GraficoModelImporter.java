@@ -43,6 +43,8 @@ import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.dircache.DirCache;
 import org.eclipse.jgit.dircache.DirCacheEntry;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
@@ -1133,7 +1135,8 @@ public class GraficoModelImporter {
         String folderPath,      // Parent folder path e.g., "model/strategy"
         boolean isFolderXml,    // true if this is a folder.xml file
         boolean isModelFile,    // true if under model/ directory
-        boolean isImageFile     // true if under images/ directory
+        boolean isImageFile,    // true if under images/ directory
+        ObjectId objectId       // Git object ID for reading from object database
     ) {
         /**
          * Get the depth of this file in the folder hierarchy.
@@ -1181,7 +1184,9 @@ public class GraficoModelImporter {
             boolean isFolderXml = path.endsWith("/" + IGraficoConstants.FOLDER_XML) || //$NON-NLS-1$
                                   path.equals(IGraficoConstants.MODEL_FOLDER + "/" + IGraficoConstants.FOLDER_XML); //$NON-NLS-1$
             
-            entries.add(new DirCacheFileEntry(path, absolutePath, folderPath, isFolderXml, isModelFile, isImageFile));
+            ObjectId objectId = entry.getObjectId();
+            
+            entries.add(new DirCacheFileEntry(path, absolutePath, folderPath, isFolderXml, isModelFile, isImageFile, objectId));
         }
         
         return entries;
@@ -1615,20 +1620,29 @@ public class GraficoModelImporter {
      */
     private void readParseAndQueueStreaming(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
             AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
-        // Use Files.newInputStream() + BufferedInputStream to avoid large byte[] allocations.
-        // This reduces GC pressure compared to Files.readAllBytes().
+        // Read from git object database instead of filesystem to reduce syscalls:
+        // - No stat() to get metadata
+        // - No open() to get file descriptor  
+        // - Single read from pack file instead of multiple filesystem reads
+        //
+        // SAFETY: This method is only called from loadModelWithDirCache(), which is only
+        // called when initDirCacheForImport() returns true (meaning fGitRepository is initialized).
         try {
-            Path path = entry.absolutePath();
+            if (fGitRepository == null) {
+                throw new IllegalStateException("readParseAndQueueStreaming called without git repository initialized"); //$NON-NLS-1$
+            }
             
-            // PROFILING: Break down the 205ms per-file average
+            // PROFILING: Break down the per-file average
             long ioStart = PERF_LOGGING ? System.nanoTime() : 0;
             
-            // I/O + Parse: Stream directly from disk
-            // BufferedInputStream ensures we read in chunks (8KB) rather than byte-by-byte
+            // Read from git object database using ObjectId from DirCache
             long readStart = PERF_LOGGING ? System.nanoTime() : 0;
-            try (InputStream inputStream = new java.io.BufferedInputStream(Files.newInputStream(path))) {
+            ObjectLoader loader = fGitRepository.open(entry.objectId());
+            byte[] bytes = loader.getCachedBytes();
+            
+            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
                 long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
-                long ioTime = PERF_LOGGING ? (parseStart - ioStart) : 0;  // Time to open stream
+                long ioTime = PERF_LOGGING ? (parseStart - ioStart) : 0;  // Time to read from object DB
                 
                 IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
                 long parseEnd = PERF_LOGGING ? System.nanoTime() : 0;
