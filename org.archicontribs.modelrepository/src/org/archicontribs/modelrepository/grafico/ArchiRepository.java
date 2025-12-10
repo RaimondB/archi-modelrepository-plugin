@@ -157,6 +157,20 @@ public class ArchiRepository implements IArchiRepository {
         }
     }
     
+    /**
+     * Get a summary of changes to be committed
+     * @param maxItems Maximum number of items to list (use -1 for all)
+     * @return ChangeSummary containing formatted text and counts
+     * @throws IOException
+     * @throws GitAPIException
+     */
+    public ChangeSummary getChangeSummary(int maxItems) throws IOException, GitAPIException {
+        try(Git git = Git.open(getLocalRepositoryFolder())) {
+            Status status = git.status().call();
+            return ChangeSummary.from(status, getLocalRepositoryFolder(), maxItems);
+        }
+    }
+    
     @Override
     public RevCommit commitChanges(String commitMessage, boolean amend) throws GitAPIException, IOException {
         try(Git git = Git.open(getLocalRepositoryFolder())) {
@@ -457,12 +471,8 @@ public class ArchiRepository implements IArchiRepository {
         // Stage modified files to index if there are changes
         if(hasChanges) {
             progress.subTask(Messages.ArchiRepository_2);
-            try(Git git = Git.open(getLocalRepositoryFolder())) {
-                AddCommand addCommand = git.add();
-                addCommand.addFilepattern("."); //$NON-NLS-1$
-                addCommand.setUpdate(false);
-                addCommand.call();
-            }
+            // Use native git add for performance (much faster than JGit on Windows)
+            gitAdd();
         }
         progress.worked(20);
         
@@ -795,12 +805,19 @@ public class ArchiRepository implements IArchiRepository {
         boolean nativeSuccess = tryNativeGitAdd();
         
         if(!nativeSuccess) {
-            // Fall back to JGit
+            // Fall back to JGit - need to call add twice to stage new, modified, AND deleted files
             try(Git git = Git.open(getLocalRepositoryFolder())) {
-                AddCommand addCommand = git.add();
-                addCommand.addFilepattern("."); //$NON-NLS-1$
-                addCommand.setUpdate(false);
-                addCommand.call();
+                // Stage new and modified files
+                git.add()
+                    .addFilepattern(".") //$NON-NLS-1$
+                    .setUpdate(false)  // false = include new files
+                    .call();
+                
+                // Stage modified and deleted files
+                git.add()
+                    .addFilepattern(".") //$NON-NLS-1$
+                    .setUpdate(true)   // true = include deleted files
+                    .call();
             }
         }
         else {
@@ -909,7 +926,8 @@ public class ArchiRepository implements IArchiRepository {
      */
     private boolean tryNativeGitAdd() throws IOException {
         try {
-            ProcessBuilder pb = new ProcessBuilder("git", "add", "."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            // Use -A (--all) to stage new, modified, AND deleted files
+            ProcessBuilder pb = new ProcessBuilder("git", "add", "-A"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             pb.directory(getLocalRepositoryFolder());
             pb.redirectErrorStream(true);
             

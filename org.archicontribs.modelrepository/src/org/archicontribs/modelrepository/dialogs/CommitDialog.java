@@ -12,6 +12,7 @@ import java.io.IOException;
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
+import org.archicontribs.modelrepository.grafico.ChangeSummary;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.eclipse.jface.dialogs.IMessageProvider;
@@ -48,11 +49,12 @@ public class CommitDialog extends ExtendedTitleAreaDialog {
     
     private static String DIALOG_ID = "CommitDialog"; //$NON-NLS-1$
     
-    private Text fTextUserName, fTextUserEmail, fTextCommitMessage;
+    private Text fTextUserName, fTextUserEmail, fTextCommitMessage, fTextChangeSummary;
     private Button fAmendLastCommitCheckbox;
     
     private String fCommitMessage;
     private String fPreviousCommitMessage;
+    private String fChangeSummaryText;
     private boolean fAmend;
     
     private IArchiRepository fRepository;
@@ -131,9 +133,35 @@ public class CommitDialog extends ExtendedTitleAreaDialog {
         fTextUserEmail.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
         fTextUserEmail.setText(userEmail);
         
+        // Changes summary
+        label = new Label(container, SWT.NONE);
+        label.setText(Messages.CommitDialog_8); // "Changes to commit:"
+        GridData gd = new GridData(GridData.FILL_HORIZONTAL);
+        gd.horizontalSpan = 2;
+        label.setLayoutData(gd);
+        
+        fTextChangeSummary = new Text(container, SWT.BORDER | SWT.READ_ONLY | SWT.V_SCROLL | SWT.WRAP | SWT.MULTI);
+        gd = new GridData(SWT.FILL, SWT.BEGINNING, true, false);
+        gd.horizontalSpan = 2;
+        gd.heightHint = 100; // Fixed height for changes summary
+        gd.widthHint = 400;  // Minimum width
+        fTextChangeSummary.setLayoutData(gd);
+        fTextChangeSummary.setBackground(container.getDisplay().getSystemColor(SWT.COLOR_WIDGET_BACKGROUND));
+        
+        // Load and display change summary
+        try {
+            ChangeSummary summary = fRepository.getChangeSummary(20);
+            fChangeSummaryText = summary.getSummaryText();
+            fTextChangeSummary.setText(fChangeSummaryText);
+        }
+        catch(Exception ex) {
+            fTextChangeSummary.setText(Messages.CommitDialog_9); // "Error loading changes"
+            ex.printStackTrace();
+        }
+        
         label = new Label(container, SWT.NONE);
         label.setText(Messages.CommitDialog_4);
-        GridData gd = new GridData(GridData.FILL_HORIZONTAL);
+        gd = new GridData(GridData.FILL_HORIZONTAL);
         gd.horizontalSpan = 2;
         label.setLayoutData(gd);
         
@@ -206,7 +234,24 @@ public class CommitDialog extends ExtendedTitleAreaDialog {
 
     @Override
     protected void okPressed() {
-        fCommitMessage = fTextCommitMessage.getText();
+        String userMessage = fTextCommitMessage.getText();
+        
+        // Append change summary after user's commit message
+        // Format: user message, empty line, change summary
+        if(userMessage != null && !userMessage.trim().isEmpty()) {
+            fCommitMessage = userMessage;
+            if(fChangeSummaryText != null && !fChangeSummaryText.isEmpty()) {
+                fCommitMessage += "\n\n" + fChangeSummaryText; //$NON-NLS-1$
+            }
+        }
+        else if(fChangeSummaryText != null && !fChangeSummaryText.isEmpty()) {
+            // No user message, just use change summary
+            fCommitMessage = fChangeSummaryText;
+        }
+        else {
+            fCommitMessage = userMessage;
+        }
+        
         fAmend = fAmendLastCommitCheckbox.getSelection();
         
         // Store user name and email
@@ -218,6 +263,11 @@ public class CommitDialog extends ExtendedTitleAreaDialog {
         }
         
         super.okPressed();
+    }
+    
+    @Override
+    protected Point getInitialSize() {
+        return new Point(600, 700);
     }
 
     private int getLatestLocalCommitParentCount() throws IOException {

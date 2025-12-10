@@ -67,6 +67,15 @@ public interface IArchiRepository extends IGraficoConstants {
     boolean hasChangesToCommit() throws IOException, GitAPIException;
 
     /**
+     * Get a summary of changes to be committed
+     * @param maxItems Maximum number of items to list
+     * @return ChangeSummary containing formatted text and counts
+     * @throws IOException
+     * @throws GitAPIException
+     */
+    ChangeSummary getChangeSummary(int maxItems) throws IOException, GitAPIException;
+
+    /**
      * Commit any changes
      * @param commitMessage
      * @param amend If true, previous commit is amended
