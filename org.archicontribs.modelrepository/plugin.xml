@@ -47,6 +47,12 @@
       </command>
       <command
             categoryId="org.archicontribs.modelrepository.category"
+            defaultHandler="org.archicontribs.modelrepository.actions.ReviewChangesHandler"
+            id="org.archicontribs.modelrepository.command.reviewChanges"
+            name="%command.name.12">
+      </command>
+      <command
+            categoryId="org.archicontribs.modelrepository.category"
             defaultHandler="org.archicontribs.modelrepository.actions.PushModelHandler"
             id="org.archicontribs.modelrepository.command.pushModel"
             name="%command.name.6">
@@ -117,6 +123,10 @@
             icon="img/commit.png">
       </image>
       <image
+            commandId="org.archicontribs.modelrepository.command.reviewChanges"
+            icon="img/revert.png">
+      </image>
+      <image
             commandId="org.archicontribs.modelrepository.command.pushModel"
             icon="img/push.png">
       </image>
@@ -180,6 +190,11 @@
             <command
                   commandId="org.archicontribs.modelrepository.command.commitModel"
                   icon="img/commit.png"
+                  style="push">
+            </command>
+            <command
+                  commandId="org.archicontribs.modelrepository.command.reviewChanges"
+                  icon="img/revert.png"
                   style="push">
             </command>
             <command
@@ -250,6 +265,11 @@
             <command
                   commandId="org.archicontribs.modelrepository.command.commitModel"
                   icon="img/commit.png"
+                  style="push">
+            </command>
+            <command
+                  commandId="org.archicontribs.modelrepository.command.reviewChanges"
+                  icon="img/revert.png"
                   style="push">
             </command>
             <command

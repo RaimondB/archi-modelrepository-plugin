@@ -166,6 +166,18 @@ public class Messages extends NLS {
 
     public static String RestoreCommitAction_4;
 
+    public static String ReviewChangesAction_0;
+
+    public static String ReviewChangesAction_1;
+
+    public static String ReviewChangesAction_2;
+
+    public static String ReviewChangesAction_3;
+
+    public static String ReviewChangesAction_4;
+
+    public static String ReviewChangesAction_5;
+
     public static String ShowInBranchesViewAction_0;
 
     public static String ShowInHistoryAction_0;
