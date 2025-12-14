@@ -83,8 +83,11 @@ public class ChangeReviewHandler {
     private IArchimateModel fHeadModel;
     
     // Cache for HEAD model ID lookups - safe to cache because HEAD model is immutable during reverts
-    // Current model lookups must NOT be cached because the model changes during reverts
     private Map<String, IIdentifier> fHeadModelIdCache;
+    
+    // Cache for current model ID lookups - incrementally updated as objects are added/removed
+    // This is safe because we explicitly update the cache when we modify the model
+    private Map<String, IIdentifier> fCurrentModelIdCache;
     
     private IProgressMonitor fProgressMonitor;
 
@@ -261,6 +264,10 @@ public class ChangeReviewHandler {
      * @throws IOException If revert fails
      */
     public void applyReverts() throws IOException {
+        // Build current model cache for O(1) lookups during reverts
+        // We'll update this cache incrementally as we add/remove objects
+        buildCurrentModelIdCache();
+        
         // Collect reverts to apply, sorted by type for correct ordering
         List<ChangeInfo> elementReverts = new ArrayList<>();
         List<ChangeInfo> relationReverts = new ArrayList<>();
@@ -343,7 +350,7 @@ public class ChangeReviewHandler {
                 String profileId = getIdentifierId(headProfile);
                 
                 // Check if profile exists in current model
-                EObject existing = ArchimateModelUtils.getObjectByID(fCurrentModel, profileId);
+                IIdentifier existing = lookupInCurrentModel(profileId);
                 if(existing instanceof IProfile) {
                     continue; // Already exists
                 }
@@ -386,6 +393,10 @@ public class ChangeReviewHandler {
     private void revertAddition(ChangeInfo info) {
         EObject current = info.getEObject(ChangeInfo.CURRENT);
         if(current != null) {
+            // Update cache before removal
+            if(current instanceof IIdentifier identifier) {
+                removeFromCurrentModelCache(identifier.getId());
+            }
             // Remove from parent
             EcoreUtil.remove(current);
         }
@@ -429,14 +440,17 @@ public class ChangeReviewHandler {
         if(targetFolder != null) {
             if(copy instanceof IArchimateElement || copy instanceof IArchimateRelationship) {
                 targetFolder.getElements().add((IIdentifier)copy);
+                addToCurrentModelCache((IIdentifier)copy);
                 logDebug("  Added element to folder"); //$NON-NLS-1$
             }
             else if(copy instanceof IDiagramModel) {
                 targetFolder.getElements().add((IDiagramModel)copy);
+                addToCurrentModelCache((IDiagramModel)copy);
                 logDebug("  Added diagram to folder"); //$NON-NLS-1$
             }
             else if(copy instanceof IFolder) {
                 targetFolder.getFolders().add((IFolder)copy);
+                addToCurrentModelCache((IFolder)copy);
                 logDebug("  Added subfolder to folder"); //$NON-NLS-1$
             }
         }
@@ -508,7 +522,7 @@ public class ChangeReviewHandler {
         IArchimateConcept source = rel.getSource();
         if(source != null) {
             String sourceId = getIdentifierId(source);
-            EObject currentSource = ArchimateModelUtils.getObjectByID(fCurrentModel, sourceId);
+            IIdentifier currentSource = lookupInCurrentModel(sourceId);
             if(currentSource instanceof IArchimateConcept concept) {
                 rel.setSource(concept);
                 logDebug("  resolved relationship source: " + concept.getName()); //$NON-NLS-1$
@@ -521,7 +535,7 @@ public class ChangeReviewHandler {
         IArchimateConcept target = rel.getTarget();
         if(target != null) {
             String targetId = getIdentifierId(target);
-            EObject currentTarget = ArchimateModelUtils.getObjectByID(fCurrentModel, targetId);
+            IIdentifier currentTarget = lookupInCurrentModel(targetId);
             if(currentTarget instanceof IArchimateConcept concept) {
                 rel.setTarget(concept);
                 logDebug("  resolved relationship target: " + concept.getName()); //$NON-NLS-1$
@@ -554,7 +568,7 @@ public class ChangeReviewHandler {
             String profileId = getIdentifierId(headProfile);
             logDebug("  looking up profile: " + profileId + " (proxy=" + headProfile.eIsProxy() + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             
-            EObject currentProfile = ArchimateModelUtils.getObjectByID(fCurrentModel, profileId);
+            IIdentifier currentProfile = lookupInCurrentModel(profileId);
             if(currentProfile instanceof IProfile profile) {
                 profilesObj.getProfiles().add(profile);
                 logDebug("  resolved profile: " + profile.getName()); //$NON-NLS-1$
@@ -626,7 +640,7 @@ public class ChangeReviewHandler {
     private IProfile copyProfileFromHead(IProfile headProfile) {
         // Check if already added (in case multiple elements reference the same deleted profile)
         String profileId = headProfile.getId();
-        EObject existing = ArchimateModelUtils.getObjectByID(fCurrentModel, profileId);
+        IIdentifier existing = lookupInCurrentModel(profileId);
         if(existing instanceof IProfile existingProfile) {
             logDebug("  profile already in current model: " + existingProfile.getName()); //$NON-NLS-1$
             return existingProfile;
@@ -638,8 +652,9 @@ public class ChangeReviewHandler {
         // Restore the original ID (EcoreUtil.copy generates new IDs)
         copiedProfile.setId(profileId);
         
-        // Add to current model's profiles
+        // Add to current model's profiles and update cache
         fCurrentModel.getProfiles().add(copiedProfile);
+        addToCurrentModelCache(copiedProfile);
         logDebug("  added profile to current model: " + copiedProfile.getName() + " (id=" + copiedProfile.getId() + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         return copiedProfile;
@@ -652,7 +667,7 @@ public class ChangeReviewHandler {
         IArchimateElement headElement = diagramObj.getArchimateElement();
         if(headElement != null) {
             String elementId = getIdentifierId(headElement);
-            EObject currentElement = ArchimateModelUtils.getObjectByID(fCurrentModel, elementId);
+            IIdentifier currentElement = lookupInCurrentModel(elementId);
             if(currentElement instanceof IArchimateElement element) {
                 diagramObj.setArchimateElement(element);
                 logDebug("  resolved diagram object element: " + element.getName()); //$NON-NLS-1$
@@ -669,7 +684,7 @@ public class ChangeReviewHandler {
         IArchimateRelationship headRel = diagramConn.getArchimateRelationship();
         if(headRel != null) {
             String relId = getIdentifierId(headRel);
-            EObject currentRel = ArchimateModelUtils.getObjectByID(fCurrentModel, relId);
+            IIdentifier currentRel = lookupInCurrentModel(relId);
             if(currentRel instanceof IArchimateRelationship rel) {
                 diagramConn.setArchimateRelationship(rel);
                 logDebug("  resolved diagram connection relationship: " + rel.getName()); //$NON-NLS-1$
@@ -701,7 +716,7 @@ public class ChangeReviewHandler {
             logDebug("  resolving source ID: " + sourceId); //$NON-NLS-1$
             
             // Find corresponding object in current model
-            EObject currentSource = ArchimateModelUtils.getObjectByID(fCurrentModel, sourceId);
+            IIdentifier currentSource = lookupInCurrentModel(sourceId);
             if(currentSource instanceof IArchimateConcept concept) {
                 relCopy.setSource(concept);
                 logDebug("  resolved source to: " + concept.getName()); //$NON-NLS-1$
@@ -715,7 +730,7 @@ public class ChangeReviewHandler {
             logDebug("  resolving target ID: " + targetId); //$NON-NLS-1$
             
             // Find corresponding object in current model
-            EObject currentTarget = ArchimateModelUtils.getObjectByID(fCurrentModel, targetId);
+            IIdentifier currentTarget = lookupInCurrentModel(targetId);
             if(currentTarget instanceof IArchimateConcept concept) {
                 relCopy.setTarget(concept);
                 logDebug("  resolved target to: " + concept.getName()); //$NON-NLS-1$
@@ -811,7 +826,7 @@ public class ChangeReviewHandler {
         logDebug("  headFolder: " + headFolder.getName() + " (id=" + folderId + ", type=" + headFolder.getType() + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
         
         // Try to find folder with same ID in current model
-        EObject currentFolder = ArchimateModelUtils.getObjectByID(fCurrentModel, folderId);
+        IIdentifier currentFolder = lookupInCurrentModel(folderId);
         logDebug("  found in current model by ID: " + currentFolder); //$NON-NLS-1$
         
         if(currentFolder instanceof IFolder) {
@@ -834,7 +849,7 @@ public class ChangeReviewHandler {
      */
     private IFolder restoreFolderHierarchy(IFolder headFolder) {
         // Check if this folder already exists in current model
-        EObject existing = ArchimateModelUtils.getObjectByID(fCurrentModel, headFolder.getId());
+        IIdentifier existing = lookupInCurrentModel(headFolder.getId());
         if(existing instanceof IFolder) {
             return (IFolder) existing;
         }
@@ -873,8 +888,9 @@ public class ChangeReviewHandler {
         folderCopy.getElements().clear();
         folderCopy.getFolders().clear();
         
-        // Add to parent
+        // Add to parent and update cache
         parentInCurrent.getFolders().add(folderCopy);
+        addToCurrentModelCache(folderCopy);
         logDebug("  restored folder: " + folderCopy.getName() + " (id=" + folderCopy.getId() + ") under " + parentInCurrent.getName()); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         return folderCopy;
@@ -1058,5 +1074,77 @@ public class ChangeReviewHandler {
         // Fallback to linear search
         EObject obj = ArchimateModelUtils.getObjectByID(fHeadModel, id);
         return obj instanceof IIdentifier ? (IIdentifier) obj : null;
+    }
+    
+    // ==================== Current Model ID Cache ====================
+    // These methods provide O(1) lookups in the current model.
+    // The cache is incrementally updated as objects are added/removed during reverts.
+    
+    /**
+     * Build the current model ID cache for O(1) lookups.
+     * Called at the start of applyReverts().
+     */
+    private void buildCurrentModelIdCache() {
+        if(fCurrentModel == null) {
+            return;
+        }
+        
+        fCurrentModelIdCache = new HashMap<>();
+        
+        // Cache all identifiable objects from current model
+        for(Iterator<EObject> iter = fCurrentModel.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IIdentifier identifier) {
+                fCurrentModelIdCache.put(identifier.getId(), identifier);
+            }
+        }
+        
+        logDebug("Built current model ID cache with " + fCurrentModelIdCache.size() + " entries"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Look up an object by ID in the current model cache.
+     * Falls back to linear search if cache is not available.
+     * 
+     * @param id The ID to look up
+     * @return The object, or null if not found
+     */
+    private IIdentifier lookupInCurrentModel(String id) {
+        if(id == null) {
+            return null;
+        }
+        
+        // Use cache if available
+        if(fCurrentModelIdCache != null) {
+            return fCurrentModelIdCache.get(id);
+        }
+        
+        // Fallback to linear search
+        EObject obj = ArchimateModelUtils.getObjectByID(fCurrentModel, id);
+        return obj instanceof IIdentifier ? (IIdentifier) obj : null;
+    }
+    
+    /**
+     * Add an object to the current model cache.
+     * Call this when adding objects to the model during reverts.
+     * 
+     * @param obj The object to add to the cache
+     */
+    private void addToCurrentModelCache(IIdentifier obj) {
+        if(fCurrentModelIdCache != null && obj != null) {
+            fCurrentModelIdCache.put(obj.getId(), obj);
+        }
+    }
+    
+    /**
+     * Remove an object from the current model cache.
+     * Call this when removing objects from the model during reverts.
+     * 
+     * @param id The ID of the object to remove
+     */
+    private void removeFromCurrentModelCache(String id) {
+        if(fCurrentModelIdCache != null && id != null) {
+            fCurrentModelIdCache.remove(id);
+        }
     }
 }
