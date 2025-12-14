@@ -7,8 +7,10 @@ package org.archicontribs.modelrepository.review;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
@@ -80,6 +82,10 @@ public class ChangeReviewHandler {
     private IArchimateModel fCurrentModel;
     private IArchimateModel fHeadModel;
     
+    // Cache for HEAD model ID lookups - safe to cache because HEAD model is immutable during reverts
+    // Current model lookups must NOT be cached because the model changes during reverts
+    private Map<String, IIdentifier> fHeadModelIdCache;
+    
     private IProgressMonitor fProgressMonitor;
 
     /**
@@ -117,6 +123,10 @@ public class ChangeReviewHandler {
         logDebug("Loading HEAD model from git objects"); //$NON-NLS-1$
         fHeadModel = extractModel(IGraficoConstants.HEAD);
         
+        // Build HEAD model ID cache for O(1) lookups during reverts
+        // Safe to cache because HEAD model is immutable during revert operations
+        buildHeadModelIdCache();
+        
         // Build list of changes from git status (fast - no file I/O needed)
         fChangeInfos = new ArrayList<>();
         buildChangeList();
@@ -135,6 +145,9 @@ public class ChangeReviewHandler {
         
         fProgressMonitor = pm;
         fHeadModel = extractModel(IGraficoConstants.HEAD);
+        
+        // Build HEAD model ID cache for O(1) lookups during reverts
+        buildHeadModelIdCache();
     }
     
     /**
@@ -590,6 +603,7 @@ public class ChangeReviewHandler {
     
     /**
      * Resolve a profile by ID from the HEAD model.
+     * Uses cached ID lookup for O(1) performance.
      * 
      * @param profileId The profile ID
      * @return The resolved profile from HEAD model, or null if not found
@@ -598,7 +612,7 @@ public class ChangeReviewHandler {
         if(fHeadModel == null) {
             return null;
         }
-        EObject obj = ArchimateModelUtils.getObjectByID(fHeadModel, profileId);
+        IIdentifier obj = lookupInHeadModel(profileId);
         return obj instanceof IProfile ? (IProfile) obj : null;
     }
     
@@ -995,5 +1009,54 @@ public class ChangeReviewHandler {
         catch(Exception e) {
             throw new IOException(e);
         }
+    }
+    
+    // ==================== HEAD Model ID Cache ====================
+    // These methods provide O(1) lookups in the HEAD model.
+    // The cache is safe because HEAD model is immutable during revert operations.
+    // Current model lookups must NOT use this cache - the model changes during reverts.
+    
+    /**
+     * Build the HEAD model ID cache for O(1) lookups.
+     * Called when HEAD model is loaded.
+     */
+    private void buildHeadModelIdCache() {
+        if(fHeadModel == null) {
+            return;
+        }
+        
+        fHeadModelIdCache = new HashMap<>();
+        
+        // Cache all identifiable objects from HEAD model
+        for(Iterator<EObject> iter = fHeadModel.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IIdentifier identifier) {
+                fHeadModelIdCache.put(identifier.getId(), identifier);
+            }
+        }
+        
+        logDebug("Built HEAD model ID cache with " + fHeadModelIdCache.size() + " entries"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Look up an object by ID in the HEAD model cache.
+     * Falls back to linear search if cache is not available.
+     * 
+     * @param id The ID to look up
+     * @return The object, or null if not found
+     */
+    private IIdentifier lookupInHeadModel(String id) {
+        if(id == null) {
+            return null;
+        }
+        
+        // Use cache if available
+        if(fHeadModelIdCache != null) {
+            return fHeadModelIdCache.get(id);
+        }
+        
+        // Fallback to linear search
+        EObject obj = ArchimateModelUtils.getObjectByID(fHeadModel, id);
+        return obj instanceof IIdentifier ? (IIdentifier) obj : null;
     }
 }
