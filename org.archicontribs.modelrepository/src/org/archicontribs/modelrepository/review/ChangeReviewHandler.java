@@ -29,6 +29,7 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.swt.widgets.Shell;
+import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.model.FolderType;
 import com.archimatetool.model.IArchimateConcept;
 import com.archimatetool.model.IArchimateElement;
@@ -300,6 +301,9 @@ public class ChangeReviewHandler {
         for(ChangeInfo info : otherReverts) {
             applyRevert(info);
         }
+        
+        // Save the model to persist the reverts
+        IEditorModelManager.INSTANCE.saveModel(fCurrentModel);
     }
     
     /**
