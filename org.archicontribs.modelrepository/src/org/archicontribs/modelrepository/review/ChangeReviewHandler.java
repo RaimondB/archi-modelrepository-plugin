@@ -34,12 +34,17 @@ import org.eclipse.swt.widgets.Shell;
 import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.model.FolderType;
 import com.archimatetool.model.IArchimateConcept;
+import com.archimatetool.model.IArchimateDiagramModel;
 import com.archimatetool.model.IArchimateElement;
 import com.archimatetool.model.IArchimateModel;
 import com.archimatetool.model.IArchimateRelationship;
+import com.archimatetool.model.IConnectable;
 import com.archimatetool.model.IDiagramModel;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IDiagramModelArchimateObject;
+import com.archimatetool.model.IDiagramModelConnection;
+import com.archimatetool.model.IDiagramModelContainer;
+import com.archimatetool.model.IDiagramModelObject;
 import com.archimatetool.model.IFolder;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.IProfile;
@@ -129,6 +134,10 @@ public class ChangeReviewHandler {
         // Build HEAD model ID cache for O(1) lookups during reverts
         // Safe to cache because HEAD model is immutable during revert operations
         buildHeadModelIdCache();
+        
+        // Build current model ID cache for O(1) lookups during dependency analysis
+        // This makes diagram dependency analysis fast when user marks diagrams for revert
+        buildCurrentModelIdCache();
         
         // Build list of changes from git status (fast - no file I/O needed)
         fChangeInfos = new ArrayList<>();
@@ -254,6 +263,95 @@ public class ChangeReviewHandler {
     }
     
     /**
+     * Analyze diagram dependencies for a ChangeInfo representing a diagram.
+     * 
+     * This scans the diagram from HEAD model and identifies visual objects
+     * that reference elements/relationships that don't exist in the current model.
+     * 
+     * @param info The ChangeInfo for a diagram (must be a diagram for this to do anything)
+     * @return List of dependencies, empty if none or if not a diagram
+     */
+    public List<DiagramDependencyInfo> analyzeDiagramDependencies(ChangeInfo info) {
+        List<DiagramDependencyInfo> dependencies = new ArrayList<>();
+        
+        // Only analyze diagrams that are being reverted from HEAD
+        EObject headObj = info.getEObject(ChangeInfo.HEAD);
+        if (!(headObj instanceof IDiagramModel headDiagram)) {
+            return dependencies;
+        }
+        
+        // Track which concepts are missing and how many visual objects reference them
+        Map<String, Integer> elementRefCounts = new HashMap<>();
+        Map<String, Integer> relationRefCounts = new HashMap<>();
+        Map<String, IArchimateElement> missingElements = new HashMap<>();
+        Map<String, IArchimateRelationship> missingRelations = new HashMap<>();
+        
+        // Scan all diagram contents recursively
+        scanDiagramForMissingConcepts(headDiagram, elementRefCounts, relationRefCounts, 
+                                       missingElements, missingRelations);
+        
+        // Create DiagramDependencyInfo for each missing element
+        for (Map.Entry<String, IArchimateElement> entry : missingElements.entrySet()) {
+            int refCount = elementRefCounts.getOrDefault(entry.getKey(), 1);
+            dependencies.add(new DiagramDependencyInfo(entry.getValue(), refCount, info));
+        }
+        
+        // Create DiagramDependencyInfo for each missing relationship
+        for (Map.Entry<String, IArchimateRelationship> entry : missingRelations.entrySet()) {
+            int refCount = relationRefCounts.getOrDefault(entry.getKey(), 1);
+            dependencies.add(new DiagramDependencyInfo(entry.getValue(), refCount, info));
+        }
+        
+        logDebug("analyzeDiagramDependencies: " + dependencies.size() + " missing concepts for " + headDiagram.getName()); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        return dependencies;
+    }
+    
+    /**
+     * Recursively scan a diagram container for visual objects that reference missing concepts
+     */
+    private void scanDiagramForMissingConcepts(IDiagramModelContainer container,
+            Map<String, Integer> elementRefCounts, Map<String, Integer> relationRefCounts,
+            Map<String, IArchimateElement> missingElements, Map<String, IArchimateRelationship> missingRelations) {
+        
+        for (IDiagramModelObject child : container.getChildren()) {
+            // Check diagram objects that reference ArchiMate elements
+            if (child instanceof IDiagramModelArchimateObject diagramObj) {
+                IArchimateElement headElement = diagramObj.getArchimateElement();
+                if (headElement != null) {
+                    String elementId = headElement.getId();
+                    // Check if element exists in current model
+                    if (lookupInCurrentModel(elementId) == null) {
+                        // Element is missing - track it
+                        missingElements.putIfAbsent(elementId, headElement);
+                        elementRefCounts.merge(elementId, 1, Integer::sum);
+                    }
+                }
+                
+                // Check connections on this object
+                for (var conn : diagramObj.getSourceConnections()) {
+                    if (conn instanceof IDiagramModelArchimateConnection diagramConn) {
+                        IArchimateRelationship headRel = diagramConn.getArchimateRelationship();
+                        if (headRel != null) {
+                            String relId = headRel.getId();
+                            if (lookupInCurrentModel(relId) == null) {
+                                missingRelations.putIfAbsent(relId, headRel);
+                                relationRefCounts.merge(relId, 1, Integer::sum);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Recurse into nested containers
+            if (child instanceof IDiagramModelContainer nestedContainer) {
+                scanDiagramForMissingConcepts(nestedContainer, elementRefCounts, relationRefCounts,
+                                              missingElements, missingRelations);
+            }
+        }
+    }
+
+    /**
      * Apply the user's revert choices to the current model.
      * 
      * Order of operations is critical for deletions:
@@ -264,7 +362,8 @@ public class ChangeReviewHandler {
      * @throws IOException If revert fails
      */
     public void applyReverts() throws IOException {
-        // Build current model cache for O(1) lookups during reverts
+        // Rebuild current model cache to ensure it's fresh before applying reverts
+        // (The model may have changed since init() was called)
         // We'll update this cache incrementally as we add/remove objects
         buildCurrentModelIdCache();
         
@@ -279,21 +378,24 @@ public class ChangeReviewHandler {
                 continue;
             }
             
+            EObject headObj = info.getEObject(ChangeInfo.HEAD);
+            
+            // Diagrams (both DELETED and MODIFIED) need special handling
+            // They may have dependencies that need to be pre-restored
+            if(headObj instanceof IDiagramModel) {
+                diagramReverts.add(info);
+            }
             // For deletions, we need to restore in dependency order
-            // For additions/modifications, order doesn't matter as much
-            if(info.getChangeType() == ChangeInfo.DELETED) {
-                EObject headObj = info.getEObject(ChangeInfo.HEAD);
+            else if(info.getChangeType() == ChangeInfo.DELETED) {
                 if(headObj instanceof IArchimateRelationship) {
                     relationReverts.add(info);
-                } else if(headObj instanceof IDiagramModel) {
-                    diagramReverts.add(info);
                 } else if(headObj instanceof IArchimateElement) {
                     elementReverts.add(info);
                 } else {
                     otherReverts.add(info);
                 }
             } else {
-                // Additions and modifications can be processed in any order
+                // Additions and modifications (except diagrams) can be processed in any order
                 otherReverts.add(info);
             }
         }
@@ -307,6 +409,11 @@ public class ChangeReviewHandler {
         // This ensures profiles exist before elements that reference them are processed
         preRestoreMissingProfiles(elementReverts);
         preRestoreMissingProfiles(relationReverts);
+        
+        // Phase 1b: Pre-restore concepts that diagram dependencies require
+        // This ensures elements/relationships exist before diagrams reference them
+        // This handles both DELETED and MODIFIED diagrams
+        preRestoreDiagramDependencies(diagramReverts);
         
         // Phase 2: Apply in correct order: elements, relations, diagrams, other
         for(ChangeInfo info : elementReverts) {
@@ -365,6 +472,200 @@ public class ChangeReviewHandler {
         }
     }
     
+    /**
+     * Pre-restore concepts (elements/relationships) that diagram dependencies require.
+     * 
+     * For each diagram being reverted that has dependencies marked as RESTORE_CONCEPT,
+     * this method restores those concepts from HEAD before the diagram is processed.
+     * 
+     * @param diagramReverts List of diagram ChangeInfos to check
+     */
+    private void preRestoreDiagramDependencies(List<ChangeInfo> diagramReverts) {
+        // Collect all concepts that need to be restored
+        Set<String> conceptsToRestore = new java.util.HashSet<>();
+        Map<String, DiagramDependencyInfo> conceptToDepInfo = new HashMap<>();
+        
+        for(ChangeInfo info : diagramReverts) {
+            if(!info.hasDependencies()) {
+                continue;
+            }
+            
+            for(DiagramDependencyInfo dep : info.getDependencies()) {
+                if(dep.shouldRestore() && !conceptsToRestore.contains(dep.getConceptId())) {
+                    conceptsToRestore.add(dep.getConceptId());
+                    conceptToDepInfo.put(dep.getConceptId(), dep);
+                }
+            }
+        }
+        
+        logDebug("preRestoreDiagramDependencies: " + conceptsToRestore.size() + " concepts to restore"); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Restore each concept from HEAD
+        // Order: elements first, then relationships (since relationships reference elements)
+        List<DiagramDependencyInfo> elements = new ArrayList<>();
+        List<DiagramDependencyInfo> relationships = new ArrayList<>();
+        
+        for(String conceptId : conceptsToRestore) {
+            DiagramDependencyInfo dep = conceptToDepInfo.get(conceptId);
+            if(dep.isElement()) {
+                elements.add(dep);
+            } else {
+                relationships.add(dep);
+            }
+        }
+        
+        // Restore elements first
+        for(DiagramDependencyInfo dep : elements) {
+            restoreConceptFromDependency(dep);
+        }
+        
+        // Then restore relationships
+        for(DiagramDependencyInfo dep : relationships) {
+            restoreConceptFromDependency(dep);
+        }
+    }
+    
+    /**
+     * Restore a concept (element or relationship) from a diagram dependency.
+     */
+    private void restoreConceptFromDependency(DiagramDependencyInfo dep) {
+        EObject headConcept = dep.getHeadConcept();
+        if(headConcept == null) {
+            logDebug("restoreConceptFromDependency: headConcept is null for " + dep.getConceptId()); //$NON-NLS-1$
+            return;
+        }
+        
+        // Check if already exists in current model
+        if(lookupInCurrentModel(dep.getConceptId()) != null) {
+            logDebug("restoreConceptFromDependency: concept already exists: " + dep.getConceptId()); //$NON-NLS-1$
+            return;
+        }
+        
+        logDebug("restoreConceptFromDependency: restoring " + dep.getConceptType() + " " + dep.getConceptId()); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Create a copy
+        EObject copy = EcoreUtil.copy(headConcept);
+        
+        // Restore original IDs
+        restoreOriginalIds(headConcept, copy);
+        
+        // Resolve cross-model references
+        resolveCrossModelReferences(copy, headConcept);
+        
+        // Find target folder - use the folder from HEAD model
+        EObject container = headConcept.eContainer();
+        if(container instanceof IFolder headFolder) {
+            IFolder targetFolder = findOrRestoreFolder(headFolder);
+            if(targetFolder != null) {
+                if(copy instanceof IArchimateElement || copy instanceof IArchimateRelationship) {
+                    targetFolder.getElements().add((IIdentifier)copy);
+                    addToCurrentModelCache((IIdentifier)copy);
+                    logDebug("  Added concept to folder: " + targetFolder.getName()); //$NON-NLS-1$
+                }
+            }
+        }
+    }
+
+    /**
+     * Find or restore a folder in the current model that corresponds to a folder from HEAD.
+     * 
+     * @param headFolder The folder from HEAD model
+     * @return The corresponding folder in current model (existing or restored)
+     */
+    private IFolder findOrRestoreFolder(IFolder headFolder) {
+        // First try to find the folder by ID in current model
+        IIdentifier existing = lookupInCurrentModel(headFolder.getId());
+        if(existing instanceof IFolder) {
+            return (IFolder) existing;
+        }
+        
+        // Not found - restore the folder hierarchy
+        return restoreFolderHierarchy(headFolder);
+    }
+
+    /**
+     * Remove visual objects from a diagram copy for dependencies marked as REMOVE_FROM_DIAGRAM.
+     * This is called during diagram revert, after the diagram is copied but before references are resolved.
+     * 
+     * IMPORTANT: When removing a visual object (element), we must also remove any connections
+     * that have this object as their source or target. Otherwise the connections will have
+     * invalid references and fail Archi's validation.
+     * 
+     * @param diagramCopy The copied diagram to modify
+     * @param dependencies The list of dependencies to check
+     */
+    private void removeVisualObjectsForDependencies(IDiagramModel diagramCopy, List<DiagramDependencyInfo> dependencies) {
+        // Collect concept IDs that should be removed from the diagram
+        Set<String> conceptIdsToRemove = new java.util.HashSet<>();
+        for(DiagramDependencyInfo dep : dependencies) {
+            if(dep.getUserChoice() == DiagramDependencyInfo.REMOVE_FROM_DIAGRAM) {
+                conceptIdsToRemove.add(dep.getConceptId());
+            }
+        }
+        
+        if(conceptIdsToRemove.isEmpty()) {
+            return;
+        }
+        
+        logDebug("removeVisualObjectsForDependencies: removing " + conceptIdsToRemove.size() + " concepts from diagram"); //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Phase 1: Collect visual objects to remove and build a set of those objects
+        Set<EObject> visualObjectsToRemove = new java.util.HashSet<>();
+        List<IDiagramModelArchimateConnection> allConnections = new ArrayList<>();
+        
+        // Walk through all diagram contents
+        for(Iterator<EObject> iter = diagramCopy.eAllContents(); iter.hasNext();) {
+            EObject child = iter.next();
+            
+            // Check if this is an ArchiMate object referencing a concept to remove
+            if(child instanceof IDiagramModelArchimateObject dmo) {
+                // The archimateElement reference still points to HEAD model at this point
+                IArchimateElement element = dmo.getArchimateElement();
+                if(element != null && conceptIdsToRemove.contains(element.getId())) {
+                    visualObjectsToRemove.add(child);
+                    logDebug("  Marking for removal: object for element " + element.getId()); //$NON-NLS-1$
+                }
+            }
+            // Collect all connections - we'll check source/target later
+            else if(child instanceof IDiagramModelArchimateConnection dmc) {
+                allConnections.add(dmc);
+                
+                // Also check if the relationship itself should be removed
+                IArchimateRelationship relationship = dmc.getArchimateRelationship();
+                if(relationship != null && conceptIdsToRemove.contains(relationship.getId())) {
+                    visualObjectsToRemove.add(child);
+                    logDebug("  Marking for removal: connection for relationship " + relationship.getId()); //$NON-NLS-1$
+                }
+            }
+        }
+        
+        // Phase 2: Find connections whose source or target is a visual object being removed
+        // These must also be removed, or they'll have invalid references
+        for(IDiagramModelArchimateConnection conn : allConnections) {
+            if(visualObjectsToRemove.contains(conn)) {
+                continue; // Already marked for removal
+            }
+            
+            // IConnectable is the common interface for source/target - cast to EObject for Set contains
+            EObject source = (EObject)conn.getSource();
+            EObject target = (EObject)conn.getTarget();
+            
+            if(visualObjectsToRemove.contains(source) || visualObjectsToRemove.contains(target)) {
+                visualObjectsToRemove.add(conn);
+                IArchimateRelationship relationship = conn.getArchimateRelationship();
+                String relId = relationship != null ? relationship.getId() : "?"; //$NON-NLS-1$
+                logDebug("  Marking for removal: connection " + relId + " (source/target being removed)"); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+        }
+        
+        // Phase 3: Remove the collected objects
+        for(EObject obj : visualObjectsToRemove) {
+            EcoreUtil.remove(obj);
+        }
+        
+        logDebug("  Removed " + visualObjectsToRemove.size() + " visual objects from diagram"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+
     /**
      * Apply a single revert
      */
@@ -429,6 +730,14 @@ public class ChangeReviewHandler {
             logDebug("  copy ID after restoreOriginalIds: " + ((IIdentifier)copy).getId()); //$NON-NLS-1$
         }
         
+        // For diagrams with dependencies marked as REMOVE_FROM_DIAGRAM,
+        // remove those visual objects BEFORE resolving references.
+        // This must happen before resolveCrossModelReferences() because the concept
+        // IDs still reference HEAD model objects at this point.
+        if(copy instanceof IDiagramModel diagramCopy && info.hasDependencies()) {
+            removeVisualObjectsForDependencies(diagramCopy, info.getDependencies());
+        }
+        
         // Resolve all cross-model references from HEAD model to current model
         // EcoreUtil.copy() keeps references to HEAD model objects, which won't work
         resolveCrossModelReferences(copy, headObject);
@@ -469,12 +778,18 @@ public class ChangeReviewHandler {
      * PERFORMANCE: Only iterates through children for diagrams. Elements and relationships
      * are simple objects that don't need deep traversal.
      * 
+     * For diagrams, any connections that reference relationships not found in the current model
+     * will be removed from the diagram.
+     * 
      * @param copy The copied object (will be modified)
      * @param headObject The original object from HEAD model (for reference)
      */
     private void resolveCrossModelReferences(EObject copy, EObject headObject) {
+        // Track unresolved connections for diagrams
+        Set<IDiagramModelArchimateConnection> unresolvedConnections = new java.util.HashSet<>();
+        
         // Resolve references on the root object
-        resolveReferencesOnObject(copy);
+        resolveReferencesOnObjectTrackingUnresolved(copy, unresolvedConnections);
         
         // Only iterate through children for objects that have them (diagrams, folders)
         // Elements and relationships don't have children with cross-model references
@@ -482,7 +797,16 @@ public class ChangeReviewHandler {
             Iterator<EObject> it = copy.eAllContents();
             while(it.hasNext()) {
                 EObject child = it.next();
-                resolveReferencesOnObject(child);
+                resolveReferencesOnObjectTrackingUnresolved(child, unresolvedConnections);
+            }
+        }
+        
+        // Remove connections that couldn't be resolved
+        // These have relationships that don't exist in the current model
+        if(!unresolvedConnections.isEmpty()) {
+            logDebug("  Removing " + unresolvedConnections.size() + " unresolved connections from diagram"); //$NON-NLS-1$ //$NON-NLS-2$
+            for(IDiagramModelArchimateConnection conn : unresolvedConnections) {
+                EcoreUtil.remove(conn);
             }
         }
     }
@@ -493,6 +817,16 @@ public class ChangeReviewHandler {
      * PERFORMANCE: Uses early returns and only checks relevant instanceof types.
      */
     private void resolveReferencesOnObject(EObject obj) {
+        resolveReferencesOnObjectTrackingUnresolved(obj, null);
+    }
+    
+    /**
+     * Resolve cross-model references on a single object, tracking unresolved connections.
+     * 
+     * @param obj The object to resolve references on
+     * @param unresolvedConnections If non-null, connections that fail to resolve are added here
+     */
+    private void resolveReferencesOnObjectTrackingUnresolved(EObject obj, Set<IDiagramModelArchimateConnection> unresolvedConnections) {
         // Handle relationship source/target
         if(obj instanceof IArchimateRelationship rel) {
             resolveRelationshipReferences(rel);
@@ -510,7 +844,10 @@ public class ChangeReviewHandler {
         
         // Handle diagram connection archimateRelationship reference
         if(obj instanceof IDiagramModelArchimateConnection diagramConn) {
-            resolveDiagramConnectionReference(diagramConn);
+            boolean resolved = resolveDiagramConnectionReference(diagramConn);
+            if(!resolved && unresolvedConnections != null) {
+                unresolvedConnections.add(diagramConn);
+            }
         }
     }
     
@@ -679,8 +1016,11 @@ public class ChangeReviewHandler {
     
     /**
      * Resolve diagram connection's archimateRelationship reference from HEAD model to current model.
+     * 
+     * @param diagramConn The diagram connection to resolve
+     * @return true if the relationship was successfully resolved, false if the relationship doesn't exist in current model
      */
-    private void resolveDiagramConnectionReference(IDiagramModelArchimateConnection diagramConn) {
+    private boolean resolveDiagramConnectionReference(IDiagramModelArchimateConnection diagramConn) {
         IArchimateRelationship headRel = diagramConn.getArchimateRelationship();
         if(headRel != null) {
             String relId = getIdentifierId(headRel);
@@ -688,10 +1028,95 @@ public class ChangeReviewHandler {
             if(currentRel instanceof IArchimateRelationship rel) {
                 diagramConn.setArchimateRelationship(rel);
                 logDebug("  resolved diagram connection relationship: " + rel.getName()); //$NON-NLS-1$
+                
+                // Validate that connection endpoints match relationship endpoints
+                if(!validateConnectionEndpoints(diagramConn, rel)) {
+                    logDebug("  WARNING: connection endpoints don't match relationship - will remove"); //$NON-NLS-1$
+                    return false;
+                }
+                
+                return true;
             } else {
                 logDebug("  WARNING: diagram connection relationship not found: " + relId); //$NON-NLS-1$
+                return false;
             }
         }
+        return true; // No relationship to resolve
+    }
+    
+    /**
+     * Validate that a diagram connection's visual endpoints match the relationship's endpoints.
+     * 
+     * Archi's validation rule:
+     * - connection.source.archimateElement == connection.archimateRelationship.source
+     * - connection.target.archimateElement == connection.archimateRelationship.target
+     * 
+     * @param conn The diagram connection
+     * @param rel The resolved relationship
+     * @return true if endpoints match, false if there's a mismatch
+     */
+    private boolean validateConnectionEndpoints(IDiagramModelArchimateConnection conn, IArchimateRelationship rel) {
+        String connId = conn.getId();
+        
+        // Get visual endpoints
+        IConnectable visualSource = conn.getSource();
+        IConnectable visualTarget = conn.getTarget();
+        
+        // Get relationship endpoints
+        IArchimateConcept relSource = rel.getSource();
+        IArchimateConcept relTarget = rel.getTarget();
+        
+        boolean valid = true;
+        
+        // Log detailed info for debugging
+        logDebug("    validateConnectionEndpoints for connection " + connId); //$NON-NLS-1$
+        logDebug("      relationship: " + rel.getId() + " (" + rel.eClass().getName() + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        logDebug("      rel.source: " + (relSource != null ? relSource.getId() + " (" + relSource.getName() + ")" : "null")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        logDebug("      rel.target: " + (relTarget != null ? relTarget.getId() + " (" + relTarget.getName() + ")" : "null")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        
+        // Check source
+        if(visualSource instanceof IDiagramModelArchimateObject visualSourceObj) {
+            IArchimateElement visualSourceElement = visualSourceObj.getArchimateElement();
+            logDebug("      visualSource.element: " + (visualSourceElement != null ? visualSourceElement.getId() + " (" + visualSourceElement.getName() + ")" : "null")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+            
+            if(visualSourceElement != relSource) {
+                logDebug("      MISMATCH: visual source element != relationship source"); //$NON-NLS-1$
+                valid = false;
+            }
+        } else if(visualSource instanceof IDiagramModelArchimateConnection nestedConn) {
+            // Connection-to-connection (relationship on relationship)
+            IArchimateRelationship nestedRel = nestedConn.getArchimateRelationship();
+            logDebug("      visualSource is nested connection: " + (nestedRel != null ? nestedRel.getId() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+            if(nestedRel != relSource) {
+                logDebug("      MISMATCH: nested connection relationship != relationship source"); //$NON-NLS-1$
+                valid = false;
+            }
+        } else {
+            logDebug("      visualSource type: " + (visualSource != null ? visualSource.getClass().getSimpleName() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
+        // Check target
+        if(visualTarget instanceof IDiagramModelArchimateObject visualTargetObj) {
+            IArchimateElement visualTargetElement = visualTargetObj.getArchimateElement();
+            logDebug("      visualTarget.element: " + (visualTargetElement != null ? visualTargetElement.getId() + " (" + visualTargetElement.getName() + ")" : "null")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+            
+            if(visualTargetElement != relTarget) {
+                logDebug("      MISMATCH: visual target element != relationship target"); //$NON-NLS-1$
+                valid = false;
+            }
+        } else if(visualTarget instanceof IDiagramModelArchimateConnection nestedConn) {
+            // Connection-to-connection (relationship on relationship)
+            IArchimateRelationship nestedRel = nestedConn.getArchimateRelationship();
+            logDebug("      visualTarget is nested connection: " + (nestedRel != null ? nestedRel.getId() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+            if(nestedRel != relTarget) {
+                logDebug("      MISMATCH: nested connection relationship != relationship target"); //$NON-NLS-1$
+                valid = false;
+            }
+        } else {
+            logDebug("      visualTarget type: " + (visualTarget != null ? visualTarget.getClass().getSimpleName() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
+        return valid;
     }
     
     /**
@@ -776,7 +1201,19 @@ public class ChangeReviewHandler {
         
         logDebug("revertModification: " + info.getXMLPath()); //$NON-NLS-1$
         
-        // Copy all features from HEAD to current
+        // For diagrams, we need special handling because diagrams contain child objects
+        // (visual objects and connections) that reference other model objects.
+        // Simple property copying would give us references to HEAD model objects,
+        // which would be wrong. Instead, we need to:
+        // 1. Remove all existing children from current diagram
+        // 2. Copy children from HEAD diagram (using EcoreUtil.copy for deep copy)
+        // 3. Resolve cross-model references in the copied children
+        if(current instanceof IDiagramModel currentDiagram && head instanceof IDiagramModel headDiagram) {
+            revertDiagramModification(currentDiagram, headDiagram, info);
+            return;
+        }
+        
+        // For non-diagrams, copy all features from HEAD to current
         for(org.eclipse.emf.ecore.EStructuralFeature feature : head.eClass().getEAllStructuralFeatures()) {
             if(feature.isChangeable() && !feature.isDerived()) {
                 try {
@@ -794,6 +1231,221 @@ public class ChangeReviewHandler {
         resolveCrossModelReferences(current, head);
     }
     
+    /**
+     * Revert a modified diagram by replacing its contents with HEAD contents.
+     * 
+     * This method handles the complex case of diagrams which contain child objects
+     * (IDiagramModelArchimateObject, IDiagramModelArchimateConnection, etc.) that
+     * reference other model objects.
+     * 
+     * The approach is:
+     * 1. Copy scalar properties (name, documentation, viewpoint) from HEAD
+     * 2. Clear current diagram's children
+     * 3. Copy children from HEAD using EcoreUtil.copy (deep copy with new IDs)
+     * 4. Restore original IDs on copied children
+     * 5. Remove visual objects for dependencies marked as REMOVE_FROM_DIAGRAM
+     * 6. Resolve cross-model references in copied children
+     * 7. Add copied children to current diagram
+     * 
+     * @param currentDiagram The diagram in the current model
+     * @param headDiagram The diagram from HEAD model
+     * @param info The ChangeInfo with dependency information
+     */
+    private void revertDiagramModification(IDiagramModel currentDiagram, IDiagramModel headDiagram, ChangeInfo info) {
+        logDebug("revertDiagramModification: " + headDiagram.getName()); //$NON-NLS-1$
+        
+        // Step 1: Copy scalar properties from HEAD to current
+        currentDiagram.setName(headDiagram.getName());
+        currentDiagram.setDocumentation(headDiagram.getDocumentation());
+        
+        // Copy Archimate-specific properties if applicable
+        if(currentDiagram instanceof IArchimateDiagramModel current && headDiagram instanceof IArchimateDiagramModel headArchi) {
+            current.setViewpoint(headArchi.getViewpoint());
+            current.setConnectionRouterType(headArchi.getConnectionRouterType());
+        }
+        
+        // Step 2: Clear current diagram's children
+        currentDiagram.getChildren().clear();
+        
+        // Step 3: Copy children from HEAD (deep copy)
+        List<IDiagramModelObject> copiedChildren = new ArrayList<>();
+        for(IDiagramModelObject headChild : headDiagram.getChildren()) {
+            EObject copy = EcoreUtil.copy(headChild);
+            if(copy instanceof IDiagramModelObject dmo) {
+                copiedChildren.add(dmo);
+            }
+        }
+        
+        // Step 4: Restore original IDs on copied children
+        for(int i = 0; i < copiedChildren.size(); i++) {
+            restoreOriginalIds(headDiagram.getChildren().get(i), copiedChildren.get(i));
+        }
+        
+        // Step 5: Remove visual objects for dependencies marked as REMOVE_FROM_DIAGRAM
+        // For this, we need to temporarily add children to a container, use a list-based approach
+        if(info.hasDependencies()) {
+            removeVisualObjectsFromList(copiedChildren, info.getDependencies());
+        }
+        
+        // Step 6: Resolve cross-model references in copied children
+        // Track connections that fail to resolve so we can remove them
+        Set<IDiagramModelArchimateConnection> unresolvedConnections = new java.util.HashSet<>();
+        for(IDiagramModelObject child : copiedChildren) {
+            resolveReferencesOnObjectTrackingUnresolved(child, unresolvedConnections);
+            // Recurse into all descendants
+            for(Iterator<EObject> it = child.eAllContents(); it.hasNext();) {
+                resolveReferencesOnObjectTrackingUnresolved(it.next(), unresolvedConnections);
+            }
+        }
+        
+        // Step 6b: Remove connections that couldn't be resolved
+        // These have relationships that don't exist in the current model
+        if(!unresolvedConnections.isEmpty()) {
+            logDebug("  Removing " + unresolvedConnections.size() + " unresolved connections"); //$NON-NLS-1$ //$NON-NLS-2$
+            for(IDiagramModelArchimateConnection conn : unresolvedConnections) {
+                EcoreUtil.remove(conn);
+            }
+        }
+        
+        // Step 7: Add copied children to current diagram
+        currentDiagram.getChildren().addAll(copiedChildren);
+        
+        logDebug("  Reverted diagram with " + copiedChildren.size() + " top-level children"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Remove visual objects from a list of diagram children for dependencies marked as REMOVE_FROM_DIAGRAM.
+     * 
+     * This is similar to removeVisualObjectsForDependencies but works on a list rather than a diagram.
+     * 
+     * @param children The list of diagram children to modify
+     * @param dependencies The list of dependencies to check
+     */
+    private void removeVisualObjectsFromList(List<IDiagramModelObject> children, List<DiagramDependencyInfo> dependencies) {
+        // Collect concept IDs that should be removed
+        Set<String> conceptIdsToRemove = new java.util.HashSet<>();
+        for(DiagramDependencyInfo dep : dependencies) {
+            if(dep.getUserChoice() == DiagramDependencyInfo.REMOVE_FROM_DIAGRAM) {
+                conceptIdsToRemove.add(dep.getConceptId());
+            }
+        }
+        
+        if(conceptIdsToRemove.isEmpty()) {
+            return;
+        }
+        
+        logDebug("removeVisualObjectsFromList: removing concepts " + conceptIdsToRemove); //$NON-NLS-1$
+        
+        // Phase 1: Collect visual objects to remove and connections
+        // Use Set<EObject> since we store both IDiagramModelObject and IDiagramModelArchimateConnection
+        Set<EObject> objectsToRemove = new java.util.HashSet<>();
+        List<IDiagramModelArchimateConnection> allConnections = new ArrayList<>();
+        
+        // Recursive helper to collect objects
+        collectObjectsToRemove(children, conceptIdsToRemove, objectsToRemove, allConnections);
+        
+        // Phase 2: Find connections whose source or target is being removed
+        for(IDiagramModelArchimateConnection conn : allConnections) {
+            if(objectsToRemove.contains(conn)) {
+                continue;
+            }
+            
+            // IConnectable is the common interface for source/target - cast to EObject for Set contains
+            EObject source = (EObject)conn.getSource();
+            EObject target = (EObject)conn.getTarget();
+            
+            if(objectsToRemove.contains(source) || objectsToRemove.contains(target)) {
+                objectsToRemove.add(conn);
+                logDebug("  Marking connection for removal (source/target removed)"); //$NON-NLS-1$
+            }
+        }
+        
+        // Phase 3: Remove from children list and nested containers
+        removeObjectsRecursively(children, objectsToRemove);
+        
+        logDebug("  Removed " + objectsToRemove.size() + " visual objects"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Recursively collect objects to remove from a list of diagram children.
+     */
+    private void collectObjectsToRemove(List<IDiagramModelObject> children, Set<String> conceptIdsToRemove,
+            Set<EObject> objectsToRemove, List<IDiagramModelArchimateConnection> allConnections) {
+        
+        for(IDiagramModelObject child : children) {
+            // Check ArchiMate objects
+            if(child instanceof IDiagramModelArchimateObject dmo) {
+                IArchimateElement element = dmo.getArchimateElement();
+                if(element != null && conceptIdsToRemove.contains(element.getId())) {
+                    objectsToRemove.add(child);
+                }
+                
+                // Collect connections from this object
+                for(IDiagramModelConnection conn : dmo.getSourceConnections()) {
+                    if(conn instanceof IDiagramModelArchimateConnection dmc) {
+                        allConnections.add(dmc);
+                        
+                        IArchimateRelationship rel = dmc.getArchimateRelationship();
+                        if(rel != null && conceptIdsToRemove.contains(rel.getId())) {
+                            objectsToRemove.add(dmc);
+                        }
+                    }
+                }
+            }
+            
+            // Recurse into containers
+            if(child instanceof IDiagramModelContainer container) {
+                collectObjectsToRemove(container.getChildren(), conceptIdsToRemove, objectsToRemove, allConnections);
+            }
+        }
+    }
+    
+    /**
+     * Recursively remove objects from a list of diagram children.
+     * 
+     * IMPORTANT: Connections must be removed BEFORE their source objects are removed,
+     * because connections are contained by their source object. If we remove the source
+     * first, the connection becomes orphaned.
+     */
+    private void removeObjectsRecursively(List<IDiagramModelObject> children, Set<EObject> objectsToRemove) {
+        // FIRST: Remove connections from ALL objects (before removing any visual objects)
+        // This includes objects that will be removed, to properly clean up connections
+        for(IDiagramModelObject child : new ArrayList<>(children)) {
+            // Remove connections from this object's source and target lists
+            child.getSourceConnections().removeIf(conn -> objectsToRemove.contains(conn));
+            child.getTargetConnections().removeIf(conn -> objectsToRemove.contains(conn));
+            
+            // Recurse into containers to remove connections from nested objects
+            if(child instanceof IDiagramModelContainer container) {
+                removeConnectionsRecursively(container.getChildren(), objectsToRemove);
+            }
+        }
+        
+        // SECOND: Remove visual objects
+        children.removeIf(objectsToRemove::contains);
+        
+        // Recurse into containers to remove nested visual objects
+        for(IDiagramModelObject child : children) {
+            if(child instanceof IDiagramModelContainer container) {
+                removeObjectsRecursively(container.getChildren(), objectsToRemove);
+            }
+        }
+    }
+    
+    /**
+     * Recursively remove connections from diagram children (helper for removeObjectsRecursively).
+     */
+    private void removeConnectionsRecursively(List<IDiagramModelObject> children, Set<EObject> objectsToRemove) {
+        for(IDiagramModelObject child : children) {
+            child.getSourceConnections().removeIf(conn -> objectsToRemove.contains(conn));
+            child.getTargetConnections().removeIf(conn -> objectsToRemove.contains(conn));
+            
+            if(child instanceof IDiagramModelContainer container) {
+                removeConnectionsRecursively(container.getChildren(), objectsToRemove);
+            }
+        }
+    }
+
     /**
      * Find the target folder in the current model based on the XML path from GRAFICO.
      * 

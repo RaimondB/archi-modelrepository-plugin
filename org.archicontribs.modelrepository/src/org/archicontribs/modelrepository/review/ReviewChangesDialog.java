@@ -14,7 +14,9 @@ import java.util.Map;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.jface.dialogs.IMessageProvider;
 import org.eclipse.jface.layout.TableColumnLayout;
+import org.eclipse.jface.layout.TreeColumnLayout;
 import org.eclipse.jface.viewers.CellEditor;
+import org.eclipse.jface.viewers.ColumnLabelProvider;
 import org.eclipse.jface.viewers.ColumnViewer;
 import org.eclipse.jface.viewers.ColumnWeightData;
 import org.eclipse.jface.viewers.ComboBoxCellEditor;
@@ -22,11 +24,14 @@ import org.eclipse.jface.viewers.EditingSupport;
 import org.eclipse.jface.viewers.ISelectionChangedListener;
 import org.eclipse.jface.viewers.IStructuredContentProvider;
 import org.eclipse.jface.viewers.ITableLabelProvider;
+import org.eclipse.jface.viewers.ITreeContentProvider;
 import org.eclipse.jface.viewers.LabelProvider;
 import org.eclipse.jface.viewers.SelectionChangedEvent;
 import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.jface.viewers.TableViewer;
 import org.eclipse.jface.viewers.TableViewerColumn;
+import org.eclipse.jface.viewers.TreeViewer;
+import org.eclipse.jface.viewers.TreeViewerColumn;
 import org.eclipse.jface.viewers.Viewer;
 import org.eclipse.jface.viewers.ViewerComparator;
 import org.eclipse.swt.SWT;
@@ -98,7 +103,7 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
     
     private ChangeInfo currentSelectedChangeInfo;
     
-    private TableViewer fTableViewer;
+    private TreeViewer fTreeViewer;
     
     private Button revertButton;
     
@@ -107,9 +112,16 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
     
     private List<TabComposite> fTabComposites = new ArrayList<>();
     
+    // Choices for ChangeInfo (elements, relationships, diagrams)
     private String[] choices = {
             Messages.ReviewChangesDialog_25,  // Keep
             Messages.ReviewChangesDialog_26   // Revert
+    };
+    
+    // Choices for DiagramDependencyInfo (missing concepts in diagrams)
+    private String[] dependencyChoices = {
+            Messages.DiagramDependencyInfo_0,  // Restore element/relationship
+            Messages.DiagramDependencyInfo_2   // Remove from diagram
     };
     
     /**
@@ -143,15 +155,16 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
         SashForm sash = new SashForm(container, SWT.VERTICAL);
         sash.setLayoutData(new GridData(GridData.FILL_BOTH));
         
-        createTableControl(sash);
+        createTreeControl(sash);
         createTabPane(sash);
         
         sash.setWeights(new int[] { 25, 75 });
         
-        // Select first object in table
-        Object first = fTableViewer.getElementAt(0);
+        // Select first object in tree
+        Object first = fTreeViewer.getTree().getItemCount() > 0 ? 
+                       fTreeViewer.getTree().getItem(0).getData() : null;
         if(first != null) {
-            fTableViewer.setSelection(new StructuredSelection(first));
+            fTreeViewer.setSelection(new StructuredSelection(first));
         }
         
         return area;
@@ -192,22 +205,304 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
         revertButton.addSelectionListener(new SelectionAdapter() {
             @Override
             public void widgetSelected(SelectionEvent e) {
-                if(currentSelectedChangeInfo != null) {
-                    fTableViewer.cancelEditing();
+                fTreeViewer.getTree().setRedraw(false);
+                try {
+                    List<Object> allChangedElements = new ArrayList<>();
                     
-                    for(Object o : fTableViewer.getStructuredSelection().toArray()) {
-                        ChangeInfo info = (ChangeInfo)o;
-                        // Toggle: if KEEP, set to REVERT; if REVERT, set to KEEP
-                        int newChoice = info.getUserChoice() == ChangeInfo.KEEP ? 
-                                ChangeInfo.REVERT : ChangeInfo.KEEP;
-                        info.setUserChoice(newChoice);
-                        fTableViewer.update(o, null);
+                    for(Object o : fTreeViewer.getStructuredSelection().toArray()) {
+                        if(o instanceof ChangeInfo info) {
+                            // Toggle: if KEEP, set to REVERT; if REVERT, set to KEEP
+                            int newChoice = info.getUserChoice() == ChangeInfo.KEEP ? 
+                                    ChangeInfo.REVERT : ChangeInfo.KEEP;
+                            
+                            // Handle deleted concepts specially - need to cascade to diagrams
+                            if(info.getChangeType() == ChangeInfo.DELETED && !info.isDiagram()) {
+                                if(newChoice == ChangeInfo.KEEP) {
+                                    // Keeping deletion = concept stays deleted
+                                    info.setUserChoice(newChoice);
+                                    allChangedElements.add(info);
+                                    allChangedElements.addAll(cascadeConceptDeletionToDiagrams(info));
+                                } else {
+                                    // Reverting deletion = concept is restored
+                                    info.setUserChoice(newChoice);
+                                    allChangedElements.add(info);
+                                    allChangedElements.addAll(cascadeConceptRestoreToDiagrams(info));
+                                }
+                            } else {
+                                info.setUserChoice(newChoice);
+                                allChangedElements.add(info);
+                            }
+                            
+                            // If reverting a diagram, analyze dependencies
+                            if(info.getUserChoice() == ChangeInfo.REVERT && info.isDiagram() && !info.areDependenciesAnalyzed()) {
+                                List<DiagramDependencyInfo> deps = fHandler.analyzeDiagramDependencies(info);
+                                info.setDependencies(deps);
+                            }
+                            
+                        } else if(o instanceof DiagramDependencyInfo depInfo) {
+                            // Toggle dependency choice
+                            int newChoice = depInfo.getUserChoice() == DiagramDependencyInfo.RESTORE_CONCEPT ?
+                                    DiagramDependencyInfo.REMOVE_FROM_DIAGRAM : DiagramDependencyInfo.RESTORE_CONCEPT;
+                            depInfo.setUserChoice(newChoice);
+                            allChangedElements.add(depInfo);
+                            
+                            if(newChoice == DiagramDependencyInfo.RESTORE_CONCEPT) {
+                                // Restoring - also restore in model and restore relationship endpoints
+                                allChangedElements.addAll(markConceptChangeInfoAsRevertWithTracking(depInfo));
+                                if(!depInfo.isElement()) {
+                                    allChangedElements.addAll(cascadeRestoreRelationshipEndpointsWithTracking(depInfo));
+                                }
+                            } else {
+                                // Removing - cascade to relationships if it's an element
+                                if(depInfo.isElement()) {
+                                    allChangedElements.addAll(cascadeRemoveRelationshipsForElementInternal(depInfo));
+                                }
+                            }
+                        }
                     }
                     
-                    updateRevertButton(currentSelectedChangeInfo);
+                    // Refresh entire tree to show any cascading changes
+                    fTreeViewer.refresh();
+                    refreshChangedElements(allChangedElements);
+                    
+                    // Update button text
+                    Object selected = fTreeViewer.getStructuredSelection().getFirstElement();
+                    if(selected instanceof ChangeInfo info) {
+                        updateRevertButton(info);
+                    } else if(selected instanceof DiagramDependencyInfo) {
+                        updateRevertButtonForDependency((DiagramDependencyInfo)selected);
+                    }
+                } finally {
+                    fTreeViewer.getTree().setRedraw(true);
                 }
             }
         });
+    }
+    
+    /**
+     * When a diagram dependency is set to RESTORE_CONCEPT, find and mark
+     * the corresponding ChangeInfo for that element/relationship as REVERT.
+     */
+    private void markConceptChangeInfoAsRevert(DiagramDependencyInfo depInfo) {
+        markConceptChangeInfoAsRevertWithTracking(depInfo);
+    }
+    
+    /**
+     * When a diagram dependency is set to RESTORE_CONCEPT, find and mark
+     * the corresponding ChangeInfo for that element/relationship as REVERT.
+     * @return List of changed elements for UI update
+     */
+    private List<Object> markConceptChangeInfoAsRevertWithTracking(DiagramDependencyInfo depInfo) {
+        List<Object> changedElements = new ArrayList<>();
+        String conceptId = depInfo.getConceptId();
+        if(conceptId == null) {
+            return changedElements;
+        }
+        
+        // Find the ChangeInfo for this concept
+        for(ChangeInfo info : fHandler.getChangeInfos()) {
+            String infoId = info.getElementId();
+            if(conceptId.equals(infoId)) {
+                // Mark as REVERT if currently KEEP
+                if(info.getUserChoice() == ChangeInfo.KEEP) {
+                    info.setUserChoice(ChangeInfo.REVERT);
+                    changedElements.add(info);
+                    
+                    // Also update any other diagram dependencies for this concept
+                    changedElements.addAll(syncOtherDiagramDependenciesWithTracking(conceptId, DiagramDependencyInfo.RESTORE_CONCEPT));
+                }
+                break;
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * Synchronize all diagram dependencies for a given concept to the same choice.
+     * This ensures consistency when a concept is marked for restore/remove.
+     */
+    private void syncOtherDiagramDependencies(String conceptId, int choice) {
+        syncOtherDiagramDependenciesWithTracking(conceptId, choice);
+    }
+    
+    /**
+     * Synchronize all diagram dependencies for a given concept to the same choice.
+     * @return List of changed elements for UI update
+     */
+    private List<Object> syncOtherDiagramDependenciesWithTracking(String conceptId, int choice) {
+        List<Object> changedElements = new ArrayList<>();
+        for(ChangeInfo info : fHandler.getChangeInfos()) {
+            if(info.isDiagram() && info.areDependenciesAnalyzed()) {
+                for(DiagramDependencyInfo dep : info.getDependencies()) {
+                    if(conceptId.equals(dep.getConceptId())) {
+                        if(dep.getUserChoice() != choice) {
+                            dep.setUserChoice(choice);
+                            changedElements.add(dep);
+                        }
+                    }
+                }
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * When an element is set to REMOVE_FROM_DIAGRAM, also set any relationships
+     * that connect to this element to REMOVE_FROM_DIAGRAM.
+     * 
+     * Relationships that have their source or target removed cannot exist in the diagram.
+     */
+    private void cascadeRemoveRelationshipsForElement(DiagramDependencyInfo elementDep) {
+        cascadeRemoveRelationshipsForElementInternal(elementDep);
+    }
+    
+    /**
+     * When a relationship is restored in a diagram, also restore its source and target elements.
+     * A relationship cannot exist without both endpoints.
+     */
+    private void cascadeRestoreRelationshipEndpoints(DiagramDependencyInfo relDep) {
+        cascadeRestoreRelationshipEndpointsWithTracking(relDep);
+    }
+    
+    /**
+     * When a relationship is restored in a diagram, also restore its source and target elements.
+     * @return List of changed elements for UI update
+     */
+    private List<Object> cascadeRestoreRelationshipEndpointsWithTracking(DiagramDependencyInfo relDep) {
+        List<Object> changedElements = new ArrayList<>();
+        
+        if(relDep.isElement() || !(relDep.getHeadConcept() instanceof IArchimateRelationship rel)) {
+            return changedElements;
+        }
+        
+        ChangeInfo parentDiagram = relDep.getParent();
+        if(parentDiagram == null || !parentDiagram.hasDependencies()) {
+            return changedElements;
+        }
+        
+        String sourceId = rel.getSource() != null ? rel.getSource().getId() : null;
+        String targetId = rel.getTarget() != null ? rel.getTarget().getId() : null;
+        
+        // Find and restore the source and target elements in this diagram
+        for(DiagramDependencyInfo dep : parentDiagram.getDependencies()) {
+            if(dep.isElement()) {
+                String depId = dep.getConceptId();
+                if(depId.equals(sourceId) || depId.equals(targetId)) {
+                    if(dep.getUserChoice() == DiagramDependencyInfo.REMOVE_FROM_DIAGRAM) {
+                        dep.setUserChoice(DiagramDependencyInfo.RESTORE_CONCEPT);
+                        changedElements.add(dep);
+                        // Also restore in model
+                        changedElements.addAll(markConceptChangeInfoAsRevertWithTracking(dep));
+                    }
+                }
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * When a model-level concept is set to KEEP (stays deleted), cascade to remove from all diagrams.
+     * A concept cannot appear in a diagram if it doesn't exist in the model.
+     * 
+     * @return List of elements that were changed (for UI update)
+     */
+    private List<Object> cascadeConceptDeletionToDiagrams(ChangeInfo conceptInfo) {
+        List<Object> changedElements = new ArrayList<>();
+        String conceptId = conceptInfo.getElementId();
+        if(conceptId == null) {
+            return changedElements;
+        }
+        
+        // Find all diagram dependencies referencing this concept and set to REMOVE_FROM_DIAGRAM
+        for(ChangeInfo info : fHandler.getChangeInfos()) {
+            if(info.isDiagram() && info.areDependenciesAnalyzed()) {
+                for(DiagramDependencyInfo dep : info.getDependencies()) {
+                    if(conceptId.equals(dep.getConceptId())) {
+                        dep.setUserChoice(DiagramDependencyInfo.REMOVE_FROM_DIAGRAM);
+                        changedElements.add(dep);
+                        
+                        // If it's an element, also cascade to relationships
+                        if(dep.isElement()) {
+                            changedElements.addAll(cascadeRemoveRelationshipsForElementInternal(dep));
+                        }
+                    }
+                }
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * When a model-level concept is set to REVERT (restored), cascade to restore in all diagrams.
+     * Default behavior is to restore, but user can still choose to remove from specific diagrams.
+     * 
+     * @return List of elements that were changed (for UI update)
+     */
+    private List<Object> cascadeConceptRestoreToDiagrams(ChangeInfo conceptInfo) {
+        List<Object> changedElements = new ArrayList<>();
+        String conceptId = conceptInfo.getElementId();
+        if(conceptId == null) {
+            return changedElements;
+        }
+        
+        // Find all diagram dependencies referencing this concept and set to RESTORE_CONCEPT
+        for(ChangeInfo info : fHandler.getChangeInfos()) {
+            if(info.isDiagram() && info.areDependenciesAnalyzed()) {
+                for(DiagramDependencyInfo dep : info.getDependencies()) {
+                    if(conceptId.equals(dep.getConceptId())) {
+                        dep.setUserChoice(DiagramDependencyInfo.RESTORE_CONCEPT);
+                        changedElements.add(dep);
+                    }
+                }
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * Internal cascade for removing relationships (returns changed elements for tracking).
+     */
+    private List<Object> cascadeRemoveRelationshipsForElementInternal(DiagramDependencyInfo elementDep) {
+        List<Object> changedElements = new ArrayList<>();
+        String elementId = elementDep.getConceptId();
+        ChangeInfo parentDiagram = elementDep.getParent();
+        
+        if(elementId == null || parentDiagram == null || !parentDiagram.hasDependencies()) {
+            return changedElements;
+        }
+        
+        // Find relationships in this diagram that reference the removed element
+        for(DiagramDependencyInfo dep : parentDiagram.getDependencies()) {
+            if(!dep.isElement() && dep.getHeadConcept() instanceof IArchimateRelationship rel) {
+                // Check if this relationship connects to the removed element
+                String sourceId = rel.getSource() != null ? rel.getSource().getId() : null;
+                String targetId = rel.getTarget() != null ? rel.getTarget().getId() : null;
+                
+                if(elementId.equals(sourceId) || elementId.equals(targetId)) {
+                    // This relationship connects to the removed element - remove it too
+                    if(dep.getUserChoice() != DiagramDependencyInfo.REMOVE_FROM_DIAGRAM) {
+                        dep.setUserChoice(DiagramDependencyInfo.REMOVE_FROM_DIAGRAM);
+                        changedElements.add(dep);
+                    }
+                }
+            }
+        }
+        return changedElements;
+    }
+    
+    /**
+     * Refresh all changed elements in the tree viewer.
+     * This ensures the UI immediately reflects cascading changes.
+     */
+    private void refreshChangedElements(List<Object> changedElements) {
+        if(changedElements.isEmpty()) {
+            return;
+        }
+        
+        // Update each changed element specifically
+        for(Object element : changedElements) {
+            fTreeViewer.update(element, null);
+        }
     }
     
     // =====================================
@@ -614,149 +909,219 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
     }
 
     // ===========================================================
-    // Top Table Control
+    // Top Tree Control
     // ===========================================================
     
-    private void createTableControl(Composite parent) {
-        Composite tableComp = new Composite(parent, SWT.BORDER);
-        TableColumnLayout tableLayout = new TableColumnLayout();
-        tableComp.setLayout(tableLayout);
-        tableComp.setLayoutData(new GridData(GridData.FILL_BOTH));
+    private void createTreeControl(Composite parent) {
+        Composite treeComp = new Composite(parent, SWT.BORDER);
+        TreeColumnLayout treeLayout = new TreeColumnLayout();
+        treeComp.setLayout(treeLayout);
+        treeComp.setLayoutData(new GridData(GridData.FILL_BOTH));
 
-        fTableViewer = new TableViewer(tableComp, SWT.FULL_SELECTION | SWT.MULTI);
-        fTableViewer.getControl().setLayoutData(new GridData(GridData.FILL_BOTH));
-        fTableViewer.getTable().setHeaderVisible(true);
-        fTableViewer.getTable().setLinesVisible(true);
-        fTableViewer.setComparator(new ViewerComparator(Collator.getInstance()) {
+        fTreeViewer = new TreeViewer(treeComp, SWT.FULL_SELECTION | SWT.MULTI);
+        fTreeViewer.getControl().setLayoutData(new GridData(GridData.FILL_BOTH));
+        fTreeViewer.getTree().setHeaderVisible(true);
+        fTreeViewer.getTree().setLinesVisible(true);
+        fTreeViewer.setComparator(new ViewerComparator(Collator.getInstance()) {
             @Override
             public int compare(Viewer viewer, Object object1, Object object2) {
-                EObject eObject1 = ((ChangeInfo)object1).getDefaultEObject();
-                EObject eObject2 = ((ChangeInfo)object2).getDefaultEObject();
-                if(eObject1 == null || eObject2 == null) {
-                    return 0;
+                // Only compare ChangeInfo objects, not dependencies
+                if(object1 instanceof ChangeInfo && object2 instanceof ChangeInfo) {
+                    EObject eObject1 = ((ChangeInfo)object1).getDefaultEObject();
+                    EObject eObject2 = ((ChangeInfo)object2).getDefaultEObject();
+                    if(eObject1 == null || eObject2 == null) {
+                        return 0;
+                    }
+                    String s1 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject1.eClass());
+                    String s2 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject2.eClass());
+                    return getComparator().compare(s1, s2);
                 }
-                String s1 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject1.eClass());
-                String s2 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject2.eClass());
-                return getComparator().compare(s1, s2);
+                return 0;
             }
         });
 
         // Columns
-        TableViewerColumn column1 = new TableViewerColumn(fTableViewer, SWT.NONE, 0);
+        TreeViewerColumn column1 = new TreeViewerColumn(fTreeViewer, SWT.NONE);
         column1.getColumn().setText(Messages.ReviewChangesDialog_21);  // "Type"
-        tableLayout.setColumnData(column1.getColumn(), new ColumnWeightData(25, true));
+        treeLayout.setColumnData(column1.getColumn(), new ColumnWeightData(25, true));
+        column1.setLabelProvider(new TypeColumnLabelProvider());
 
-        TableViewerColumn column2 = new TableViewerColumn(fTableViewer, SWT.NONE, 1);
+        TreeViewerColumn column2 = new TreeViewerColumn(fTreeViewer, SWT.NONE);
         column2.getColumn().setText(Messages.ReviewChangesDialog_22);  // "Name"
-        tableLayout.setColumnData(column2.getColumn(), new ColumnWeightData(40, true));
+        treeLayout.setColumnData(column2.getColumn(), new ColumnWeightData(40, true));
+        column2.setLabelProvider(new NameColumnLabelProvider());
 
-        TableViewerColumn column3 = new TableViewerColumn(fTableViewer, SWT.NONE, 2);
+        TreeViewerColumn column3 = new TreeViewerColumn(fTreeViewer, SWT.NONE);
         column3.getColumn().setText(Messages.ReviewChangesDialog_23);  // "Status"
-        tableLayout.setColumnData(column3.getColumn(), new ColumnWeightData(15, true));
+        treeLayout.setColumnData(column3.getColumn(), new ColumnWeightData(15, true));
+        column3.setLabelProvider(new StatusColumnLabelProvider());
 
-        TableViewerColumn column4 = new TableViewerColumn(fTableViewer, SWT.NONE, 3);
+        TreeViewerColumn column4 = new TreeViewerColumn(fTreeViewer, SWT.NONE);
         column4.getColumn().setText(Messages.ReviewChangesDialog_24);  // "Action"
-        tableLayout.setColumnData(column4.getColumn(), new ColumnWeightData(15, true));
-        column4.setEditingSupport(new ComboChoiceEditingSupport(fTableViewer));
+        treeLayout.setColumnData(column4.getColumn(), new ColumnWeightData(15, true));
+        column4.setLabelProvider(new ActionColumnLabelProvider());
+        column4.setEditingSupport(new TreeComboChoiceEditingSupport(fTreeViewer));
 
-        // Content Provider
-        fTableViewer.setContentProvider(new IStructuredContentProvider() {
-            @Override
-            public void inputChanged(Viewer viewer, Object oldInput, Object newInput) {
-            }
-
-            @Override
-            public void dispose() {
-            }
-
+        // Content Provider - hierarchical
+        fTreeViewer.setContentProvider(new ITreeContentProvider() {
             @Override
             public Object[] getElements(Object inputElement) {
                 return fHandler.getChangeInfos().toArray();
             }
+            
+            @Override
+            public Object[] getChildren(Object parentElement) {
+                if(parentElement instanceof ChangeInfo info) {
+                    // Only show dependencies for diagrams that are set to REVERT
+                    if(info.isDiagram() && info.isRevert() && info.hasDependencies()) {
+                        return info.getDependencies().toArray();
+                    }
+                }
+                return new Object[0];
+            }
+            
+            @Override
+            public Object getParent(Object element) {
+                if(element instanceof DiagramDependencyInfo depInfo) {
+                    return depInfo.getParent();
+                }
+                return null;
+            }
+            
+            @Override
+            public boolean hasChildren(Object element) {
+                if(element instanceof ChangeInfo info) {
+                    return info.isDiagram() && info.isRevert() && info.hasDependencies();
+                }
+                return false;
+            }
         });
 
-        // Table Selection Listener
-        fTableViewer.addSelectionChangedListener(new ISelectionChangedListener() {
+        // Tree Selection Listener
+        fTreeViewer.addSelectionChangedListener(new ISelectionChangedListener() {
             @Override
             public void selectionChanged(SelectionChangedEvent event) {
-                ChangeInfo info = (ChangeInfo)((StructuredSelection)event.getSelection()).getFirstElement();
-                updateTabs(info);
+                Object selected = ((StructuredSelection)event.getSelection()).getFirstElement();
+                if(selected instanceof ChangeInfo info) {
+                    // Don't set currentSelectedChangeInfo here - updateTabs does it
+                    updateTabs(info);
+                    updateRevertButton(info);
+                } else if(selected instanceof DiagramDependencyInfo depInfo) {
+                    // For dependencies, show parent diagram info but update button for dependency
+                    updateTabs(depInfo.getParent());
+                    updateRevertButtonForDependency(depInfo);
+                }
             }
         });
         
-        // Table Label Provider
-        fTableViewer.setLabelProvider(new TableLabelProvider());
-        
-        // Start the table
-        fTableViewer.setInput(""); // anything will do //$NON-NLS-1$
+        // Start the tree
+        fTreeViewer.setInput(""); // anything will do //$NON-NLS-1$
     }
     
-    // Label Provider
-    private class TableLabelProvider extends LabelProvider implements ITableLabelProvider {
+    /**
+     * Update revert button text for a dependency
+     */
+    private void updateRevertButtonForDependency(DiagramDependencyInfo depInfo) {
+        int choice = depInfo.getUserChoice();
+        revertButton.setText(choice == DiagramDependencyInfo.RESTORE_CONCEPT ? 
+                Messages.DiagramDependencyInfo_2 :  // "Remove from diagram" 
+                Messages.DiagramDependencyInfo_0);  // "Restore element"
+    }
+    
+    // ==================== Column Label Providers ====================
+    
+    private class TypeColumnLabelProvider extends ColumnLabelProvider {
+        @Override
+        public String getText(Object element) {
+            if(element instanceof ChangeInfo info) {
+                EObject eObject = info.getDefaultEObject();
+                if(eObject != null) {
+                    return ArchiLabelProvider.INSTANCE.getDefaultName(eObject.eClass());
+                }
+                String type = info.getElementType();
+                return type != null ? type : Messages.ReviewChangesDialog_27;
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                return depInfo.getConceptType();
+            }
+            return ""; //$NON-NLS-1$
+        }
         
         @Override
-        public Image getColumnImage(Object element, int columnIndex) {
-            if(columnIndex == 0) {
-                ChangeInfo info = (ChangeInfo)element;
+        public Image getImage(Object element) {
+            if(element instanceof ChangeInfo info) {
                 EObject eObject = info.getDefaultEObject();
                 if(eObject != null) {
                     return ArchiLabelProvider.INSTANCE.getImage(eObject);
                 }
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                return ArchiLabelProvider.INSTANCE.getImage(depInfo.getHeadConcept());
             }
-            
             return null;
         }
-
+    }
+    
+    private class NameColumnLabelProvider extends ColumnLabelProvider {
         @Override
-        public String getColumnText(Object element, int columnIndex) {
-            ChangeInfo info = (ChangeInfo)element;
-            EObject eObject = info.getDefaultEObject();
-            
-            switch(columnIndex) {
-                case 0:
-                    // Type column - use EObject if available, else fall back to path-extracted type
-                    if(eObject != null) {
-                        return ArchiLabelProvider.INSTANCE.getDefaultName(eObject.eClass());
-                    }
-                    // Fallback: use element type from path (e.g., "BusinessProcess")
-                    String type = info.getElementType();
-                    return type != null ? type : Messages.ReviewChangesDialog_27;
-
-                case 1:
-                    // Name column - use EObject if available, else show ID
-                    if(eObject != null) {
-                        return ArchiLabelProvider.INSTANCE.getLabel(eObject);
-                    }
-                    // Fallback: show element ID from path
-                    String id = info.getElementId();
-                    return id != null ? id : ""; //$NON-NLS-1$
-
-                case 2:
-                    return info.getStatus();
-
-                case 3:
-                    return choices[info.getUserChoice()];
-
-                default:
-                    return ""; //$NON-NLS-1$
+        public String getText(Object element) {
+            if(element instanceof ChangeInfo info) {
+                EObject eObject = info.getDefaultEObject();
+                if(eObject != null) {
+                    return ArchiLabelProvider.INSTANCE.getLabel(eObject);
+                }
+                String id = info.getElementId();
+                return id != null ? id : ""; //$NON-NLS-1$
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                String name = depInfo.getConceptName();
+                return name.isEmpty() ? "(unnamed)" : name; //$NON-NLS-1$
             }
+            return ""; //$NON-NLS-1$
+        }
+    }
+    
+    private class StatusColumnLabelProvider extends ColumnLabelProvider {
+        @Override
+        public String getText(Object element) {
+            if(element instanceof ChangeInfo info) {
+                return info.getStatus();
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                // Show reference count
+                return depInfo.getVisualObjectCount() + " ref"; //$NON-NLS-1$
+            }
+            return ""; //$NON-NLS-1$
+        }
+    }
+    
+    private class ActionColumnLabelProvider extends ColumnLabelProvider {
+        @Override
+        public String getText(Object element) {
+            if(element instanceof ChangeInfo info) {
+                return choices[info.getUserChoice()];
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                return depInfo.getActionDescription();
+            }
+            return ""; //$NON-NLS-1$
         }
     }
 
     /**
-     * Combo Choice Editor for Action column
+     * Combo Choice Editor for Action column - handles both ChangeInfo and DiagramDependencyInfo
      */
-    private class ComboChoiceEditingSupport extends EditingSupport {
-        private ComboBoxCellEditor cellEditor;
+    private class TreeComboChoiceEditingSupport extends EditingSupport {
+        private ComboBoxCellEditor changeInfoEditor;
+        private ComboBoxCellEditor dependencyEditor;
         
-        public ComboChoiceEditingSupport(ColumnViewer viewer) {
+        public TreeComboChoiceEditingSupport(ColumnViewer viewer) {
             super(viewer);
-            cellEditor = new ComboBoxCellEditor((Composite)viewer.getControl(), choices, SWT.READ_ONLY);
+            changeInfoEditor = new ComboBoxCellEditor((Composite)viewer.getControl(), choices, SWT.READ_ONLY);
+            dependencyEditor = new ComboBoxCellEditor((Composite)viewer.getControl(), dependencyChoices, SWT.READ_ONLY);
         }
 
         @Override
         protected CellEditor getCellEditor(Object element) {
-            return cellEditor;
+            if(element instanceof DiagramDependencyInfo) {
+                return dependencyEditor;
+            }
+            return changeInfoEditor;
         }
 
         @Override
@@ -766,8 +1131,12 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
 
         @Override
         protected Object getValue(Object element) {
-            ChangeInfo info = (ChangeInfo)element;
-            return info.getUserChoice();
+            if(element instanceof ChangeInfo info) {
+                return info.getUserChoice();
+            } else if(element instanceof DiagramDependencyInfo depInfo) {
+                return depInfo.getUserChoice();
+            }
+            return 0;
         }
 
         @Override
@@ -777,10 +1146,69 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
                 return;
             }
             
-            ChangeInfo info = (ChangeInfo)element;
-            info.setUserChoice(index);
-            fTableViewer.update(element, null);
-            updateRevertButton(info);
+            fTreeViewer.getTree().setRedraw(false);
+            try {
+                if(element instanceof ChangeInfo info) {
+                    int oldChoice = info.getUserChoice();
+                    
+                    // Handle deleted concepts specially - need to cascade to diagrams
+                    if(info.getChangeType() == ChangeInfo.DELETED && !info.isDiagram()) {
+                        if(index == ChangeInfo.KEEP && oldChoice != ChangeInfo.KEEP) {
+                            // Keeping deletion = concept stays deleted
+                            // Must cascade to remove from all diagrams
+                            info.setUserChoice(index);
+                            cascadeConceptDeletionToDiagrams(info);
+                        } else if(index == ChangeInfo.REVERT && oldChoice != ChangeInfo.REVERT) {
+                            // Reverting deletion = concept is restored
+                            // Diagram dependencies can now choose to restore
+                            info.setUserChoice(index);
+                            cascadeConceptRestoreToDiagrams(info);
+                        } else {
+                            info.setUserChoice(index);
+                        }
+                    } else {
+                        info.setUserChoice(index);
+                    }
+                    
+                    // If switching to REVERT on a diagram, analyze dependencies
+                    if(info.getUserChoice() == ChangeInfo.REVERT && info.isDiagram() && !info.areDependenciesAnalyzed()) {
+                        List<DiagramDependencyInfo> deps = fHandler.analyzeDiagramDependencies(info);
+                        info.setDependencies(deps);
+                    }
+                    
+                    // Expand to show dependencies
+                    if(info.hasDependencies() && info.isRevert()) {
+                        fTreeViewer.setExpandedState(element, true);
+                    }
+                    
+                    updateRevertButton(info);
+                } else if(element instanceof DiagramDependencyInfo depInfo) {
+                    int oldChoice = depInfo.getUserChoice();
+                    depInfo.setUserChoice(index);
+                    
+                    if(index == DiagramDependencyInfo.RESTORE_CONCEPT && oldChoice != DiagramDependencyInfo.RESTORE_CONCEPT) {
+                        // Restoring a concept - must also restore in model
+                        markConceptChangeInfoAsRevert(depInfo);
+                        
+                        // If restoring a relationship, also restore its source/target elements
+                        if(!depInfo.isElement()) {
+                            cascadeRestoreRelationshipEndpoints(depInfo);
+                        }
+                    } else if(index == DiagramDependencyInfo.REMOVE_FROM_DIAGRAM && oldChoice != DiagramDependencyInfo.REMOVE_FROM_DIAGRAM) {
+                        // Removing an element from diagram - also remove connected relationships
+                        if(depInfo.isElement()) {
+                            cascadeRemoveRelationshipsForElement(depInfo);
+                        }
+                    }
+                    
+                    updateRevertButtonForDependency(depInfo);
+                }
+                
+                // Always refresh the entire tree to show cascading changes
+                fTreeViewer.refresh();
+            } finally {
+                fTreeViewer.getTree().setRedraw(true);
+            }
         }
     }
 }

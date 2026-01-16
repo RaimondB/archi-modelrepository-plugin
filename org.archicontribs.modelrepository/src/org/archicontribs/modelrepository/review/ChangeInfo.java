@@ -6,6 +6,8 @@
 package org.archicontribs.modelrepository.review;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -14,6 +16,7 @@ import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.ecore.EObject;
 
 import com.archimatetool.model.IArchimateModel;
+import com.archimatetool.model.IDiagramModel;
 import com.archimatetool.model.util.ArchimateModelUtils;
 
 /**
@@ -76,6 +79,11 @@ public class ChangeInfo {
     
     // User's choice - default is to keep changes
     private int userChoice = KEEP;
+    
+    // For diagrams: dependencies on deleted concepts (elements/relationships)
+    // These are analyzed when the user selects "Revert" on a diagram
+    private List<DiagramDependencyInfo> dependencies;
+    private boolean dependenciesAnalyzed = false;
 
     /**
      * Constructor
@@ -307,5 +315,76 @@ public class ChangeInfo {
         }
         
         return null;
+    }
+    
+    // ==================== Diagram Dependency Support ====================
+    
+    /**
+     * Check if this change info represents a diagram
+     * @return true if this is a diagram
+     */
+    public boolean isDiagram() {
+        EObject obj = getDefaultEObject();
+        return obj instanceof IDiagramModel;
+    }
+    
+    /**
+     * Check if dependencies have been analyzed for this diagram
+     * @return true if dependencies have been analyzed
+     */
+    public boolean areDependenciesAnalyzed() {
+        return dependenciesAnalyzed;
+    }
+    
+    /**
+     * Set the analyzed dependencies for this diagram
+     * @param deps The list of dependencies
+     */
+    public void setDependencies(List<DiagramDependencyInfo> deps) {
+        this.dependencies = deps != null ? new ArrayList<>(deps) : new ArrayList<>();
+        this.dependenciesAnalyzed = true;
+    }
+    
+    /**
+     * Get the dependencies for this diagram
+     * @return The list of dependencies, or empty list if none or not analyzed
+     */
+    public List<DiagramDependencyInfo> getDependencies() {
+        return dependencies != null ? dependencies : new ArrayList<>();
+    }
+    
+    /**
+     * Check if this diagram has any unresolved dependencies
+     * @return true if there are dependencies that reference missing concepts
+     */
+    public boolean hasDependencies() {
+        return dependencies != null && !dependencies.isEmpty();
+    }
+    
+    /**
+     * Get the parent ChangeInfo (for DiagramDependencyInfo, this returns the diagram ChangeInfo)
+     * This is used for tree hierarchy - ChangeInfo objects are roots
+     * @return null for ChangeInfo (it's a root)
+     */
+    public ChangeInfo getParent() {
+        return null;  // ChangeInfo is always a root
+    }
+    
+    /**
+     * Check if any dependency is set to restore
+     * @return true if at least one dependency should restore its concept
+     */
+    public boolean hasRestoreDependencies() {
+        if (dependencies == null) return false;
+        return dependencies.stream().anyMatch(DiagramDependencyInfo::shouldRestore);
+    }
+    
+    /**
+     * Check if any dependency is set to remove from diagram
+     * @return true if at least one dependency should be removed from diagram
+     */
+    public boolean hasRemoveDependencies() {
+        if (dependencies == null) return false;
+        return dependencies.stream().anyMatch(DiagramDependencyInfo::shouldRemoveFromDiagram);
     }
 }
