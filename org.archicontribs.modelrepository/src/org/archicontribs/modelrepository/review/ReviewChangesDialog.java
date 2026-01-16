@@ -195,12 +195,14 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
         createPropertiesTabItem();
         // View TabItem is created on demand for diagrams
         
-        // Revert button
+        // Revert button - TEMPORARILY DISABLED until revert logic is complete
         revertButton = new Button(mainComposite, SWT.PUSH);
         GridData gd = new GridData(SWT.FILL, SWT.FILL, true, false);
         gd.horizontalSpan = 2;
+        gd.exclude = true;  // Hide the button entirely for now
         revertButton.setLayoutData(gd);
         revertButton.setText(Messages.ReviewChangesDialog_20);  // "Revert Selected"
+        revertButton.setVisible(false);  // TODO: Show when revert logic is complete
         
         revertButton.addSelectionListener(new SelectionAdapter() {
             @Override
@@ -1126,7 +1128,8 @@ public class ReviewChangesDialog extends ExtendedTitleAreaDialog {
 
         @Override
         protected boolean canEdit(Object element) {
-            return true;
+            // TODO: Enable when revert logic is complete
+            return false;  // Temporarily disabled - all changes are kept
         }
 
         @Override

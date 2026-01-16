@@ -137,10 +137,51 @@ if (Test-Path $manifestPath) {
 # Clean up temp extraction dir
 Remove-Item $tempExtractDir -Recurse -Force
 
-# Copy commandline plugin JAR (this one stays as JAR)
+# Copy and rename commandline plugin JAR with suffix in qualifier
 if ($cmdlineJar) {
-    Copy-Item $cmdlineJar.FullName "$OutputDir\"
-    Write-Host "Copied commandline JAR"
+    # Extract version from cmdline JAR name and apply suffix
+    $cmdlineBaseName = [System.IO.Path]::GetFileNameWithoutExtension($cmdlineJar.Name)
+    if ($VersionSuffix -and $cmdlineBaseName -match "^(.+)_(\d+\.\d+\.\d+)\.(.+)$") {
+        $cmdlineId = $matches[1]
+        $cmdlineVersion = $matches[2]
+        $cmdlineQualifier = $matches[3]
+        $cmdlineFullQualifier = "${VersionSuffix}${cmdlineQualifier}"
+        $newCmdlineName = "${cmdlineId}_${cmdlineVersion}.${cmdlineFullQualifier}.jar"
+        
+        # Find jar command
+        $jarCmd = if ($env:JAVA_HOME) { "$env:JAVA_HOME\bin\jar.exe" } else { "jar" }
+        
+        # Update MANIFEST.MF inside the JAR using jar command
+        $cmdlineTempDir = "$env:TEMP\coarchi-cmdline-extract"
+        if (Test-Path $cmdlineTempDir) { Remove-Item $cmdlineTempDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $cmdlineTempDir | Out-Null
+        
+        # Extract using jar command (preserves JAR structure)
+        Push-Location $cmdlineTempDir
+        & $jarCmd xf $cmdlineJar.FullName
+        Pop-Location
+        
+        $cmdlineManifest = "$cmdlineTempDir\META-INF\MANIFEST.MF"
+        if (Test-Path $cmdlineManifest) {
+            $manifestContent = Get-Content $cmdlineManifest -Raw
+            $manifestContent = $manifestContent -replace "Bundle-Version: .*", "Bundle-Version: $cmdlineVersion.$cmdlineFullQualifier"
+            Set-Content $cmdlineManifest $manifestContent -NoNewline
+        }
+        
+        # Repackage using jar command (proper JAR format with MANIFEST first)
+        $newCmdlinePath = "$OutputDir\$newCmdlineName"
+        Push-Location $cmdlineTempDir
+        & $jarCmd cfm $newCmdlinePath "META-INF\MANIFEST.MF" .
+        Pop-Location
+        
+        Remove-Item $cmdlineTempDir -Recurse -Force
+        
+        Write-Host "Copied and updated commandline JAR: $newCmdlineName" -ForegroundColor Green
+    } else {
+        # No suffix or pattern didn't match - just copy as-is
+        Copy-Item $cmdlineJar.FullName "$OutputDir\"
+        Write-Host "Copied commandline JAR"
+    }
 }
 
 # Create the .archiplugin file

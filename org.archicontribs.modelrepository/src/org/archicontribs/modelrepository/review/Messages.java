@@ -50,6 +50,7 @@ public class Messages extends NLS {
     public static String ReviewChangesDialog_26;
     public static String ReviewChangesDialog_27;
     public static String ReviewChangesDialog_28;
+    public static String ReviewChangesDialog_RevertDisabled;
 
     public static String DiagramDependencyInfo_0;
     public static String DiagramDependencyInfo_1;
