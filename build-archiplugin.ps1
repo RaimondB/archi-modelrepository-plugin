@@ -1,0 +1,176 @@
+# build-archiplugin.ps1
+# Run this after exporting plugins from Eclipse to create an .archiplugin file
+#
+# Usage: .\build-archiplugin.ps1 [-ExportDir <path>] [-Version <version>]
+#
+# Configuration:
+#   Create a build-config.local.json file (gitignored) with your local paths:
+#   {
+#       "ExportDir": "C:\\path\\to\\eclipse\\export\\plugins",
+#       "DistDir": "C:\\path\\to\\output"
+#   }
+#
+# Or pass parameters directly: .\build-archiplugin.ps1 -ExportDir "C:\path" -DistDir "C:\dist"
+
+param(
+    [string]$ExportDir = "",
+    [string]$OutputDir = "",
+    [string]$Version = "",
+    [string]$OutputFile = "",
+    [string]$DistDir = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+# Paths
+$mainPluginId = "org.archicontribs.modelrepository"
+$cmdlinePluginId = "org.archicontribs.modelrepository.commandline"
+$sourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Load local config if exists
+$configFile = Join-Path $sourceDir "build-config.local.json"
+if (Test-Path $configFile) {
+    $config = Get-Content $configFile | ConvertFrom-Json
+    if (-not $ExportDir -and $config.ExportDir) { $ExportDir = $config.ExportDir }
+    if (-not $DistDir -and $config.DistDir) { $DistDir = $config.DistDir }
+    Write-Host "Loaded config from: build-config.local.json" -ForegroundColor DarkGray
+}
+
+# Apply defaults for anything still not set
+if (-not $ExportDir) { $ExportDir = "C:\temp\coarchi-export\plugins" }
+if (-not $OutputDir) { $OutputDir = "$env:TEMP\archiplugin-build" }
+if (-not $DistDir) { $DistDir = "$env:USERPROFILE\dist\coArchi" }
+
+Write-Host "=== Archi Plugin Builder ===" -ForegroundColor Cyan
+Write-Host "Export Dir: $ExportDir"
+Write-Host "Source Dir: $sourceDir"
+
+# Validate export directory
+if (-not (Test-Path $ExportDir)) {
+    Write-Error "Export directory not found: $ExportDir`nExport plugins from Eclipse first!"
+    exit 1
+}
+
+# Find exported JARs (use exact pattern to avoid matching commandline as main)
+$mainJar = Get-ChildItem "$ExportDir" -Filter "$mainPluginId`_*.jar" -ErrorAction SilentlyContinue | 
+    Where-Object { $_.Name -notmatch "commandline" } | 
+    Select-Object -First 1
+$cmdlineJar = Get-ChildItem "$ExportDir" -Filter "$cmdlinePluginId`_*.jar" -ErrorAction SilentlyContinue | 
+    Select-Object -First 1
+
+if (-not $mainJar) {
+    Write-Error "Main plugin JAR not found in $ExportDir`nLooking for: $mainPluginId`_*.jar (not commandline)"
+    Write-Host "Files in directory:" -ForegroundColor Yellow
+    Get-ChildItem $ExportDir | ForEach-Object { Write-Host "  $($_.Name)" }
+    exit 1
+}
+
+Write-Host "Found main JAR: $($mainJar.Name)" -ForegroundColor Green
+if ($cmdlineJar) {
+    Write-Host "Found cmdline JAR: $($cmdlineJar.Name)" -ForegroundColor Green
+}
+
+# Extract version and qualifier from JAR name (e.g., org.archicontribs.modelrepository_0.9.4.202501161234.jar)
+$jarBaseName = [System.IO.Path]::GetFileNameWithoutExtension($mainJar.Name)
+if ($jarBaseName -match "_(\d+\.\d+\.\d+)\.?(.*)$") {
+    $jarVersion = $matches[1]
+    $qualifier = $matches[2]
+    if (-not $Version) { $Version = $jarVersion }
+} else {
+    if (-not $Version) { $Version = "0.9.4" }
+    $qualifier = Get-Date -Format "yyyyMMddHHmm"
+}
+
+$pluginFolderName = "${mainPluginId}_${Version}.${qualifier}"
+Write-Host "Plugin folder: $pluginFolderName" -ForegroundColor Yellow
+
+# Clean and create output directory
+if (Test-Path $OutputDir) {
+    Remove-Item $OutputDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path "$OutputDir\$pluginFolderName" | Out-Null
+
+# Create magic marker file
+"Magic file to signify this is an Archi plug-in bundle." | Out-File "$OutputDir\archi-plugin" -Encoding ASCII -NoNewline
+Write-Host "Created archi-plugin marker"
+
+# The exported JAR is already in "exploded" format - it contains:
+# - org.archicontribs.modelrepository.jar (inner JAR with compiled classes)
+# - img/, lib/, META-INF/, LICENSE.txt, plugin.xml, plugin.properties
+# So we just need to EXTRACT it, not copy resources from source
+
+$tempExtractDir = "$env:TEMP\coarchi-jar-extract"
+if (Test-Path $tempExtractDir) {
+    Remove-Item $tempExtractDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $tempExtractDir | Out-Null
+
+# Copy JAR to .zip for extraction (PowerShell only supports .zip)
+$tempZipPath = "$env:TEMP\coarchi-main.zip"
+Copy-Item $mainJar.FullName $tempZipPath -Force
+Expand-Archive -Path $tempZipPath -DestinationPath $tempExtractDir -Force
+Remove-Item $tempZipPath -Force
+
+# Copy extracted contents to plugin folder
+Get-ChildItem $tempExtractDir | ForEach-Object {
+    Copy-Item $_.FullName "$OutputDir\$pluginFolderName\" -Recurse -Force
+}
+Write-Host "Extracted and copied exported JAR contents" -ForegroundColor Green
+
+# Update the version in MANIFEST.MF
+$manifestPath = "$OutputDir\$pluginFolderName\META-INF\MANIFEST.MF"
+if (Test-Path $manifestPath) {
+    $manifestContent = Get-Content $manifestPath -Raw
+    $manifestContent = $manifestContent -replace "Bundle-Version: .*", "Bundle-Version: $Version.$qualifier"
+    Set-Content $manifestPath $manifestContent -NoNewline
+    Write-Host "Updated MANIFEST.MF version"
+}
+
+# Clean up temp extraction dir
+Remove-Item $tempExtractDir -Recurse -Force
+
+# Copy commandline plugin JAR (this one stays as JAR)
+if ($cmdlineJar) {
+    Copy-Item $cmdlineJar.FullName "$OutputDir\"
+    Write-Host "Copied commandline JAR"
+}
+
+# Create the .archiplugin file
+# Note: Create as .zip first, then rename (PowerShell only supports .zip extension)
+if (-not $OutputFile) {
+    # Create dist directory if needed
+    if (-not (Test-Path $DistDir)) {
+        New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+    }
+    $OutputFile = "$DistDir\coArchi_$Version.archiplugin"
+}
+
+$tempZipOutput = "$env:TEMP\coarchi-output.zip"
+
+if (Test-Path $OutputFile) {
+    Remove-Item $OutputFile -Force -Recurse
+}
+if (Test-Path $tempZipOutput) {
+    Remove-Item $tempZipOutput -Force
+}
+
+Compress-Archive -Path "$OutputDir\*" -DestinationPath $tempZipOutput -Force
+Move-Item $tempZipOutput $OutputFile -Force
+
+Write-Host ""
+Write-Host "=== Build Complete ===" -ForegroundColor Green
+Write-Host "Created: $OutputFile" -ForegroundColor Green
+Write-Host ""
+Write-Host "To install: Drag onto Archi or use Help -> Manage Plug-ins -> Install New..."
+
+# Show contents
+Write-Host ""
+Write-Host "Archive contents:" -ForegroundColor Yellow
+Get-ChildItem $OutputDir -Recurse | ForEach-Object {
+    $relativePath = $_.FullName.Replace($OutputDir, "").TrimStart("\")
+    if ($_.PSIsContainer) {
+        Write-Host "  $relativePath/" -ForegroundColor Blue
+    } else {
+        Write-Host "  $relativePath"
+    }
+}

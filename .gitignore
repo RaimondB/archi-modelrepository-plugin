@@ -1,2 +1,7 @@
 .settings/
 target/
+examples/
+debug.log
+
+# Local build configuration (user-specific paths)
+build-config.local.json
