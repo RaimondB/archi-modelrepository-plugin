@@ -16,6 +16,7 @@ param(
     [string]$ExportDir = "",
     [string]$OutputDir = "",
     [string]$Version = "",
+    [string]$VersionSuffix = "",
     [string]$OutputFile = "",
     [string]$DistDir = ""
 )
@@ -33,6 +34,7 @@ if (Test-Path $configFile) {
     $config = Get-Content $configFile | ConvertFrom-Json
     if (-not $ExportDir -and $config.ExportDir) { $ExportDir = $config.ExportDir }
     if (-not $DistDir -and $config.DistDir) { $DistDir = $config.DistDir }
+    if (-not $VersionSuffix -and $config.VersionSuffix) { $VersionSuffix = $config.VersionSuffix }
     Write-Host "Loaded config from: build-config.local.json" -ForegroundColor DarkGray
 }
 
@@ -52,10 +54,13 @@ if (-not (Test-Path $ExportDir)) {
 }
 
 # Find exported JARs (use exact pattern to avoid matching commandline as main)
+# Sort by LastWriteTime descending to get the latest export when multiple exist
 $mainJar = Get-ChildItem "$ExportDir" -Filter "$mainPluginId`_*.jar" -ErrorAction SilentlyContinue | 
     Where-Object { $_.Name -notmatch "commandline" } | 
+    Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 $cmdlineJar = Get-ChildItem "$ExportDir" -Filter "$cmdlinePluginId`_*.jar" -ErrorAction SilentlyContinue | 
+    Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
 if (-not $mainJar) {
@@ -81,7 +86,10 @@ if ($jarBaseName -match "_(\d+\.\d+\.\d+)\.?(.*)$") {
     $qualifier = Get-Date -Format "yyyyMMddHHmm"
 }
 
-$pluginFolderName = "${mainPluginId}_${Version}.${qualifier}"
+# Apply version suffix as prefix to qualifier (OSGi requires major.minor.micro.qualifier format)
+# e.g., "rb" suffix becomes "0.9.4.rb202601161718" not "0.9.4-rb.202601161718"
+$fullQualifier = if ($VersionSuffix) { "${VersionSuffix}${qualifier}" } else { $qualifier }
+$pluginFolderName = "${mainPluginId}_${Version}.${fullQualifier}"
 Write-Host "Plugin folder: $pluginFolderName" -ForegroundColor Yellow
 
 # Clean and create output directory
@@ -121,9 +129,9 @@ Write-Host "Extracted and copied exported JAR contents" -ForegroundColor Green
 $manifestPath = "$OutputDir\$pluginFolderName\META-INF\MANIFEST.MF"
 if (Test-Path $manifestPath) {
     $manifestContent = Get-Content $manifestPath -Raw
-    $manifestContent = $manifestContent -replace "Bundle-Version: .*", "Bundle-Version: $Version.$qualifier"
+    $manifestContent = $manifestContent -replace "Bundle-Version: .*", "Bundle-Version: $Version.$fullQualifier"
     Set-Content $manifestPath $manifestContent -NoNewline
-    Write-Host "Updated MANIFEST.MF version"
+    Write-Host "Updated MANIFEST.MF version to $Version.$fullQualifier"
 }
 
 # Clean up temp extraction dir
@@ -142,7 +150,9 @@ if (-not $OutputFile) {
     if (-not (Test-Path $DistDir)) {
         New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
     }
-    $OutputFile = "$DistDir\coArchi_$Version.archiplugin"
+    # Use suffix in filename for easy identification
+    $filenameSuffix = if ($VersionSuffix) { "-$VersionSuffix" } else { "" }
+    $OutputFile = "$DistDir\coArchi_$Version$filenameSuffix.archiplugin"
 }
 
 $tempZipOutput = "$env:TEMP\coarchi-output.zip"
