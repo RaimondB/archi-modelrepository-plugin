@@ -9,12 +9,15 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter.UnresolvedObject;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.util.EcoreUtil;
 import org.eclipse.jface.operation.IRunnableWithProgress;
@@ -71,6 +74,16 @@ public class GraficoModelLoader {
     }
     
     /**
+     * Log a message via the plugin logger, tolerating null plugin instance (e.g. in tests)
+     */
+    private static void log(int severity, String message) {
+        ModelRepositoryPlugin plugin = ModelRepositoryPlugin.getInstance();
+        if(plugin != null) {
+            plugin.log(severity, message, null);
+        }
+    }
+    
+    /**
      * Load the model
      * @return
      * @throws IOException
@@ -88,6 +101,14 @@ public class GraficoModelLoader {
      */
     public IArchimateModel loadModel(IProgressMonitor monitor) throws IOException {
         fRestoredObjects = null;
+        
+        // Repair missing folder.xml files before import.
+        // After git merges, directories may exist with element files but no folder.xml,
+        // which causes the importer to throw IOException or silently drop elements.
+        int repairedFolders = repairMissingFolderXml();
+        if(repairedFolders > 0) {
+            log(IStatus.INFO, "[GraficoModelLoader] Restored " + repairedFolders + " missing folder.xml file(s) from git history"); //$NON-NLS-1$ //$NON-NLS-2$
+        }
         
         // Import Grafico Model
         GraficoModelImporter importer = new GraficoModelImporter(fRepository.getLocalRepositoryFolder());
@@ -176,7 +197,7 @@ public class GraficoModelLoader {
         	// (e.g. from merge conflicts or manual diagram edits).
         	int repaired = repairConnectionEndpoints(graficoModel[0]);
         	if(repaired > 0) {
-        	    System.out.println("[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        	    log(IStatus.INFO, "[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
         	}
 
         	// Validate that the model is correct after fixes so it can be exported again
@@ -373,7 +394,7 @@ public class GraficoModelLoader {
      * @param model The model to repair
      * @return The number of connections repaired
      */
-    private int repairConnectionEndpoints(IArchimateModel model) {
+    int repairConnectionEndpoints(IArchimateModel model) {
         int repaired = 0;
         
         // Collect all connections first to avoid ConcurrentModificationException
@@ -433,7 +454,7 @@ public class GraficoModelLoader {
             if(newSource != currentSource || newTarget != currentTarget) {
                 String diagramName = diagram.getName();
                 String connId = connection.getId();
-                System.out.println("[GraficoModelLoader] Rewiring connection " + connId //$NON-NLS-1$
+                log(IStatus.INFO, "[GraficoModelLoader] Rewiring connection " + connId //$NON-NLS-1$
                         + " in '" + diagramName + "'" //$NON-NLS-1$ //$NON-NLS-2$
                         + (sourceMismatch ? " (source)" : "") //$NON-NLS-1$ //$NON-NLS-2$
                         + (targetMismatch ? " (target)" : "")); //$NON-NLS-1$ //$NON-NLS-2$
@@ -466,6 +487,249 @@ public class GraficoModelLoader {
         }
         
         return null;
+    }
+
+    /**
+     * Scan the GRAFICO model directory tree and repair any directories that contain
+     * element XML files but are missing their folder.xml.
+     * 
+     * <p>This happens after git merges in two scenarios:</p>
+     * <ol>
+     *   <li><b>Simple merge conflict:</b> One side adds elements in a subfolder, the other
+     *       side doesn't have that subfolder. Git creates the element files but may lose
+     *       the folder.xml. In this case, restoring from git history is safe.</li>
+     *   <li><b>Folder move:</b> Git sees a folder move as delete + create. After merge,
+     *       the old location may still have element files but no folder.xml. Restoring
+     *       the old folder.xml would undo the move (duplicate ID). Instead, we create
+     *       a new "[MERGE FIX]" folder with a fresh ID so the user can manually resolve.</li>
+     * </ol>
+     * 
+     * <p>For each missing folder.xml, we:</p>
+     * <ol>
+     *   <li>Try to restore it from git history at the same path</li>
+     *   <li>Check if the restored folder's ID already exists elsewhere in the model tree
+     *       (indicating a move, not a delete)</li>
+     *   <li>If duplicate detected: discard the restored file and create a "[MERGE FIX]"
+     *       folder with a new UUID</li>
+     *   <li>If not found in history: also create a "[MERGE FIX]" folder</li>
+     * </ol>
+     * 
+     * @return The number of folder.xml files restored or created
+     * @throws IOException if the model directory cannot be read
+     */
+    int repairMissingFolderXml() throws IOException {
+        File modelDir = new File(fRepository.getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
+        if(!modelDir.isDirectory()) {
+            return 0;
+        }
+        
+        int repaired = 0;
+        List<File> dirsWithMissingFolderXml = new ArrayList<>();
+        
+        // Recursively find directories that have element XML files but no folder.xml
+        findDirsWithMissingFolderXml(modelDir, dirsWithMissingFolderXml);
+        
+        if(dirsWithMissingFolderXml.isEmpty()) {
+            return 0;
+        }
+        
+        // Build a set of all existing folder IDs in the model tree (for move detection)
+        java.util.Set<String> existingFolderIds = collectExistingFolderIds(modelDir);
+        
+        try(Repository repository = Git.open(fRepository.getLocalRepositoryFolder()).getRepository()) {
+            for(File dir : dirsWithMissingFolderXml) {
+                String relativePath = fRepository.getLocalRepositoryFolder().toPath()
+                        .relativize(dir.toPath().resolve(IGraficoConstants.FOLDER_XML))
+                        .toString().replace('\\', '/');
+                
+                // Try to restore from git history at this exact path
+                byte[] historicalContent = loadFolderXmlFromHistory(repository, relativePath);
+                
+                if(historicalContent != null) {
+                    // Found in history - extract the ID to check for moves
+                    String historicalId = extractIdFromFolderXml(historicalContent);
+                    
+                    if(historicalId != null && existingFolderIds.contains(historicalId)) {
+                        // ID already exists elsewhere = this was a MOVE, not a delete.
+                        // Don't restore the old folder.xml (would create duplicate ID).
+                        // Instead create a merge-fix folder with a new ID.
+                        String originalName = extractNameFromFolderXml(historicalContent);
+                        createMergeFixFolderXml(dir, originalName != null ? originalName : dir.getName());
+                        log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
+                                + " (id " + historicalId + " exists elsewhere). Created [MERGE FIX] folder."); //$NON-NLS-1$ //$NON-NLS-2$
+                    } else {
+                        // ID doesn't exist elsewhere - safe to restore from history
+                        File folderXmlFile = new File(dir, IGraficoConstants.FOLDER_XML);
+                        Files.write(folderXmlFile.toPath(), historicalContent);
+                        if(historicalId != null) {
+                            existingFolderIds.add(historicalId); // Track for subsequent dirs
+                        }
+                        log(IStatus.INFO, "[GraficoModelLoader] Restored folder.xml from git history: " + relativePath); //$NON-NLS-1$
+                    }
+                } else {
+                    // Not found in history at all - create a merge-fix folder
+                    createMergeFixFolderXml(dir, dir.getName());
+                    log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] folder.xml for " + relativePath); //$NON-NLS-1$
+                }
+                
+                repaired++;
+            }
+        }
+        
+        return repaired;
+    }
+    
+    /**
+     * Recursively find directories under modelDir that contain .xml element files
+     * but are missing folder.xml.
+     */
+    void findDirsWithMissingFolderXml(File dir, List<File> result) {
+        File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
+        
+        if(!folderXml.exists()) {
+            // Check if this directory contains any .xml element files or subdirectories
+            // (a folder might only contain subfolders, not direct elements)
+            File[] xmlFiles = dir.listFiles((d, name) -> name.endsWith(".xml")); //$NON-NLS-1$
+            File[] subdirs = dir.listFiles(File::isDirectory);
+            if((xmlFiles != null && xmlFiles.length > 0) || (subdirs != null && subdirs.length > 0)) {
+                result.add(dir);
+            }
+        }
+        
+        // Recurse into subdirectories
+        File[] subdirs = dir.listFiles(File::isDirectory);
+        if(subdirs != null) {
+            for(File subdir : subdirs) {
+                findDirsWithMissingFolderXml(subdir, result);
+            }
+        }
+    }
+    
+    /**
+     * Collect all folder IDs from existing folder.xml files in the model tree.
+     * Used to detect folder moves (where the same ID exists in a different location).
+     */
+    java.util.Set<String> collectExistingFolderIds(File modelDir) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        collectFolderIdsRecursive(modelDir, ids);
+        return ids;
+    }
+    
+    private void collectFolderIdsRecursive(File dir, java.util.Set<String> ids) {
+        File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
+        if(folderXml.exists()) {
+            try {
+                byte[] content = Files.readAllBytes(folderXml.toPath());
+                String id = extractIdFromFolderXml(content);
+                if(id != null) {
+                    ids.add(id);
+                }
+            } catch(IOException e) {
+                // Skip unreadable files
+            }
+        }
+        
+        File[] subdirs = dir.listFiles(File::isDirectory);
+        if(subdirs != null) {
+            for(File subdir : subdirs) {
+                collectFolderIdsRecursive(subdir, ids);
+            }
+        }
+    }
+    
+    /**
+     * Load folder.xml content from git commit history at the exact path.
+     * 
+     * @return The file content as bytes, or null if not found in history
+     */
+    private byte[] loadFolderXmlFromHistory(Repository repository, String relativePath) throws IOException {
+        try(RevWalk revWalk = new RevWalk(repository)) {
+            ObjectId headId = repository.resolve(IGraficoConstants.HEAD);
+            if(headId == null) {
+                return null;
+            }
+            revWalk.markStart(revWalk.parseCommit(headId));
+            
+            for(RevCommit commit : revWalk) {
+                try(TreeWalk treeWalk = TreeWalk.forPath(repository, relativePath, commit.getTree())) {
+                    if(treeWalk != null) {
+                        ObjectId objectId = treeWalk.getObjectId(0);
+                        ObjectLoader loader = repository.open(objectId);
+                        return loader.getBytes();
+                    }
+                }
+            }
+            
+            revWalk.dispose();
+        }
+        return null;
+    }
+    
+    /**
+     * Extract the id attribute from a folder.xml content.
+     * Uses simple string matching to avoid XML parsing overhead.
+     */
+    static String extractIdFromFolderXml(byte[] content) {
+        String xml = new String(content, java.nio.charset.StandardCharsets.UTF_8);
+        int idStart = xml.indexOf("id=\""); //$NON-NLS-1$
+        if(idStart < 0) {
+            return null;
+        }
+        idStart += 4; // skip past id="
+        int idEnd = xml.indexOf('"', idStart);
+        if(idEnd < 0) {
+            return null;
+        }
+        return xml.substring(idStart, idEnd);
+    }
+    
+    /**
+     * Extract the name attribute from a folder.xml content.
+     * Uses simple string matching to avoid XML parsing overhead.
+     */
+    static String extractNameFromFolderXml(byte[] content) {
+        String xml = new String(content, java.nio.charset.StandardCharsets.UTF_8);
+        int nameStart = xml.indexOf("name=\""); //$NON-NLS-1$
+        if(nameStart < 0) {
+            return null;
+        }
+        nameStart += 6; // skip past name="
+        int nameEnd = xml.indexOf('"', nameStart);
+        if(nameEnd < 0) {
+            return null;
+        }
+        return xml.substring(nameStart, nameEnd)
+                .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
+                .replace("&quot;", "\""); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Create a "[MERGE FIX]" folder.xml with a new UUID.
+     * This is used when a folder was moved (so the original ID exists elsewhere)
+     * or when the folder.xml was never found in history.
+     * The "[MERGE FIX]" prefix signals to the user that manual resolution is needed.
+     * 
+     * @param dir The directory to create the folder.xml in
+     * @param originalName The original folder name (will be prefixed with "[MERGE FIX] ")
+     * @throws IOException if the file cannot be written
+     */
+    void createMergeFixFolderXml(File dir, String originalName) throws IOException {
+        String newId = "id-" + java.util.UUID.randomUUID().toString().replace("-", ""); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        String displayName = "[MERGE FIX] " + originalName; //$NON-NLS-1$
+        File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
+        String xml = "<archimate:Folder\n" //$NON-NLS-1$
+                + "    xmlns:archimate=\"http://www.archimatetool.com/archimate\"\n" //$NON-NLS-1$
+                + "    name=\"" + escapeXml(displayName) + "\"\n" //$NON-NLS-1$ //$NON-NLS-2$
+                + "    id=\"" + escapeXml(newId) + "\"/>\n"; //$NON-NLS-1$ //$NON-NLS-2$
+        Files.writeString(folderXml.toPath(), xml);
+    }
+    
+    /**
+     * Escape special XML characters in a string.
+     */
+    static String escapeXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
+                .replace("\"", "&quot;"); //$NON-NLS-1$ //$NON-NLS-2$
     }
 
     @SuppressWarnings("unused")  // Keep for potential future use
