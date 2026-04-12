@@ -35,8 +35,13 @@ import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.editor.model.ModelChecker;
 import com.archimatetool.editor.ui.services.EditorManager;
 import com.archimatetool.editor.utils.StringUtils;
+import com.archimatetool.model.IArchimateConcept;
 import com.archimatetool.model.IArchimateModel;
+import com.archimatetool.model.IArchimateRelationship;
+import com.archimatetool.model.IConnectable;
 import com.archimatetool.model.IDiagramModel;
+import com.archimatetool.model.IDiagramModelArchimateComponent;
+import com.archimatetool.model.IDiagramModelArchimateConnection;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
 import com.archimatetool.model.util.ArchimateModelUtils;
@@ -163,7 +168,16 @@ public class GraficoModelLoader {
 	            reopenEditors(graficoModel[0], openModelIDs);
 	        }
         } else {
-        	// Just do the validation that the model is valid after the fix so it can be correctly exported again
+        	// Repair connection endpoint mismatches before validation.
+        	// After GRAFICO import, some diagram connections may reference elements
+        	// that don't match their underlying relationship's source/target
+        	// (e.g. from merge conflicts or manual diagram edits).
+        	int repaired = repairConnectionEndpoints(graficoModel[0]);
+        	if(repaired > 0) {
+        	    System.out.println("[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        	}
+
+        	// Validate that the model is correct after fixes so it can be exported again
             ModelChecker checker = new ModelChecker(graficoModel[0]);
             if(!checker.checkAll()) {
             	//String errorMessage = checker.buildMessageSummary(); Wait with this until PR accepted for Archi
@@ -326,7 +340,114 @@ public class GraficoModelLoader {
         return graficoModel;
     }
 
-    @SuppressWarnings("unused")
+    /**
+     * Repair diagram connections whose visual source/target endpoints don't match 
+     * the underlying relationship's source/target concepts.
+     * 
+     * This happens when GRAFICO merge conflicts cause a connection's source or target
+     * diagram object to reference a different concept than the relationship expects.
+     * For each mismatched connection, we search the same diagram for a diagram object 
+     * representing the correct concept and rewire the connection.
+     * 
+     * @param model The model to repair
+     * @return The number of connections repaired
+     */
+    private int repairConnectionEndpoints(IArchimateModel model) {
+        int repaired = 0;
+        
+        // Collect all connections first to avoid ConcurrentModificationException
+        // when connect() modifies the model tree during iteration
+        List<IDiagramModelArchimateConnection> connections = new ArrayList<>();
+        for(Iterator<EObject> iter = model.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IDiagramModelArchimateConnection connection) {
+                connections.add(connection);
+            }
+        }
+        
+        for(IDiagramModelArchimateConnection connection : connections) {
+            IArchimateRelationship relation = connection.getArchimateRelationship();
+            if(relation == null) {
+                continue;
+            }
+            
+            IConnectable currentSource = connection.getSource();
+            IConnectable currentTarget = connection.getTarget();
+            
+            // Check source mismatch
+            boolean sourceMismatch = currentSource instanceof IDiagramModelArchimateComponent dmc
+                    && dmc.getArchimateConcept() != relation.getSource();
+            
+            // Check target mismatch
+            boolean targetMismatch = currentTarget instanceof IDiagramModelArchimateComponent dmc
+                    && dmc.getArchimateConcept() != relation.getTarget();
+            
+            if(!sourceMismatch && !targetMismatch) {
+                continue;
+            }
+            
+            IDiagramModel diagram = connection.getDiagramModel();
+            if(diagram == null) {
+                continue;
+            }
+            
+            IConnectable newSource = currentSource;
+            IConnectable newTarget = currentTarget;
+            
+            if(sourceMismatch) {
+                IConnectable found = findDiagramComponentForConcept(diagram, relation.getSource());
+                if(found != null) {
+                    newSource = found;
+                }
+            }
+            
+            if(targetMismatch) {
+                IConnectable found = findDiagramComponentForConcept(diagram, relation.getTarget());
+                if(found != null) {
+                    newTarget = found;
+                }
+            }
+            
+            // Only rewire if we actually found replacements
+            if(newSource != currentSource || newTarget != currentTarget) {
+                String diagramName = diagram.getName();
+                String connId = connection.getId();
+                System.out.println("[GraficoModelLoader] Rewiring connection " + connId //$NON-NLS-1$
+                        + " in '" + diagramName + "'" //$NON-NLS-1$ //$NON-NLS-2$
+                        + (sourceMismatch ? " (source)" : "") //$NON-NLS-1$ //$NON-NLS-2$
+                        + (targetMismatch ? " (target)" : "")); //$NON-NLS-1$ //$NON-NLS-2$
+                connection.connect(newSource, newTarget);
+                repaired++;
+            }
+        }
+        
+        return repaired;
+    }
+    
+    /**
+     * Find a diagram component (object or connection) in the given diagram that references
+     * the specified ArchiMate concept.
+     * 
+     * @param diagram The diagram to search
+     * @param concept The concept to find a visual representation of
+     * @return The first matching diagram component, or null if not found
+     */
+    private IConnectable findDiagramComponentForConcept(IDiagramModel diagram, IArchimateConcept concept) {
+        if(concept == null) {
+            return null;
+        }
+        
+        for(Iterator<EObject> iter = diagram.eAllContents(); iter.hasNext();) {
+            EObject child = iter.next();
+            if(child instanceof IDiagramModelArchimateComponent dmc && dmc.getArchimateConcept() == concept) {
+                return dmc;
+            }
+        }
+        
+        return null;
+    }
+
+    @SuppressWarnings("unused")  // Keep for potential future use
     private void deleteProblemObjects(List<UnresolvedObject> unresolvedObjects, IArchimateModel model) throws IOException {
         for(UnresolvedObject unresolved : unresolvedObjects) {
             String parentID = unresolved.parentObject.getId();
