@@ -21,6 +21,8 @@
         <!-- p2 file URL prefix: Linux paths start with / so file:// suffices;
              Windows paths start with C: so need file:/// (overridden in Windows profile) -->
         <archi.p2.url.prefix>file://</archi.p2.url.prefix>
+        <!-- Set to true to skip Archi download+extract (auto-set by skip-archi-download profile) -->
+        <archi.download.skip>false</archi.download.skip>
     </properties>
     
     <repositories>
@@ -181,6 +183,21 @@
     </build>
 
     <profiles>
+        <!-- Skip download+extract when Archi runtime already exists.
+             This prevents file lock errors when a previous test run's OSGi
+             process still holds jar files open. -->
+        <profile>
+            <id>skip-archi-download</id>
+            <activation>
+                <file>
+                    <exists>${maven.multiModuleProjectDirectory}/target/archi-runtime/Archi/artifacts.xml</exists>
+                </file>
+            </activation>
+            <properties>
+                <archi.download.skip>true</archi.download.skip>
+            </properties>
+        </profile>
+
         <!-- Download Archi runtime for target platform (OS-specific).
              Always active on the matching OS. The download plugin caches the
              archive in ~/.m2/repository/.cache/download-maven-plugin/ so
@@ -206,6 +223,7 @@
                                     <url>https://github.com/archimatetool/archi.io/releases/download/${archi.version}/Archi-Linux64-${archi.version}.tgz</url>
                                     <unpack>true</unpack>
                                     <outputDirectory>${maven.multiModuleProjectDirectory}/target/archi-runtime</outputDirectory>
+                                    <skip>${archi.download.skip}</skip>
                                     <skipCache>false</skipCache>
                                     <overwrite>false</overwrite>
                                     <followRedirects>true</followRedirects>
@@ -241,6 +259,7 @@
                                     <url>https://github.com/archimatetool/archi.io/releases/download/${archi.version}/Archi-Win64-${archi.version}.zip</url>
                                     <unpack>true</unpack>
                                     <outputDirectory>${maven.multiModuleProjectDirectory}/target/archi-runtime</outputDirectory>
+                                    <skip>${archi.download.skip}</skip>
                                     <skipCache>false</skipCache>
                                     <overwrite>false</overwrite>
                                     <followRedirects>true</followRedirects>
@@ -272,6 +291,7 @@
                                     <url>https://github.com/archimatetool/archi.io/releases/download/${archi.version}/Archi-Mac-${archi.version}.dmg</url>
                                     <unpack>true</unpack>
                                     <outputDirectory>${maven.multiModuleProjectDirectory}/target/archi-runtime</outputDirectory>
+                                    <skip>${archi.download.skip}</skip>
                                     <skipCache>false</skipCache>
                                     <overwrite>false</overwrite>
                                     <followRedirects>true</followRedirects>
