@@ -29,6 +29,8 @@ import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorReference;
 import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.PlatformUI;
+import org.eclipse.swt.graphics.Rectangle;
+import org.eclipse.swt.widgets.Shell;
 
 import com.archimatetool.editor.diagram.DiagramEditorInput;
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -226,9 +228,28 @@ public class GraficoModelLoader {
         if(model != null) {
             // Store ids of open diagrams
             List<String> openModelIDs = getOpenDiagramModelIdentifiers(model);
-            IEditorModelManager.INSTANCE.closeModel(model);
-            IEditorModelManager.INSTANCE.openModel(graficoModel);
-            reopenEditors(graficoModel, openModelIDs);
+            
+            // Save shell state before close/open cycle.
+            // closeModel() can cause the shell to lose its maximized state when
+            // the editor area collapses, resulting in a visible window resize.
+            Shell shell = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell();
+            boolean wasMaximized = shell.getMaximized();
+            Rectangle savedBounds = shell.getBounds();
+            
+            shell.setRedraw(false);
+            try {
+                IEditorModelManager.INSTANCE.closeModel(model);
+                IEditorModelManager.INSTANCE.openModel(graficoModel);
+                reopenEditors(graficoModel, openModelIDs);
+            } finally {
+                // Restore shell state if it changed during close/open
+                if(wasMaximized && !shell.getMaximized()) {
+                    shell.setMaximized(true);
+                } else if(!wasMaximized) {
+                    shell.setBounds(savedBounds);
+                }
+                shell.setRedraw(true);
+            }
         }
     }
     

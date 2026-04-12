@@ -1,0 +1,9 @@
+{
+    "// README": "Copy this file to build-config.local.json and adjust for your environment",
+    "// DistDir": "Output directory for the .archiplugin file",
+    "DistDir": "C:\\Users\\<you>\\dist\\coArchi",
+    "// VersionSuffix": "Optional prefix added to the qualifier (e.g. 'rb' -> 0.9.4.rb202603111729)",
+    "VersionSuffix": "",
+    "// MavenPath": "Full path to mvn.cmd if not on PATH",
+    "MavenPath": ""
+}

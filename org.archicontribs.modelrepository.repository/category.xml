@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <feature id="org.archicontribs.modelrepository.feature" version="0.0.0">
+      <category name="org.archicontribs.modelrepository"/>
+   </feature>
+   <category-def name="org.archicontribs.modelrepository" label="coArchi">
+      <description>
+         Collaboration plugin for Archi using Git to store ArchiMate models in GRAFICO format.
+      </description>
+   </category-def>
+</site>

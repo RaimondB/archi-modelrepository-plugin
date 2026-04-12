@@ -779,7 +779,13 @@ public class GraficoModelImporter {
                         
                         if (drained > 0) {
                             for (ElementWithFolder item : drainBuffer) {
-                                if (item.element() == null) continue;
+                                if (item.element() == null) {
+                                    elementsProcessed.incrementAndGet();
+                                    if (fProgressReporter != null) {
+                                        fProgressReporter.increment();
+                                    }
+                                    continue;
+                                }
                                 
                                 IFolder targetFolder = fFolderPathLookup.get(item.folderPath());
                                 if (targetFolder != null) {
@@ -801,22 +807,36 @@ public class GraficoModelImporter {
                             }
                         } else {
                             // Queue empty, wait a bit
-                            ElementWithFolder item = elementQueue.poll(10, TimeUnit.MILLISECONDS);
-                            if (item != null && item.element() != null) {
-                                IFolder targetFolder = fFolderPathLookup.get(item.folderPath());
-                                if (targetFolder != null) {
-                                    // Check type - diagrams are not IArchimateConcept
-                                    if (item.element() instanceof IArchimateConcept) {
-                                        targetFolder.getElements().add((IArchimateConcept) item.element());
-                                    } else if (item.element() instanceof IDiagramModel) {
-                                        targetFolder.getElements().add((IDiagramModel) item.element());
-                                    }
+                            ElementWithFolder item = elementQueue.poll(2, TimeUnit.SECONDS);
+                            if (item == null) {
+                                // Timeout - check if producers are done
+                                if (remainingElements.get() == 0 && elementQueue.isEmpty()) {
+                                    break;  // All done
                                 }
+                                continue;
+                            }
+                            
+                            if (item.element() == null) {
                                 elementsProcessed.incrementAndGet();
-                                
                                 if (fProgressReporter != null) {
-                                    fProgressReporter.incrementBy(1);
+                                    fProgressReporter.increment();
                                 }
+                                continue;
+                            }
+                            
+                            IFolder targetFolder = fFolderPathLookup.get(item.folderPath());
+                            if (targetFolder != null) {
+                                // Check type - diagrams are not IArchimateConcept
+                                if (item.element() instanceof IArchimateConcept) {
+                                    targetFolder.getElements().add((IArchimateConcept) item.element());
+                                } else if (item.element() instanceof IDiagramModel) {
+                                    targetFolder.getElements().add((IDiagramModel) item.element());
+                                }
+                            }
+                            elementsProcessed.incrementAndGet();
+                                
+                            if (fProgressReporter != null) {
+                                fProgressReporter.incrementBy(1);
                             }
                         }
                     }

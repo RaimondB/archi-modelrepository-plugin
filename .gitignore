@@ -1,7 +1,19 @@
-.settings/
+# Eclipse build outputs
+bin/
 target/
+
+# IDE
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test/example files
 examples/
-debug.log
 
 # Local build configuration (user-specific paths)
 build-config.local.json

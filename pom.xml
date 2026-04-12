@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.archicontribs</groupId>
+    <artifactId>archi-modelrepository-plugin</artifactId>
+    <version>${revision}</version>
+    <packaging>pom</packaging>
+
+    <name>coArchi - Archi Model Repository Plugin</name>
+    <description>Collaboration plugin for Archi using Git to store ArchiMate models</description>
+
+    <properties>
+        <revision>0.9.4-SNAPSHOT</revision>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- Archi version to download -->
+        <archi.version>5.7.0</archi.version>
+        <!-- Default to downloaded Archi; override with -Darchi.target.dir for local dev -->
+        <archi.target.dir>${maven.multiModuleProjectDirectory}/target/archi-runtime/Archi</archi.target.dir>
+    </properties>
+    
+    <repositories>
+        <!-- Eclipse 2024-06 platform -->
+        <repository>
+            <id>Eclipse</id>
+            <layout>p2</layout>
+            <url>https://download.eclipse.org/releases/2024-06</url>
+        </repository>
+    </repositories>
+
+    <modules>
+        <module>org.archicontribs.modelrepository</module>
+        <module>org.archicontribs.modelrepository.commandline</module>
+        <module>org.archicontribs.modelrepository.feature</module>
+        <module>org.archicontribs.modelrepository.repository</module>
+    </modules>
+
+    <build>
+        <plugins>
+            <!-- Download Archi runtime for target platform -->
+            <plugin>
+                <groupId>com.googlecode.maven-download-plugin</groupId>
+                <artifactId>download-maven-plugin</artifactId>
+                <version>1.9.0</version>
+                <inherited>false</inherited>
+                <executions>
+                    <execution>
+                        <id>download-archi</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>wget</goal>
+                        </goals>
+                        <configuration>
+                            <url>https://github.com/archimatetool/archi.io/releases/download/${archi.version}/Archi-Win64-${archi.version}.zip</url>
+                            <unpack>true</unpack>
+                            <outputDirectory>${maven.multiModuleProjectDirectory}/target/archi-runtime</outputDirectory>
+                            <skipCache>false</skipCache>
+                            <overwrite>false</overwrite>
+                            <followRedirects>true</followRedirects>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.eclipse.tycho</groupId>
+                <artifactId>tycho-maven-plugin</artifactId>
+                <version>${tycho-version}</version>
+                <extensions>true</extensions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.eclipse.tycho</groupId>
+                <artifactId>tycho-packaging-plugin</artifactId>
+                <version>${tycho-version}</version>
+                <configuration>
+                    <archive>
+                        <addMavenDescriptor>false</addMavenDescriptor>
+                    </archive>
+                </configuration>
+            </plugin>
+            
+            <plugin>
+                <groupId>org.eclipse.tycho</groupId>
+                <artifactId>tycho-compiler-plugin</artifactId>
+                <version>${tycho-version}</version>
+                <configuration>
+                    <encoding>UTF-8</encoding>
+                    <useProjectSettings>false</useProjectSettings>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.eclipse.tycho</groupId>
+                <artifactId>target-platform-configuration</artifactId>
+                <version>${tycho-version}</version>
+                <configuration>
+                    <target>
+                        <file>${maven.multiModuleProjectDirectory}/coarchi.target</file>
+                    </target>
+                    <environments>
+                        <environment>
+                            <os>win32</os>
+                            <ws>win32</ws>
+                            <arch>x86_64</arch>
+                        </environment>
+                        <environment>
+                            <os>linux</os>
+                            <ws>gtk</ws>
+                            <arch>x86_64</arch>
+                        </environment>
+                        <environment>
+                            <os>macosx</os>
+                            <ws>cocoa</ws>
+                            <arch>x86_64</arch>
+                        </environment>
+                        <environment>
+                            <os>macosx</os>
+                            <ws>cocoa</ws>
+                            <arch>aarch64</arch>
+                        </environment>
+                    </environments>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

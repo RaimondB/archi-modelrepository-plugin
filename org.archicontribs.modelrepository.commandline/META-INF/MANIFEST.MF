@@ -4,7 +4,7 @@ Bundle-Name: coArchi Command Line
 Bundle-SymbolicName: org.archicontribs.modelrepository.commandline;singleton:=true
 Bundle-Localization: plugin
 Bundle-Version: 0.9.4.qualifier
-Bundle-Vendor: Archi
+Bundle-Vendor: Archi - RaimondB fork
 Require-Bundle: com.archimatetool.commandline;bundle-version="4.9.0",
  org.archicontribs.modelrepository;bundle-version="0.9.4",
  com.archimatetool.model;bundle-version="4.9.0",
