@@ -22,6 +22,7 @@ import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.util.EcoreUtil;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
@@ -536,6 +537,9 @@ public class GraficoModelLoader {
         // Build a set of all existing folder IDs in the model tree (for move detection)
         java.util.Set<String> existingFolderIds = collectExistingFolderIds(modelDir);
         
+        // Track repaired paths for git add (needed so DirCache importer can see them)
+        List<String> repairedRelativePaths = new ArrayList<>();
+        
         try(Repository repository = Git.open(fRepository.getLocalRepositoryFolder()).getRepository()) {
             for(File dir : dirsWithMissingFolderXml) {
                 String relativePath = fRepository.getLocalRepositoryFolder().toPath()
@@ -572,7 +576,24 @@ public class GraficoModelLoader {
                     log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] folder.xml for " + relativePath); //$NON-NLS-1$
                 }
                 
+                repairedRelativePaths.add(relativePath);
                 repaired++;
+            }
+        }
+        
+        // Stage repaired folder.xml files so the DirCache-based importer can see them.
+        // The importer reads file paths from the git index (DirCache), not the working
+        // directory, so untracked files would be invisible and their elements orphaned.
+        if(!repairedRelativePaths.isEmpty()) {
+            try(Git git = Git.open(fRepository.getLocalRepositoryFolder())) {
+                var addCommand = git.add();
+                for(String path : repairedRelativePaths) {
+                    addCommand.addFilepattern(path);
+                }
+                addCommand.call();
+            } catch(GitAPIException ex) {
+                log(IStatus.WARNING, "[GraficoModelLoader] Failed to stage repaired folder.xml files: " + ex.getMessage()); //$NON-NLS-1$
+                // Non-fatal: the traditional (non-DirCache) importer would still work
             }
         }
         
