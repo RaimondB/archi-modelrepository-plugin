@@ -356,6 +356,12 @@ public class MergeBranchAction extends AbstractModelAction {
                 if(restoredObjects != null) {
                     mergeMessage += "\n\n" + Messages.RefreshModelAction_3 + "\n" + restoredObjects; //$NON-NLS-1$ //$NON-NLS-2$
                 }
+                
+                // Did we repair any missing folder.xml files?
+                String repairDetails = loader.getRepairDetailsAsString();
+                if(repairDetails != null) {
+                    mergeMessage += "\n" + repairDetails; //$NON-NLS-1$
+                }
 
                 // IMPORTANT!!! "amend" has to be false after a merge conflict or else the commit will be orphaned
                 getRepository().commitChanges(mergeMessage, false);

@@ -927,6 +927,275 @@ public class GraficoModelLoaderTests {
         }
     }
 
+    /**
+     * Expanded two-branch merge scenario with recursive folder move, duplicate elements,
+     * and element renames across branches.
+     * 
+     * Initial state:
+     *   model/business/shared/
+     *     folder.xml (id-shared, name="Shared Services")
+     *     BusinessActor_id-e1.xml (name="Actor Original")
+     *     BusinessRole_id-e2.xml  (name="Role Original")
+     *     sub/
+     *       folder.xml (id-sub, name="Sub Folder")
+     *       BusinessProcess_id-e4.xml (name="Process Original")
+     * 
+     * Branch A (from initial):
+     *   - Renames E1: name="Actor Renamed by A" (same file, different content)
+     *   - Adds E3: BusinessProcess_id-e3.xml (name="New Process by A")
+     *   - Renames E4: name="Process Renamed by A" (same file, different content)
+     * 
+     * Branch B (from initial):
+     *   - Moves shared/ → model/technology/shared/ (keeping id-shared and id-sub)
+     *   - All elements (E1, E2, E4) move with it
+     * 
+     * After merge (A into B), post-conflict resolution:
+     *   model/technology/shared/          ← from B's move
+     *     folder.xml (id-shared)
+     *     BusinessActor_id-e1.xml         ← B's version (original name, from move)
+     *     BusinessRole_id-e2.xml          ← from move
+     *     sub/
+     *       folder.xml (id-sub)
+     *       BusinessProcess_id-e4.xml     ← B's version (original name, from move)
+     *   model/business/shared/            ← elements left from A's modifications
+     *     BusinessActor_id-e1.xml         ← A's version (renamed) — DUPLICATE of destination
+     *     BusinessProcess_id-e3.xml       ← genuinely new — NOT at destination
+     *     sub/
+     *       BusinessProcess_id-e4.xml     ← A's version (renamed) — DUPLICATE of destination
+     *     (NO folder.xml at either level)
+     * 
+     * Expected repair:
+     *   1. business/shared/: move detected (id-shared)
+     *      - E1 duplicate of technology/shared/ → REMOVED
+     *      - E3 unique → KEPT
+     *      - [MERGE FIX] folder created (has unique elements)
+     *   2. business/shared/sub/: move detected (id-sub)
+     *      - E4 duplicate of technology/shared/sub/ → REMOVED
+     *      - No unique elements remain → NO [MERGE FIX] folder, directory skipped
+     */
+    @Test
+    public void repairMissingFolderXml_TwoBranchMerge_MovedFolderWithDuplicatesAndRenames() throws IOException, GitAPIException {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "testRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File sharedDir = new File(bizDir, "shared");
+            File subDir = new File(sharedDir, "sub");
+            subDir.mkdirs();
+
+            // === Initial state ===
+            Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Model\" id=\"id-root\"/>\n");
+            Files.writeString(new File(bizDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Business\" id=\"id-biz\"/>\n");
+            Files.writeString(new File(sharedDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+            Files.writeString(new File(subDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Sub Folder\" id=\"id-sub\"/>\n");
+            Files.writeString(new File(sharedDir, "BusinessActor_id-e1.xml").toPath(),
+                    "<archimate:BusinessActor xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Actor Original\" id=\"id-e1\"/>\n");
+            Files.writeString(new File(sharedDir, "BusinessRole_id-e2.xml").toPath(),
+                    "<archimate:BusinessRole xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Role Original\" id=\"id-e2\"/>\n");
+            Files.writeString(new File(subDir, "BusinessProcess_id-e4.xml").toPath(),
+                    "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Process Original\" id=\"id-e4\"/>\n");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: shared folder with E1, E2, sub/E4").call();
+
+                // === Branch A: rename E1, add E3, rename E4 ===
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                Files.writeString(new File(sharedDir, "BusinessActor_id-e1.xml").toPath(),
+                        "<archimate:BusinessActor xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Actor Renamed by A\" id=\"id-e1\"/>\n");
+                Files.writeString(new File(sharedDir, "BusinessProcess_id-e3.xml").toPath(),
+                        "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"New Process by A\" id=\"id-e3\"/>\n");
+                Files.writeString(new File(subDir, "BusinessProcess_id-e4.xml").toPath(),
+                        "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Process Renamed by A\" id=\"id-e4\"/>\n");
+
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchA: rename E1, add E3, rename E4").call();
+
+                // === Branch B: move shared/ to technology/ ===
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+
+                File techDir = new File(modelDir, "technology");
+                File movedShared = new File(techDir, "shared");
+                File movedSub = new File(movedShared, "sub");
+                movedSub.mkdirs();
+
+                Files.writeString(new File(techDir, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Technology\" id=\"id-tech\"/>\n");
+                Files.writeString(new File(movedShared, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+                Files.writeString(new File(movedSub, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Sub Folder\" id=\"id-sub\"/>\n");
+                // All elements moved with their original content
+                Files.writeString(new File(movedShared, "BusinessActor_id-e1.xml").toPath(),
+                        "<archimate:BusinessActor xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Actor Original\" id=\"id-e1\"/>\n");
+                Files.writeString(new File(movedShared, "BusinessRole_id-e2.xml").toPath(),
+                        "<archimate:BusinessRole xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Role Original\" id=\"id-e2\"/>\n");
+                Files.writeString(new File(movedSub, "BusinessProcess_id-e4.xml").toPath(),
+                        "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Process Original\" id=\"id-e4\"/>\n");
+
+                // Remove old location
+                new File(subDir, "BusinessProcess_id-e4.xml").delete();
+                new File(subDir, "folder.xml").delete();
+                subDir.delete();
+                new File(sharedDir, "folder.xml").delete();
+                new File(sharedDir, "BusinessActor_id-e1.xml").delete();
+                new File(sharedDir, "BusinessRole_id-e2.xml").delete();
+                sharedDir.delete();
+
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: move shared+sub to technology").call();
+
+                // === Merge branchA into branchB ===
+                git.merge()
+                    .include(gitRepo.resolve("branchA"))
+                    .setMessage("merge branchA into branchB")
+                    .call();
+            }
+
+            // === Simulate post-merge state ===
+            // Git merge may or may not produce the exact state we need.
+            // Ensure the scenario is exactly as described: duplicate elements at old location,
+            // unique element E3 at old location, no folder.xml at old location.
+            sharedDir.mkdirs();
+            subDir.mkdirs();
+
+            // Destination (technology/) should already be correct from branchB
+            File techShared = new File(modelDir, "technology/shared");
+            File techSub = new File(techShared, "sub");
+
+            // Ensure destination has original-named elements (from B's move)
+            Files.writeString(new File(techShared, "BusinessActor_id-e1.xml").toPath(),
+                    "<archimate:BusinessActor xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Actor Original\" id=\"id-e1\"/>\n");
+            Files.writeString(new File(techShared, "BusinessRole_id-e2.xml").toPath(),
+                    "<archimate:BusinessRole xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Role Original\" id=\"id-e2\"/>\n");
+            assertTrue(new File(techShared, "folder.xml").exists(), "tech/shared/folder.xml should exist");
+            Files.writeString(new File(techSub, "BusinessProcess_id-e4.xml").toPath(),
+                    "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Process Original\" id=\"id-e4\"/>\n");
+            assertTrue(new File(techSub, "folder.xml").exists(), "tech/shared/sub/folder.xml should exist");
+
+            // Old location: A's renamed E1 (duplicate), A's new E3 (unique), A's renamed E4 (duplicate)
+            Files.writeString(new File(sharedDir, "BusinessActor_id-e1.xml").toPath(),
+                    "<archimate:BusinessActor xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Actor Renamed by A\" id=\"id-e1\"/>\n");
+            Files.writeString(new File(sharedDir, "BusinessProcess_id-e3.xml").toPath(),
+                    "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"New Process by A\" id=\"id-e3\"/>\n");
+            Files.writeString(new File(subDir, "BusinessProcess_id-e4.xml").toPath(),
+                    "<archimate:BusinessProcess xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Process Renamed by A\" id=\"id-e4\"/>\n");
+
+            // Ensure NO folder.xml at old locations
+            new File(sharedDir, "folder.xml").delete();
+            new File(subDir, "folder.xml").delete();
+
+            // Stage everything so git knows the current state
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("simulate post-merge state").call();
+            }
+
+            // === Validate pre-conditions ===
+            assertTrue(new File(sharedDir, "BusinessActor_id-e1.xml").exists(), "E1 at old location (duplicate)");
+            assertTrue(new File(sharedDir, "BusinessProcess_id-e3.xml").exists(), "E3 at old location (unique)");
+            assertTrue(new File(subDir, "BusinessProcess_id-e4.xml").exists(), "E4 at old sub location (duplicate)");
+            assertFalse(new File(sharedDir, "folder.xml").exists(), "No folder.xml at old shared/");
+            assertFalse(new File(subDir, "folder.xml").exists(), "No folder.xml at old sub/");
+            assertTrue(new File(techShared, "folder.xml").exists(), "folder.xml at destination shared/");
+            assertTrue(new File(techSub, "folder.xml").exists(), "folder.xml at destination sub/");
+
+            // === Run repair ===
+            IArchiRepository repo = new ArchiRepository(repoFolder);
+            GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+            int repaired = loader.repairMissingFolderXml();
+
+            // === Validate results ===
+
+            // 1. business/shared/: [MERGE FIX] folder created (has unique E3)
+            File oldFolderXml = new File(sharedDir, "folder.xml");
+            assertTrue(oldFolderXml.exists(),
+                    "folder.xml should be created at old location (has unique element E3)");
+            String repairedContent = Files.readString(oldFolderXml.toPath());
+            assertTrue(repairedContent.contains("[MERGE FIX]"),
+                    "Should have [MERGE FIX] prefix (move detected)");
+            assertFalse(repairedContent.contains("id-shared"),
+                    "Should NOT reuse id-shared (would create duplicate)");
+
+            // 2. E1 duplicate removed from old location
+            assertFalse(new File(sharedDir, "BusinessActor_id-e1.xml").exists(),
+                    "E1 should be REMOVED from old location (duplicate of destination)");
+
+            // 3. E3 unique element preserved at old location
+            assertTrue(new File(sharedDir, "BusinessProcess_id-e3.xml").exists(),
+                    "E3 must be preserved at old location (unique, not at destination)");
+
+            // 4. business/shared/sub/: NO [MERGE FIX] folder (all elements were duplicates)
+            File oldSubFolderXml = new File(subDir, "folder.xml");
+            assertFalse(oldSubFolderXml.exists(),
+                    "sub/folder.xml should NOT be created (all elements were duplicates, no unique remains)");
+
+            // 5. E4 duplicate removed from old sub/ location
+            assertFalse(new File(subDir, "BusinessProcess_id-e4.xml").exists(),
+                    "E4 should be REMOVED from old sub/ location (duplicate of destination)");
+
+            // 6. Destination (technology/) unchanged
+            assertTrue(Files.readString(new File(techShared, "folder.xml").toPath()).contains("id-shared"),
+                    "Destination folder.xml should still have id-shared");
+            assertTrue(new File(techShared, "BusinessActor_id-e1.xml").exists(),
+                    "E1 should still exist at destination");
+            assertTrue(new File(techShared, "BusinessRole_id-e2.xml").exists(),
+                    "E2 should still exist at destination");
+            assertTrue(new File(techSub, "BusinessProcess_id-e4.xml").exists(),
+                    "E4 should still exist at destination sub/");
+
+            // 7. Sub directory should be cleaned up (empty after removing E4)
+            // Or at minimum: no folder.xml and no elements ← sub directory itself may still exist
+            File[] subFiles = subDir.listFiles();
+            assertTrue(subFiles == null || subFiles.length == 0,
+                    "Old sub/ directory should be empty after deduplication");
+
+            // 8. Verify repair count: only business/shared/ gets a [MERGE FIX] folder
+            //    business/shared/sub/ is skipped (no unique elements)
+            assertEquals(1, repaired,
+                    "Only one folder should be repaired (shared/ with E3); sub/ should be skipped");
+
+            // 9. Verify repair details mention the deduplication
+            String details = loader.getRepairDetailsAsString();
+            assertNotNull(details, "Should have repair details");
+            assertTrue(details.contains("MERGE FIX"),
+                    "Details should mention [MERGE FIX] folder creation");
+            assertTrue(details.contains("Skipped") || details.contains("duplicate"),
+                    "Details should mention skipped/duplicate subfolder");
+        }
+    }
+
     @Test
     public void repairMissingFolderXml_ReturnsZero_WhenNoModelDirectory() throws IOException, GitAPIException {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "testRepo");

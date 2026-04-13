@@ -291,6 +291,12 @@ public class RefreshModelAction extends AbstractModelAction {
             if(restoredObjects != null) {
                 commitMessage += "\n\n" + Messages.RefreshModelAction_3 + "\n" + restoredObjects; //$NON-NLS-1$ //$NON-NLS-2$
             }
+            
+            // Did we repair any missing folder.xml files?
+            String repairDetails = loader.getRepairDetailsAsString();
+            if(repairDetails != null) {
+                commitMessage += "\n" + repairDetails; //$NON-NLS-1$
+            }
 
             // TODO - not sure if amend should be false or true here?
             getRepository().commitChanges(commitMessage, false);
