@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Set;
 
 import org.archicontribs.modelrepository.GitHelper;
+import org.archicontribs.modelrepository.grafico.FolderMoveInfo;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;
@@ -757,7 +758,13 @@ public class GraficoModelLoaderTests {
             GraficoModelLoader loader = new GraficoModelLoader(repo, true);
             int repaired = loader.repairMissingFolderXml();
 
-            assertEquals(1, repaired);
+            // Move detected — not immediately repaired
+            assertEquals(0, repaired, "Simple repairs should be 0 (only moves detected)");
+            assertTrue(loader.hasPendingFolderMoves(), "Should have detected folder move");
+            
+            // Apply with default choice (keep new location)
+            int moveRepairs = loader.applyFolderMoveResolutions();
+            assertTrue(moveRepairs > 0, "Should have applied move repairs");
 
             // Should have created a [MERGE FIX] folder (not restored the original id-shared)
             File repairedFolderXml = new File(subDir, "folder.xml");
@@ -902,9 +909,15 @@ public class GraficoModelLoaderTests {
             IArchiRepository repo = new ArchiRepository(repoFolder);
             GraficoModelLoader loader = new GraficoModelLoader(repo, true);
             int repaired = loader.repairMissingFolderXml();
+            
+            // Should have detected folder moves
+            assertTrue(loader.hasPendingFolderMoves(), "Should have detected folder move");
+            
+            // Apply with default choice (keep new location)
+            int moveRepairs = loader.applyFolderMoveResolutions();
 
             // === Validate repair results ===
-            assertTrue(repaired > 0, "Should have repaired at least one folder");
+            assertTrue(repaired + moveRepairs > 0, "Should have repaired at least one folder");
 
             // Old location: [MERGE FIX] folder.xml with NEW id (not id-shared)
             assertTrue(oldFolderXml.exists(), "folder.xml should be created at old location");
@@ -1135,6 +1148,14 @@ public class GraficoModelLoaderTests {
             IArchiRepository repo = new ArchiRepository(repoFolder);
             GraficoModelLoader loader = new GraficoModelLoader(repo, true);
             int repaired = loader.repairMissingFolderXml();
+            
+            // Moves detected — not immediately repaired
+            assertEquals(0, repaired, "Simple repairs should be 0 (only moves detected)");
+            assertTrue(loader.hasPendingFolderMoves(), "Should have detected folder moves");
+            assertEquals(2, loader.getFolderMoves().size(), "Should detect 2 moves (shared/ and sub/)");
+            
+            // Apply with default choice (keep new location)
+            int moveRepairs = loader.applyFolderMoveResolutions();
 
             // === Validate results ===
 
@@ -1181,9 +1202,9 @@ public class GraficoModelLoaderTests {
             assertTrue(subFiles == null || subFiles.length == 0,
                     "Old sub/ directory should be empty after deduplication");
 
-            // 8. Verify repair count: only business/shared/ gets a [MERGE FIX] folder
+            // 8. Verify move repair count: only business/shared/ gets a [MERGE FIX] folder
             //    business/shared/sub/ is skipped (no unique elements)
-            assertEquals(1, repaired,
+            assertEquals(1, moveRepairs,
                     "Only one folder should be repaired (shared/ with E3); sub/ should be skipped");
 
             // 9. Verify repair details mention the deduplication
@@ -1193,6 +1214,114 @@ public class GraficoModelLoaderTests {
                     "Details should mention [MERGE FIX] folder creation");
             assertTrue(details.contains("Skipped") || details.contains("duplicate"),
                     "Details should mention skipped/duplicate subfolder");
+        }
+    }
+
+    /**
+     * Test "keep old location" choice for folder move resolution.
+     * 
+     * Scenario: Same as TwoBranchMerge_FolderMoveAndAdd but user chooses to keep old location.
+     * 
+     * Expected:
+     * - Old location gets restored folder.xml with original id-shared
+     * - New location gets [MERGE FIX] folder.xml with new ID
+     * - Duplicate elements removed from old location
+     * - E3 (unique) preserved at old location
+     */
+    @Test
+    public void applyFolderMoveResolutions_KeepOldLocation() throws IOException, GitAPIException {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "testRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File sharedDir = new File(bizDir, "shared");
+            sharedDir.mkdirs();
+
+            Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Model\" id=\"id-root\"/>\n");
+            Files.writeString(new File(bizDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Business\" id=\"id-biz\"/>\n");
+            Files.writeString(new File(sharedDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+            Files.writeString(new File(sharedDir, "BusinessActor_id-e1.xml").toPath(), "<e1/>");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+            }
+
+            // Set up post-merge state: folder moved to technology/shared/
+            File techDir = new File(modelDir, "technology");
+            File movedShared = new File(techDir, "shared");
+            movedShared.mkdirs();
+            Files.writeString(new File(techDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Technology\" id=\"id-tech\"/>\n");
+            Files.writeString(new File(movedShared, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+            Files.writeString(new File(movedShared, "BusinessActor_id-e1.xml").toPath(), "<e1/>");
+
+            // Old location: E1 (duplicate) + E3 (unique), no folder.xml
+            new File(sharedDir, "folder.xml").delete();
+            Files.writeString(new File(sharedDir, "BusinessProcess_id-e3.xml").toPath(), "<e3/>");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("setup post-merge state").call();
+            }
+
+            // === Detect moves ===
+            IArchiRepository repo = new ArchiRepository(repoFolder);
+            GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+            loader.repairMissingFolderXml();
+
+            assertTrue(loader.hasPendingFolderMoves(), "Should detect folder move");
+            assertEquals(1, loader.getFolderMoves().size());
+
+            // === User chooses: keep OLD location ===
+            loader.getFolderMoves().get(0).setUserChoice(FolderMoveInfo.KEEP_OLD_LOCATION);
+
+            int repaired = loader.applyFolderMoveResolutions();
+            assertTrue(repaired > 0, "Should have repaired folders");
+
+            // === Validate ===
+
+            // Old location: restored folder.xml with ORIGINAL id-shared
+            File oldFolderXml = new File(sharedDir, "folder.xml");
+            assertTrue(oldFolderXml.exists(), "Old location should have restored folder.xml");
+            String oldContent = Files.readString(oldFolderXml.toPath());
+            assertTrue(oldContent.contains("id-shared"),
+                    "Old location should keep original id-shared");
+            assertFalse(oldContent.contains("[MERGE FIX]"),
+                    "Old location should NOT be [MERGE FIX]");
+
+            // E1 duplicate removed from old location (exists at new location)
+            assertFalse(new File(sharedDir, "BusinessActor_id-e1.xml").exists(),
+                    "E1 should be removed from old location (duplicate)");
+
+            // E3 unique preserved at old location
+            assertTrue(new File(sharedDir, "BusinessProcess_id-e3.xml").exists(),
+                    "E3 should be preserved at old location (unique)");
+
+            // New location: [MERGE FIX] folder.xml with NEW id (not id-shared)
+            File newFolderXml = new File(movedShared, "folder.xml");
+            assertTrue(newFolderXml.exists(), "New location should have folder.xml");
+            String newContent = Files.readString(newFolderXml.toPath());
+            assertTrue(newContent.contains("[MERGE FIX]"),
+                    "New location should be [MERGE FIX]");
+            assertFalse(newContent.contains("id-shared"),
+                    "New location should NOT have original id-shared");
+
+            // E1 remains at new location (not a duplicate of old anymore since old has it removed)
+            // Actually after removeDuplicateElements(destDir, oldDir):
+            // oldDir has E3 only, destDir has E1 — E1 doesn't exist at oldDir so it stays at destDir
+            assertTrue(new File(movedShared, "BusinessActor_id-e1.xml").exists(),
+                    "E1 should remain at new location (unique there after old's E1 was removed)");
         }
     }
 

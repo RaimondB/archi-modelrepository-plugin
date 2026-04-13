@@ -48,6 +48,26 @@ public class Messages extends NLS {
 
     public static String ConflictsDialog_28;
 
+    public static String ConflictsDialog_29;
+
+    public static String ConflictsDialog_30;
+
+    public static String ConflictsDialog_31;
+
+    public static String ConflictsDialog_32;
+
+    public static String ConflictsDialog_33;
+
+    public static String ConflictsDialog_34;
+
+    public static String ConflictsDialog_35;
+
+    public static String ConflictsDialog_36;
+
+    public static String ConflictsDialog_37;
+
+    public static String ConflictsDialog_38;
+
     public static String ConflictsDialog_4;
 
     public static String ConflictsDialog_5;
@@ -66,11 +86,40 @@ public class Messages extends NLS {
 
     public static String MergeConflictHandler_2;
 
+    public static String MergeConflictHandler_3;
+
     public static String MergeObjectInfo_0;
 
     public static String MergeObjectInfo_1;
 
     public static String MergeObjectInfo_2;
+
+    public static String MergeObjectInfo_3;
+
+    public static String FolderMoveResolutionDialog_0;
+
+    public static String FolderMoveResolutionDialog_1;
+
+    public static String FolderMoveResolutionDialog_2;
+
+    public static String FolderMoveResolutionDialog_3;
+
+    public static String FolderMoveResolutionDialog_4;
+
+    public static String FolderMoveResolutionDialog_5;
+
+    public static String FolderMoveResolutionDialog_6;
+
+    public static String FolderMoveResolutionDialog_7;
+
+    public static String FolderMoveResolutionDialog_8;
+
+    public static String FolderMoveResolutionDialog_9;
+
+    public static String FolderMoveResolutionDialog_10;
+
+    public static String FolderMoveResolutionDialog_11;
+
     static {
         // initialize resource bundle
         NLS.initializeMessages(BUNDLE_NAME, Messages.class);

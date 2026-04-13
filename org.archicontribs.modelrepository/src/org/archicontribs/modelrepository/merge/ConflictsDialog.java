@@ -97,10 +97,16 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
     
     private TableViewer fTableViewer;
     
+    // Folder Moves tab table
+    private TableViewer fMovesTableViewer;
+    
     private Button[] buttons = new Button[2];
     
     private TabFolder tabFolder;
     private TabItem itemView;
+    
+    // Top-level tab folder (Folder Moves | Element Conflicts)
+    private TabFolder fTopTabFolder;
     
     private List<TabComposite> fTabComposites = new ArrayList<TabComposite>();
     
@@ -132,21 +138,50 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
         container.setLayoutData(new GridData(GridData.FILL_BOTH));
         container.setLayout(new GridLayout());
         
-        SashForm sash = new SashForm(container, SWT.VERTICAL);
-        sash.setLayoutData(new GridData(GridData.FILL_BOTH));
+        boolean hasMoves = fHandler.hasMoveGroups();
         
-        createTableControl(sash);
-        createTabPane(sash);
+        if(hasMoves) {
+            // Two-phase layout: top-level tab folder with "Folder Moves" and "Element Conflicts" tabs
+            fTopTabFolder = new TabFolder(container, SWT.NONE);
+            fTopTabFolder.setLayoutData(new GridData(GridData.FILL_BOTH));
+            
+            // Tab 1: Folder Moves
+            createFolderMovesTab(fTopTabFolder);
+            
+            // Tab 2: Element Conflicts (contains existing table + detail pane)
+            TabItem conflictsTab = new TabItem(fTopTabFolder, SWT.NONE);
+            conflictsTab.setText(Messages.ConflictsDialog_31);
+            Composite conflictsContainer = new Composite(fTopTabFolder, SWT.NONE);
+            conflictsContainer.setLayout(new GridLayout());
+            conflictsTab.setControl(conflictsContainer);
+            
+            createConflictsContent(conflictsContainer);
+        } else {
+            // No folder moves — single-phase layout (backward compatible)
+            createConflictsContent(container);
+        }
         
-        sash.setWeights(new int[] { 25, 75 });
-        
-        // Select first object in table
+        // Select first object in conflicts table
         Object first = fTableViewer.getElementAt(0);
         if(first != null) {
             fTableViewer.setSelection(new StructuredSelection(first));
         }
         
         return area;
+    }
+    
+    /**
+     * Create the main conflicts content (table + detail pane).
+     * Used both in standalone mode and as a tab page.
+     */
+    private void createConflictsContent(Composite parent) {
+        SashForm sash = new SashForm(parent, SWT.VERTICAL);
+        sash.setLayoutData(new GridData(GridData.FILL_BOTH));
+        
+        createTableControl(sash);
+        createTabPane(sash);
+        
+        sash.setWeights(new int[] { 25, 75 });
     }
     
     /**
@@ -180,7 +215,9 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
                         int choice = (int)e.widget.getData();
 
                         for(Object o : fTableViewer.getStructuredSelection().toArray()) {
-                            ((MergeObjectInfo)o).setUserChoice(choice);
+                            MergeObjectInfo info = (MergeObjectInfo)o;
+                            info.setUserChoice(choice);
+                            autoResolveMoveGroup(info, choice);
                             fTableViewer.update(o, null);
                         }
                         
@@ -212,7 +249,7 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
     private class MainComposite extends TabComposite {
         private Composite fieldsComposite;
         private Label labelDocumentation;
-        private Text textName, textDocumentation;
+        private Text textName, textLocation, textDocumentation;
         
         private Text textSource, textTarget;
         private Text textViewpoint;
@@ -228,6 +265,10 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
             // Name
             createLabel(fieldsComposite, Messages.ConflictsDialog_6, null);
             textName = createSingleText(fieldsComposite, null);
+            
+            // Location (model hierarchy breadcrumb)
+            createLabel(fieldsComposite, Messages.ConflictsDialog_38, null);
+            textLocation = createSingleText(fieldsComposite, null);
             
             // Relationship Source
             createLabel(fieldsComposite, Messages.ConflictsDialog_7, IArchimateRelationship.class);
@@ -284,6 +325,9 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
             else {
                 textName.setText(""); //$NON-NLS-1$
             }
+            
+            // Location (breadcrumb from containment hierarchy)
+            textLocation.setText(mergeInfo.getLocation(choice));
 
             // Relationship controls
             if(eObject instanceof IArchimateRelationship) {
@@ -584,7 +628,7 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
     
     @Override
     protected Point getDefaultDialogSize() {
-        return new Point(700, 550);
+        return new Point(900, 650);
     }
     
     @Override
@@ -592,6 +636,185 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
         return true;
     }
 
+    // ===========================================================
+    // Folder Moves Tab
+    // ===========================================================
+    
+    /**
+     * Create the "Folder Moves" tab showing detected folder moves with 
+     * Keep New / Keep Old buttons. Resolving a move auto-resolves related
+     * element conflicts in the Conflicts tab.
+     */
+    private void createFolderMovesTab(TabFolder topTabFolder) {
+        TabItem movesTab = new TabItem(topTabFolder, SWT.NONE);
+        movesTab.setText(Messages.ConflictsDialog_30);
+        
+        Composite movesContainer = new Composite(topTabFolder, SWT.NONE);
+        movesContainer.setLayout(new GridLayout());
+        movesTab.setControl(movesContainer);
+        
+        SashForm movesSash = new SashForm(movesContainer, SWT.VERTICAL);
+        movesSash.setLayoutData(new GridData(GridData.FILL_BOTH));
+        
+        // Moves table
+        Composite movesTableComp = new Composite(movesSash, SWT.BORDER);
+        TableColumnLayout movesTableLayout = new TableColumnLayout();
+        movesTableComp.setLayout(movesTableLayout);
+        
+        fMovesTableViewer = new TableViewer(movesTableComp, SWT.FULL_SELECTION | SWT.SINGLE);
+        fMovesTableViewer.getTable().setHeaderVisible(true);
+        fMovesTableViewer.getTable().setLinesVisible(true);
+        
+        TableViewerColumn colFolder = new TableViewerColumn(fMovesTableViewer, SWT.NONE, 0);
+        colFolder.getColumn().setText(Messages.ConflictsDialog_32);
+        movesTableLayout.setColumnData(colFolder.getColumn(), new ColumnWeightData(25, true));
+        
+        TableViewerColumn colOld = new TableViewerColumn(fMovesTableViewer, SWT.NONE, 1);
+        colOld.getColumn().setText(Messages.ConflictsDialog_33);
+        movesTableLayout.setColumnData(colOld.getColumn(), new ColumnWeightData(30, true));
+        
+        TableViewerColumn colNew = new TableViewerColumn(fMovesTableViewer, SWT.NONE, 2);
+        colNew.getColumn().setText(Messages.ConflictsDialog_34);
+        movesTableLayout.setColumnData(colNew.getColumn(), new ColumnWeightData(30, true));
+        
+        TableViewerColumn colChoice = new TableViewerColumn(fMovesTableViewer, SWT.NONE, 3);
+        colChoice.getColumn().setText(Messages.ConflictsDialog_27);
+        movesTableLayout.setColumnData(colChoice.getColumn(), new ColumnWeightData(15, true));
+        
+        fMovesTableViewer.setContentProvider(new IStructuredContentProvider() {
+            @Override
+            public void inputChanged(Viewer viewer, Object oldInput, Object newInput) {}
+            @Override
+            public void dispose() {}
+            @Override
+            public Object[] getElements(Object inputElement) {
+                return fHandler.getMoveGroups().toArray();
+            }
+        });
+        
+        fMovesTableViewer.setLabelProvider(new LabelProvider() {
+            @Override
+            public String getText(Object element) {
+                return ""; //$NON-NLS-1$
+            }
+        });
+        
+        // Moves table label provider
+        fMovesTableViewer.setLabelProvider(new MovesTableLabelProvider());
+        
+        // Detail area below the moves table
+        Composite detailComp = new Composite(movesSash, SWT.NONE);
+        detailComp.setLayout(new GridLayout(2, true));
+        detailComp.setLayoutData(new GridData(GridData.FILL_BOTH));
+        
+        // Keep New / Keep Old buttons
+        Button keepNewButton = new Button(detailComp, SWT.PUSH);
+        keepNewButton.setText(Messages.ConflictsDialog_35);
+        keepNewButton.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, false));
+        
+        Button keepOldButton = new Button(detailComp, SWT.PUSH);
+        keepOldButton.setText(Messages.ConflictsDialog_36);
+        keepOldButton.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, false));
+        
+        keepNewButton.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                applyMoveChoice(MergeObjectInfo.THEIRS);
+            }
+        });
+        
+        keepOldButton.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                applyMoveChoice(MergeObjectInfo.OURS);
+            }
+        });
+        
+        movesSash.setWeights(new int[] { 60, 40 });
+        
+        fMovesTableViewer.setInput(""); //$NON-NLS-1$
+        
+        // Select first move
+        Object firstMove = fMovesTableViewer.getElementAt(0);
+        if(firstMove != null) {
+            fMovesTableViewer.setSelection(new StructuredSelection(firstMove));
+        }
+    }
+    
+    /**
+     * Apply a move choice (OURS = keep old location, THEIRS = keep new location)
+     * to the currently selected move group. Auto-resolves all related element conflicts.
+     */
+    private void applyMoveChoice(int choice) {
+        StructuredSelection sel = (StructuredSelection)fMovesTableViewer.getSelection();
+        if(sel.isEmpty()) return;
+        
+        MergeConflictHandler.MoveGroup group = (MergeConflictHandler.MoveGroup)sel.getFirstElement();
+        
+        // Set choice on all related merge infos
+        for(MergeObjectInfo info : group.relatedInfos) {
+            info.setUserChoice(choice);
+        }
+        
+        // Refresh both tables
+        fMovesTableViewer.refresh();
+        if(fTableViewer != null) {
+            fTableViewer.refresh();
+        }
+    }
+    
+    /**
+     * Label provider for the Folder Moves table.
+     */
+    private class MovesTableLabelProvider extends LabelProvider implements ITableLabelProvider {
+        @Override
+        public Image getColumnImage(Object element, int columnIndex) {
+            return null;
+        }
+        
+        @Override
+        public String getColumnText(Object element, int columnIndex) {
+            MergeConflictHandler.MoveGroup group = (MergeConflictHandler.MoveGroup)element;
+            switch(columnIndex) {
+                case 0: return group.folderName;
+                case 1: return group.oldLocationBreadcrumb;
+                case 2: return group.newLocationBreadcrumb;
+                case 3:
+                    // Show the current choice based on what the related items have
+                    if(!group.relatedInfos.isEmpty()) {
+                        int choice = group.relatedInfos.get(0).getUserChoice();
+                        return choice == MergeObjectInfo.THEIRS 
+                                ? Messages.ConflictsDialog_35 
+                                : Messages.ConflictsDialog_36;
+                    }
+                    return ""; //$NON-NLS-1$
+                default: return ""; //$NON-NLS-1$
+            }
+        }
+    }
+    
+    // ===========================================================
+    // Move Group Auto-Resolution
+    // ===========================================================
+    
+    /**
+     * When the user changes the choice on an item that is part of a move group,
+     * automatically apply the same choice to all sibling items in the same group.
+     */
+    private void autoResolveMoveGroup(MergeObjectInfo info, int choice) {
+        if(!info.isPartOfMove()) {
+            return;
+        }
+        
+        String groupId = info.getMoveGroupId();
+        for(MergeObjectInfo sibling : fHandler.getMergeObjectInfos()) {
+            if(sibling != info && groupId.equals(sibling.getMoveGroupId())) {
+                sibling.setUserChoice(choice);
+                fTableViewer.update(sibling, null);
+            }
+        }
+    }
+    
     // ===========================================================
     // Top Table Control
     // ===========================================================
@@ -609,8 +832,30 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
         fTableViewer.setComparator(new ViewerComparator(Collator.getInstance()) {
             @Override
             public int compare(Viewer viewer, Object object1, Object object2) {
-                EObject eObject1 = ((MergeObjectInfo)object1).getDefaultEObject();
-                EObject eObject2 = ((MergeObjectInfo)object2).getDefaultEObject();
+                MergeObjectInfo info1 = (MergeObjectInfo)object1;
+                MergeObjectInfo info2 = (MergeObjectInfo)object2;
+                
+                // Sort move groups together by groupId first, then by path
+                boolean move1 = info1.isPartOfMove();
+                boolean move2 = info2.isPartOfMove();
+                if(move1 != move2) {
+                    return move1 ? -1 : 1; // Move items first
+                }
+                if(move1 && move2) {
+                    int groupCmp = getComparator().compare(info1.getMoveGroupId(), info2.getMoveGroupId());
+                    if(groupCmp != 0) return groupCmp;
+                    // Within same group: folder.xml first, then by path
+                    if(info1.isFolderXml() != info2.isFolderXml()) {
+                        return info1.isFolderXml() ? -1 : 1;
+                    }
+                    return getComparator().compare(info1.getFolderPath(), info2.getFolderPath());
+                }
+                
+                EObject eObject1 = info1.getDefaultEObject();
+                EObject eObject2 = info2.getDefaultEObject();
+                if(eObject1 == null && eObject2 == null) return 0;
+                if(eObject1 == null) return 1;
+                if(eObject2 == null) return -1;
                 String s1 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject1.eClass());
                 String s2 = ArchiLabelProvider.INSTANCE.getDefaultName(eObject2.eClass());
                 return getComparator().compare(s1, s2);
@@ -620,17 +865,21 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
         // Columns
         TableViewerColumn column1 = new TableViewerColumn(fTableViewer, SWT.NONE, 0);
         column1.getColumn().setText(Messages.ConflictsDialog_24);
-        tableLayout.setColumnData(column1.getColumn(), new ColumnWeightData(30, true));
+        tableLayout.setColumnData(column1.getColumn(), new ColumnWeightData(20, true));
 
         TableViewerColumn column2 = new TableViewerColumn(fTableViewer, SWT.NONE, 1);
         column2.getColumn().setText(Messages.ConflictsDialog_25);
-        tableLayout.setColumnData(column2.getColumn(), new ColumnWeightData(40, true));
+        tableLayout.setColumnData(column2.getColumn(), new ColumnWeightData(30, true));
 
-        TableViewerColumn column3 = new TableViewerColumn(fTableViewer, SWT.NONE, 2);
+        TableViewerColumn columnLocation = new TableViewerColumn(fTableViewer, SWT.NONE, 2);
+        columnLocation.getColumn().setText(Messages.ConflictsDialog_29);
+        tableLayout.setColumnData(columnLocation.getColumn(), new ColumnWeightData(20, true));
+
+        TableViewerColumn column3 = new TableViewerColumn(fTableViewer, SWT.NONE, 3);
         column3.getColumn().setText(Messages.ConflictsDialog_26);
         tableLayout.setColumnData(column3.getColumn(), new ColumnWeightData(15, true));
 
-        TableViewerColumn column4 = new TableViewerColumn(fTableViewer, SWT.NONE, 3);
+        TableViewerColumn column4 = new TableViewerColumn(fTableViewer, SWT.NONE, 4);
         column4.getColumn().setText(Messages.ConflictsDialog_27);
         tableLayout.setColumnData(column4.getColumn(), new ColumnWeightData(15, true));
         column4.setEditingSupport(new ComboChoiceEditingSupport(fTableViewer));
@@ -684,6 +933,11 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
             MergeObjectInfo info = (MergeObjectInfo)element;
             EObject eObject = info.getDefaultEObject();
             
+            // Location column works regardless of eObject being null
+            if(columnIndex == 2) {
+                return info.getDisplayLocation();
+            }
+            
             if(eObject == null) {
                 return Messages.ConflictsDialog_28;
             }
@@ -695,10 +949,14 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
                 case 1:
                     return ArchiLabelProvider.INSTANCE.getLabel(eObject);
 
-                case 2:
-                    return info.getStatus();
-
                 case 3:
+                    String status = info.getStatus();
+                    if(info.isPartOfMove() && fHandler.hasMoveGroups()) {
+                        status += " " + Messages.ConflictsDialog_37; //$NON-NLS-1$
+                    }
+                    return status;
+
+                case 4:
                     return choices[info.getUserChoice()];
 
                 default:
@@ -744,6 +1002,10 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
             
             MergeObjectInfo info = (MergeObjectInfo)element;
             info.setUserChoice(index);
+            
+            // Auto-resolve all items in the same move group
+            autoResolveMoveGroup(info, index);
+            
             fTableViewer.update(element, null);
             updateButtons(info);
         }

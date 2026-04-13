@@ -343,6 +343,11 @@ public class MergeBranchAction extends AbstractModelAction {
             
             // Reload the model from the Grafico XML files
             GraficoModelLoader loader = new GraficoModelLoader(getRepository());
+            
+            // Pre-repair: detect and resolve folder moves before loading the model
+            loader.repairMissingFolderXml();
+            loader.applyFolderMoveResolutions();
+            
             loader.loadModel();
             
             // Do a commit if needed

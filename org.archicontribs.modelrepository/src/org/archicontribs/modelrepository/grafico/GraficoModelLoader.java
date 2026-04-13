@@ -70,6 +70,16 @@ public class GraficoModelLoader {
      */
     private List<String> fRepairDetails;
     
+    /**
+     * Folder moves detected during repairMissingFolderXml().
+     * These need interactive resolution (user chooses which location to keep).
+     * Populated by repairMissingFolderXml(), consumed by applyFolderMoveResolutions().
+     */
+    private List<FolderMoveInfo> fFolderMoves;
+    
+    /** Flag to skip repair in loadModel() when caller has already handled it */
+    private boolean fRepairAlreadyDone;
+    
     public GraficoModelLoader(IArchiRepository repository) {
         fRepository = repository;
         bHeadless = false;
@@ -109,12 +119,25 @@ public class GraficoModelLoader {
     public IArchimateModel loadModel(IProgressMonitor monitor) throws IOException {
         fRestoredObjects = null;
         
-        // Repair missing folder.xml files before import.
+        // Repair missing folder.xml files before import (unless already done by caller).
         // After git merges, directories may exist with element files but no folder.xml,
         // which causes the importer to throw IOException or silently drop elements.
-        int repairedFolders = repairMissingFolderXml();
-        if(repairedFolders > 0) {
-            log(IStatus.INFO, "[GraficoModelLoader] Restored " + repairedFolders + " missing folder.xml file(s) from git history"); //$NON-NLS-1$ //$NON-NLS-2$
+        if(!fRepairAlreadyDone) {
+            int repairedFolders = repairMissingFolderXml();
+            if(repairedFolders > 0) {
+                log(IStatus.INFO, "[GraficoModelLoader] Restored " + repairedFolders + " missing folder.xml file(s) from git history"); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+            
+            // Auto-apply folder move resolutions with default choices (keep new location).
+            // In interactive mode, the caller should call repairMissingFolderXml(),
+            // show the resolution dialog, call applyFolderMoveResolutions(),
+            // then call loadModel().
+            if(hasPendingFolderMoves()) {
+                int moveRepairs = applyFolderMoveResolutions();
+                if(moveRepairs > 0) {
+                    log(IStatus.INFO, "[GraficoModelLoader] Auto-resolved " + moveRepairs + " folder move(s) with default choices"); //$NON-NLS-1$ //$NON-NLS-2$
+                }
+            }
         }
         
         // Import Grafico Model
@@ -317,6 +340,185 @@ public class GraficoModelLoader {
         }
         
         return s;
+    }
+    
+    /**
+     * @return The list of detected folder moves that need user resolution, or null if none
+     */
+    public List<FolderMoveInfo> getFolderMoves() {
+        return fFolderMoves;
+    }
+    
+    /**
+     * @return true if there are pending folder moves that need user resolution
+     */
+    public boolean hasPendingFolderMoves() {
+        return fFolderMoves != null && !fFolderMoves.isEmpty();
+    }
+    
+    /**
+     * Apply the user's resolution choices for detected folder moves.
+     * Must be called after the user has set choices on each {@link FolderMoveInfo}
+     * via {@link FolderMoveInfo#setUserChoice(int)}.
+     * 
+     * <p>For each move:</p>
+     * <ul>
+     *   <li><b>Keep new location</b> (default): Remove duplicate elements from old location.
+     *       If unique elements remain, create a [MERGE FIX] folder at the old location.
+     *       Otherwise skip the old directory entirely.</li>
+     *   <li><b>Keep old location</b>: Restore the original folder.xml at the old location.
+     *       Create a [MERGE FIX] folder at the new location (so it gets a new ID).
+     *       Remove duplicate elements from the new location.</li>
+     * </ul>
+     * 
+     * @return The number of folders repaired
+     * @throws IOException if files cannot be written
+     */
+    public int applyFolderMoveResolutions() throws IOException {
+        if(fFolderMoves == null || fFolderMoves.isEmpty()) {
+            return 0;
+        }
+        
+        if(fRepairDetails == null) {
+            fRepairDetails = new ArrayList<>();
+        }
+        
+        int repaired = 0;
+        List<String> repairedDirPatterns = new ArrayList<>();
+        
+        for(FolderMoveInfo move : fFolderMoves) {
+            if(move.getUserChoice() == FolderMoveInfo.KEEP_NEW_LOCATION) {
+                repaired += applyKeepNewLocation(move, repairedDirPatterns);
+            } else {
+                repaired += applyKeepOldLocation(move, repairedDirPatterns);
+            }
+        }
+        
+        // Stage repaired directories
+        if(!repairedDirPatterns.isEmpty()) {
+            stageDirectories(repairedDirPatterns);
+        }
+        
+        // Mark repair as done so loadModel() skips it
+        fFolderMoves.clear();
+        fRepairAlreadyDone = true;
+        
+        return repaired;
+    }
+    
+    /**
+     * Apply "keep new location" resolution: duplicates removed from old dir,
+     * unique elements get a [MERGE FIX] folder, empty dirs are skipped.
+     */
+    private int applyKeepNewLocation(FolderMoveInfo move, List<String> repairedDirPatterns) throws IOException {
+        File oldDir = move.getOldDir();
+        File destDir = move.getNewDir();
+        String dirPattern = move.getOldRelativePath();
+        
+        // Remove duplicate elements from old location
+        removeDuplicateElements(oldDir, destDir);
+        
+        // Check if anything unique remains
+        File[] remainingXmls = oldDir.listFiles((d, name) ->
+                name.endsWith(".xml") && !IGraficoConstants.FOLDER_XML.equals(name)); //$NON-NLS-1$
+        int uniqueRemaining = remainingXmls != null ? remainingXmls.length : 0;
+        
+        if(uniqueRemaining == 0 && !hasSubdirectories(oldDir)) {
+            // All duplicates, no subfolders — skip entirely
+            fRepairDetails.add("Skipped empty moved folder (all elements are duplicates): " + dirPattern //$NON-NLS-1$
+                    + " (kept at " + move.getNewRelativePath() + ")"); //$NON-NLS-1$ //$NON-NLS-2$
+            log(IStatus.INFO, "[GraficoModelLoader] Skipped moved folder " + dirPattern //$NON-NLS-1$
+                    + " — all elements are duplicates of " + move.getNewRelativePath()); //$NON-NLS-1$
+            return 0;
+        }
+        
+        // Has unique elements — create [MERGE FIX] folder at old location
+        createMergeFixFolderXml(oldDir, move.getFolderName());
+        repairedDirPatterns.add(dirPattern);
+        fRepairDetails.add("Created [MERGE FIX] folder for unique elements: " + dirPattern //$NON-NLS-1$
+                + " (folder kept at " + move.getNewRelativePath() + ")"); //$NON-NLS-1$ //$NON-NLS-2$
+        log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] at " + dirPattern //$NON-NLS-1$
+                + " for " + uniqueRemaining + " unique element(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        return 1;
+    }
+    
+    /**
+     * Apply "keep old location" resolution: restore original folder.xml at old location,
+     * create [MERGE FIX] at new location, remove duplicates from new location.
+     */
+    private int applyKeepOldLocation(FolderMoveInfo move, List<String> repairedDirPatterns) throws IOException {
+        File oldDir = move.getOldDir();
+        File destDir = move.getNewDir();
+        String oldDirPattern = move.getOldRelativePath();
+        String newDirPattern = move.getNewRelativePath();
+        
+        // 1. Restore original folder.xml at old location (with original ID)
+        File oldFolderXml = new File(oldDir, IGraficoConstants.FOLDER_XML);
+        Files.write(oldFolderXml.toPath(), move.getHistoricalContent());
+        repairedDirPatterns.add(oldDirPattern);
+        
+        // 2. Remove duplicate elements from old location (they exist at new location too)
+        removeDuplicateElements(oldDir, destDir);
+        
+        // 3. Create [MERGE FIX] at new location (gets a new ID, since old location keeps original)
+        String newFolderName = extractNameFromFolderXml(
+                Files.readAllBytes(new File(destDir, IGraficoConstants.FOLDER_XML).toPath()));
+        createMergeFixFolderXml(destDir, newFolderName != null ? newFolderName : destDir.getName());
+        repairedDirPatterns.add(newDirPattern);
+        
+        // 4. Remove duplicate elements from new location (they exist at old location now)
+        removeDuplicateElements(destDir, oldDir);
+        
+        fRepairDetails.add("Restored folder at original location: " + oldDirPattern //$NON-NLS-1$
+                + " (moved " + newDirPattern + " to [MERGE FIX])"); //$NON-NLS-1$ //$NON-NLS-2$
+        log(IStatus.INFO, "[GraficoModelLoader] Kept folder at " + oldDirPattern //$NON-NLS-1$
+                + ", created [MERGE FIX] at " + newDirPattern); //$NON-NLS-1$
+        return 2; // Both locations were repaired
+    }
+    
+    /**
+     * Classify element XML files in sourceDir into duplicates and unique,
+     * based on whether they also exist at destDir (by filename).
+     */
+    private void classifyElements(File sourceDir, File destDir,
+                                  List<String> duplicates, List<String> unique) {
+        File[] sourceXmls = sourceDir.listFiles((d, name) ->
+                name.endsWith(".xml") && !IGraficoConstants.FOLDER_XML.equals(name)); //$NON-NLS-1$
+        if(sourceXmls == null) {
+            return;
+        }
+        
+        java.util.Set<String> destNames = new java.util.HashSet<>();
+        File[] destXmls = destDir.listFiles((d, name) ->
+                name.endsWith(".xml") && !IGraficoConstants.FOLDER_XML.equals(name)); //$NON-NLS-1$
+        if(destXmls != null) {
+            for(File f : destXmls) {
+                destNames.add(f.getName());
+            }
+        }
+        
+        for(File f : sourceXmls) {
+            if(destNames.contains(f.getName())) {
+                duplicates.add(f.getName());
+            } else {
+                unique.add(f.getName());
+            }
+        }
+    }
+    
+    /**
+     * Stage directories via git add so the DirCache-based importer can see them.
+     */
+    private void stageDirectories(List<String> dirPatterns) {
+        try(Git git = Git.open(fRepository.getLocalRepositoryFolder())) {
+            var addCommand = git.add();
+            for(String dirPattern : dirPatterns) {
+                addCommand.addFilepattern(dirPattern);
+            }
+            addCommand.call();
+        } catch(IOException | GitAPIException ex) {
+            log(IStatus.WARNING, "[GraficoModelLoader] Failed to stage repaired directories: " + ex.getMessage()); //$NON-NLS-1$
+        }
     }
     
     /**
@@ -524,24 +726,18 @@ public class GraficoModelLoader {
      *       the folder.xml. In this case, restoring from git history is safe.</li>
      *   <li><b>Folder move:</b> Git sees a folder move as delete + create. After merge,
      *       the old location may still have element files but no folder.xml. Restoring
-     *       the old folder.xml would undo the move (duplicate ID). Instead, we create
-     *       a new "[MERGE FIX]" folder with a fresh ID so the user can manually resolve.</li>
+     *       the old folder.xml would undo the move (duplicate ID). Instead, we detect the
+     *       move and let the user choose which location to keep.</li>
      * </ol>
      * 
-     * <p>For each missing folder.xml, we:</p>
-     * <ol>
-     *   <li>Try to restore it from git history at the same path</li>
-     *   <li>Check if the restored folder's ID already exists elsewhere in the model tree
-     *       (indicating a move, not a delete)</li>
-     *   <li>If duplicate detected: discard the restored file and create a "[MERGE FIX]"
-     *       folder with a new UUID</li>
-     *   <li>If not found in history: also create a "[MERGE FIX]" folder</li>
-     * </ol>
+     * <p>This method handles simple restores (no move) and unknown folders immediately.
+     * Folder moves are collected in {@link #fFolderMoves} for interactive resolution
+     * via {@link #getFolderMoves()} and {@link #applyFolderMoveResolutions()}.</p>
      * 
-     * @return The number of folder.xml files restored or created
+     * @return The number of folder.xml files restored or created (excluding pending moves)
      * @throws IOException if the model directory cannot be read
      */
-    int repairMissingFolderXml() throws IOException {
+    public int repairMissingFolderXml() throws IOException {
         File modelDir = new File(fRepository.getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
         if(!modelDir.isDirectory()) {
             return 0;
@@ -563,6 +759,7 @@ public class GraficoModelLoader {
         // Track repaired directory paths for git add and commit message details
         List<String> repairedDirPatterns = new ArrayList<>();
         fRepairDetails = new ArrayList<>();
+        fFolderMoves = new ArrayList<>();
         
         try(Repository repository = Git.open(fRepository.getLocalRepositoryFolder()).getRepository()) {
             for(File dir : dirsWithMissingFolderXml) {
@@ -584,28 +781,36 @@ public class GraficoModelLoader {
                     
                     if(historicalId != null && existingFolderIds.contains(historicalId)) {
                         // ID already exists elsewhere = this was a MOVE, not a delete.
-                        // Don't restore the old folder.xml (would create duplicate ID).
-                        // Find where the folder moved to and remove duplicate elements.
+                        // Collect move info for interactive resolution.
                         File destDir = findFolderDirById(modelDir, historicalId);
+                        String folderName = extractNameFromFolderXml(historicalContent);
                         
                         if(destDir != null) {
-                            int uniqueRemaining = removeDuplicateElements(dir, destDir);
+                            // Classify elements: which are duplicates, which are unique
+                            List<String> duplicates = new ArrayList<>();
+                            List<String> unique = new ArrayList<>();
+                            classifyElements(dir, destDir, duplicates, unique);
                             
-                            if(uniqueRemaining == 0 && !hasSubdirectories(dir)) {
-                                // No unique elements and no subfolders — skip this directory entirely.
-                                // The elements were all moved with the folder; nothing new from the other branch.
-                                fRepairDetails.add("Skipped empty moved folder (all elements are duplicates): " + dirPattern //$NON-NLS-1$
-                                        + " (moved to " + fRepository.getLocalRepositoryFolder().toPath() //$NON-NLS-1$
-                                        .relativize(destDir.toPath()).toString().replace('\\', '/') + ")"); //$NON-NLS-1$ //$NON-NLS-2$
-                                log(IStatus.INFO, "[GraficoModelLoader] Skipped moved folder " + relativePath //$NON-NLS-1$
-                                        + " — all elements are duplicates of destination."); //$NON-NLS-1$
-                                continue; // Don't create [MERGE FIX] folder, don't stage
-                            }
+                            String destRelPath = fRepository.getLocalRepositoryFolder().toPath()
+                                    .relativize(destDir.toPath())
+                                    .toString().replace('\\', '/');
+                            
+                            FolderMoveInfo moveInfo = new FolderMoveInfo(
+                                    folderName != null ? folderName : dir.getName(),
+                                    historicalId, dir, destDir,
+                                    dirPattern, destRelPath,
+                                    duplicates, unique, historicalContent);
+                            fFolderMoves.add(moveInfo);
+                            
+                            log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
+                                    + " (id " + historicalId + " exists at " + destRelPath //$NON-NLS-1$ //$NON-NLS-2$
+                                    + "). " + duplicates.size() + " duplicates, " + unique.size() + " unique."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                            // Don't repair yet — wait for user resolution
+                            continue;
                         }
                         
-                        // Still has unique elements — create a [MERGE FIX] folder for them
-                        String originalName = extractNameFromFolderXml(historicalContent);
-                        createMergeFixFolderXml(dir, originalName != null ? originalName : dir.getName());
+                        // destDir not found (shouldn't happen but be safe) — fall through to [MERGE FIX]
+                        createMergeFixFolderXml(dir, folderName != null ? folderName : dir.getName());
                         fRepairDetails.add("Created [MERGE FIX] folder for moved folder: " + dirPattern //$NON-NLS-1$
                                 + " (original id " + historicalId + " exists elsewhere)"); //$NON-NLS-1$ //$NON-NLS-2$
                         log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
@@ -639,17 +844,7 @@ public class GraficoModelLoader {
         // files that exist on disk but aren't in the git index (e.g. after a merge).
         // Without this, elements show up as both "added" and "removed" in review.
         if(!repairedDirPatterns.isEmpty()) {
-            try(Git git = Git.open(fRepository.getLocalRepositoryFolder())) {
-                var addCommand = git.add();
-                for(String dirPattern : repairedDirPatterns) {
-                    // Add the entire directory (folder.xml + all element XMLs)
-                    addCommand.addFilepattern(dirPattern);
-                }
-                addCommand.call();
-            } catch(GitAPIException ex) {
-                log(IStatus.WARNING, "[GraficoModelLoader] Failed to stage repaired directories: " + ex.getMessage()); //$NON-NLS-1$
-                // Non-fatal: the traditional (non-DirCache) importer would still work
-            }
+            stageDirectories(repairedDirPatterns);
         }
         
         return repaired;

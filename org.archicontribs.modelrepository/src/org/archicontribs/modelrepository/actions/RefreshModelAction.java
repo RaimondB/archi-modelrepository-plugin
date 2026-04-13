@@ -19,6 +19,7 @@ import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
+import org.archicontribs.modelrepository.merge.FolderMoveResolutionDialog;
 import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
@@ -264,6 +265,10 @@ public class RefreshModelAction extends AbstractModelAction {
             // We now have to check if model can be reloaded
             pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
             
+            // Pre-repair: detect and resolve folder moves before loading the model
+            loader.repairMissingFolderXml();
+            loader.applyFolderMoveResolutions();
+            
             // Reload the model from the Grafico XML files
             try {
             	loader.loadModel();
@@ -275,6 +280,24 @@ public class RefreshModelAction extends AbstractModelAction {
         } else { 
 		    // Reload the model from the Grafico XML files
 		    pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
+		    
+		    // Pre-repair: detect folder moves before loading the model
+		    loader.repairMissingFolderXml();
+		    
+		    // Show folder move resolution dialog if moves were detected
+		    if(loader.hasPendingFolderMoves()) {
+		        pmDialog.getShell().setVisible(false);
+		        
+		        FolderMoveResolutionDialog moveDialog = new FolderMoveResolutionDialog(
+		                fWindow.getShell(), loader.getFolderMoves());
+		        moveDialog.open();
+		        
+		        pmDialog.getShell().setVisible(true);
+		    }
+		    
+		    // Apply the user's choices (or defaults if no dialog was needed)
+		    loader.applyFolderMoveResolutions();
+		    
 			loader.loadModel();
         }
         
