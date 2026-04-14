@@ -21,6 +21,7 @@ import java.util.Set;
 
 import org.archicontribs.modelrepository.GitHelper;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;
 import org.junit.jupiter.api.AfterEach;
@@ -795,6 +796,9 @@ public class GraficoModelLoaderTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "testRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            // Get the default branch name dynamically (may be "master" or "main")
+            String defaultBranch = gitRepo.getBranch();
+
             File modelDir = new File(repoFolder, "model");
             File bizDir = new File(modelDir, "business");
             File sharedDir = new File(bizDir, "shared");
@@ -827,7 +831,7 @@ public class GraficoModelLoaderTests {
                 git.commit().setMessage("branchA: add E3 to shared").call();
 
                 // === Branch B: move shared/ to technology/, delete E2 ===
-                git.checkout().setName("master").call();
+                git.checkout().setName(defaultBranch).call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
@@ -847,48 +851,38 @@ public class GraficoModelLoaderTests {
                 Files.writeString(new File(movedShared, "BusinessActor_id-e1.xml").toPath(), "<e1/>");
                 // E2 intentionally NOT copied — deleted by branch B
 
-                // Remove old location
-                new File(sharedDir, "folder.xml").delete();
-                new File(sharedDir, "BusinessActor_id-e1.xml").delete();
-                new File(sharedDir, "BusinessRole_id-e2.xml").delete();
-                sharedDir.delete(); // empty now
-
+                // Stage new technology files
                 git.add().addFilepattern(".").call();
+
+                // Remove old location files via git rm (stages deletion AND removes from working tree).
+                // NOTE: JGit's git.add().addFilepattern(".") does NOT stage deletions!
+                // You must use git.rm() or git.add().setUpdate(true) to properly stage file removals.
+                git.rm().addFilepattern("model/business/shared/folder.xml").call();
+                git.rm().addFilepattern("model/business/shared/BusinessActor_id-e1.xml").call();
+                git.rm().addFilepattern("model/business/shared/BusinessRole_id-e2.xml").call();
+
                 git.commit().setMessage("branchB: move shared to technology, delete E2").call();
 
                 // === Merge branchA into branchB ===
-                git.merge()
+                MergeResult mergeResult = git.merge()
                     .include(gitRepo.resolve("branchA"))
                     .setMessage("merge branchA into branchB")
                     .call();
+
+                assertEquals(MergeResult.MergeStatus.MERGED, mergeResult.getMergeStatus(),
+                        "Merge should succeed without conflicts");
             }
 
-            // === Post-merge state (simulate what git produces) ===
-            // After merge, git recreates files from branchA:
-            // - model/business/shared/BusinessProcess_id-e3.xml (from A's add)
-            // but folder.xml at old location is gone (B deleted it, A didn't touch it).
-            // Git may or may not recreate the directory — we ensure the scenario:
-            if(!sharedDir.exists()) {
-                sharedDir.mkdirs();
-            }
-            // E3 should be there from the merge, but ensure for the test
+            // === Validate actual post-merge state (no manual fixup — real git result) ===
             File e3File = new File(sharedDir, "BusinessProcess_id-e3.xml");
-            if(!e3File.exists()) {
-                Files.writeString(e3File.toPath(), "<e3/>");
-            }
-            // No folder.xml at old location — this is the problem we fix
             File oldFolderXml = new File(sharedDir, "folder.xml");
-            if(oldFolderXml.exists()) {
-                oldFolderXml.delete(); // Ensure it's missing
-            }
+            File newFolderXml = new File(modelDir, "technology/shared/folder.xml");
 
-            // === Validate pre-conditions ===
-            // E3 exists at old location (from branch A)
+            // E3 exists at old location (added by branch A, auto-merged in)
             assertTrue(e3File.exists(), "E3 should exist at old location (from branch A)");
-            // No folder.xml at old location
+            // No folder.xml at old location (removed by branch B via git rm, not touched by branch A)
             assertFalse(oldFolderXml.exists(), "folder.xml should be missing at old location");
             // folder.xml exists at new location with id-shared
-            File newFolderXml = new File(modelDir, "technology/shared/folder.xml");
             assertTrue(newFolderXml.exists(), "folder.xml should exist at new location");
             assertTrue(Files.readString(newFolderXml.toPath()).contains("id-shared"));
             // E1 at new location (from move)
@@ -897,6 +891,9 @@ public class GraficoModelLoaderTests {
             // E2 gone (deleted by branch B)
             assertFalse(new File(modelDir, "technology/shared/BusinessRole_id-e2.xml").exists(),
                     "E2 should be deleted (by branch B)");
+            // E1 gone from old location (removed by branch B via git rm)
+            assertFalse(new File(sharedDir, "BusinessActor_id-e1.xml").exists(),
+                    "E1 should be gone from old location (moved by branch B)");
 
             // === Run repair ===
             IArchiRepository repo = new ArchiRepository(repoFolder);
