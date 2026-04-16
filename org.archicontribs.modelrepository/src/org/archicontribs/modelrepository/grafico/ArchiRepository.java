@@ -176,21 +176,27 @@ public class ArchiRepository implements IArchiRepository {
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             Status status = git.status().call();
             
-            // Nothing changed
-            if(status.isClean()) {
+            // Check if we're in a merge state (MERGE_HEAD exists)
+            boolean isMerging = new File(getLocalRepositoryFolder(), ".git/MERGE_HEAD").exists(); //$NON-NLS-1$
+            
+            // Nothing changed and not in a merge — no commit needed
+            if(status.isClean() && !isMerging) {
                 return null;
             }
             
             // Check lock file is deleted
             checkDeleteLockFile();
             
-            // Add modified files to index
-            // Try native Git first (much faster for large repos), falls back to JGit automatically
-            gitAdd();
-            
-            // Add missing files to index
-            for(String s : status.getMissing()) {
-                git.rm().addFilepattern(s).call();
+            // Stage changes (skip if clean — only here for merge commit)
+            if(!status.isClean()) {
+                // Add modified files to index
+                // Try native Git first (much faster for large repos), falls back to JGit automatically
+                gitAdd();
+                
+                // Add missing files to index
+                for(String s : status.getMissing()) {
+                    git.rm().addFilepattern(s).call();
+                }
             }
             
             // Commit

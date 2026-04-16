@@ -309,7 +309,7 @@ public class RefreshModelAction extends AbstractModelAction {
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] hasChangesToCommit=" + hasChanges + " (pull path)", null); //$NON-NLS-1$ //$NON-NLS-2$
         java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
-        if(hasChanges) {
+        if(hasChanges || mergeHead.exists()) {
             pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_9);
             
             String commitMessage = NLS.bind(Messages.RefreshModelAction_1, branchStatus.getCurrentLocalBranch().getShortName());

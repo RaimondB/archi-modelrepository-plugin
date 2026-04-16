@@ -368,7 +368,7 @@ public class MergeBranchAction extends AbstractModelAction {
             java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
             ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
             
-            if(hasChanges) {
+            if(hasChanges || mergeHead.exists()) {
                 mergeMessage = NLS.bind(Messages.MergeBranchAction_3, branchToMerge.getShortName(), currentBranch.getShortName());
                 
                 // Did we restore any missing objects?
