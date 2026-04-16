@@ -10,6 +10,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.security.GeneralSecurityException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
@@ -22,6 +23,7 @@ import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.archicontribs.modelrepository.merge.FolderMoveResolutionDialog;
 import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
@@ -255,6 +257,7 @@ public class RefreshModelAction extends AbstractModelAction {
 
             if(result) {
                 handler.merge();
+                ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] handler.merge() completed (pull)", null); //$NON-NLS-1$
             }
             // User cancelled - we assume they committed all changes so we can reset
             else {
@@ -302,7 +305,11 @@ public class RefreshModelAction extends AbstractModelAction {
         }
         
         // Do a commit if needed
-        if(getRepository().hasChangesToCommit()) {
+        boolean hasChanges = getRepository().hasChangesToCommit();
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] hasChangesToCommit=" + hasChanges + " (pull path)", null); //$NON-NLS-1$ //$NON-NLS-2$
+        java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
+        if(hasChanges) {
             pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_9);
             
             String commitMessage = NLS.bind(Messages.RefreshModelAction_1, branchStatus.getCurrentLocalBranch().getShortName());

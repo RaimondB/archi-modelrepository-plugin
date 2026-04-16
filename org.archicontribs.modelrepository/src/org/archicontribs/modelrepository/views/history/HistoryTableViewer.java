@@ -97,12 +97,22 @@ public class HistoryTableViewer extends TableViewer {
         // Get BranchStatus and currentLocalBranch
         try {
             BranchStatus branchStatus = archiRepo.getBranchStatus();
-            if(branchStatus != null) {
-                fSelectedBranch = branchStatus.getCurrentLocalBranch();
-            }
+            doSetInput(archiRepo, branchStatus);
+            return;
         }
         catch(IOException | GitAPIException ex) {
             ex.printStackTrace();
+        }
+        
+        doSetInput(archiRepo, (BranchStatus)null);
+    }
+    
+    /**
+     * Set input with a pre-computed BranchStatus to avoid redundant git operations.
+     */
+    public void doSetInput(IArchiRepository archiRepo, BranchStatus branchStatus) {
+        if(branchStatus != null) {
+            fSelectedBranch = branchStatus.getCurrentLocalBranch();
         }
         
         setInput(archiRepo);

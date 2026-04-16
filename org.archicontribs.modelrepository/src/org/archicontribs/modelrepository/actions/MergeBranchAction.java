@@ -10,6 +10,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.security.GeneralSecurityException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
@@ -19,6 +20,7 @@ import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
@@ -333,6 +335,7 @@ public class MergeBranchAction extends AbstractModelAction {
                 
                 if(result) {
                     handler.merge();
+                    ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] handler.merge() completed", null); //$NON-NLS-1$
                 }
                 // User cancelled - so we reset
                 else {
@@ -345,13 +348,27 @@ public class MergeBranchAction extends AbstractModelAction {
             GraficoModelLoader loader = new GraficoModelLoader(getRepository());
             
             // Pre-repair: detect and resolve folder moves before loading the model
+            long t = System.nanoTime();
             loader.repairMissingFolderXml();
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] repairMissingFolderXml: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
+            t = System.nanoTime();
             loader.applyFolderMoveResolutions();
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] applyFolderMoveResolutions: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
             
+            t = System.nanoTime();
             loader.loadModel();
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] loadModel: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
             
             // Do a commit if needed
-            if(getRepository().hasChangesToCommit()) {
+            t = System.nanoTime();
+            boolean hasChanges = getRepository().hasChangesToCommit();
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] hasChangesToCommit=" + hasChanges + " (" + (System.nanoTime() - t) / 1_000_000 + "ms)", null); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            
+            // Also check for MERGE_HEAD presence (indicates we're in a merge)
+            java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
+            
+            if(hasChanges) {
                 mergeMessage = NLS.bind(Messages.MergeBranchAction_3, branchToMerge.getShortName(), currentBranch.getShortName());
                 
                 // Did we restore any missing objects?

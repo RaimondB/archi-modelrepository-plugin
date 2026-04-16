@@ -743,7 +743,9 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
     
     /**
      * Apply a move choice (OURS = keep old location, THEIRS = keep new location)
-     * to the currently selected move group. Auto-resolves all related element conflicts.
+     * to the currently selected move group. Only sets the location choice on the
+     * group and its folder.xml infos. Element content choices remain independent
+     * so the user can pick which version of each element to keep.
      */
     private void applyMoveChoice(int choice) {
         StructuredSelection sel = (StructuredSelection)fMovesTableViewer.getSelection();
@@ -751,8 +753,11 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
         
         MergeConflictHandler.MoveGroup group = (MergeConflictHandler.MoveGroup)sel.getFirstElement();
         
-        // Set choice on all related merge infos
-        for(MergeObjectInfo info : group.relatedInfos) {
+        // Set the location choice on the group
+        group.locationChoice = choice;
+        
+        // Set choice on folder.xml infos only (these represent the location, not content)
+        for(MergeObjectInfo info : group.folderInfos) {
             info.setUserChoice(choice);
         }
         
@@ -780,14 +785,9 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
                 case 1: return group.oldLocationBreadcrumb;
                 case 2: return group.newLocationBreadcrumb;
                 case 3:
-                    // Show the current choice based on what the related items have
-                    if(!group.relatedInfos.isEmpty()) {
-                        int choice = group.relatedInfos.get(0).getUserChoice();
-                        return choice == MergeObjectInfo.THEIRS 
-                                ? Messages.ConflictsDialog_35 
-                                : Messages.ConflictsDialog_36;
-                    }
-                    return ""; //$NON-NLS-1$
+                    return group.locationChoice == MergeObjectInfo.THEIRS 
+                            ? Messages.ConflictsDialog_35 
+                            : Messages.ConflictsDialog_36;
                 default: return ""; //$NON-NLS-1$
             }
         }
@@ -799,20 +799,12 @@ class ConflictsDialog extends ExtendedTitleAreaDialog {
     
     /**
      * When the user changes the choice on an item that is part of a move group,
-     * automatically apply the same choice to all sibling items in the same group.
+     * do NOT auto-propagate to siblings. Each element in a move group has an
+     * independent content choice (ours vs theirs version). The folder location
+     * is controlled separately via the Folder Moves tab.
      */
     private void autoResolveMoveGroup(MergeObjectInfo info, int choice) {
-        if(!info.isPartOfMove()) {
-            return;
-        }
-        
-        String groupId = info.getMoveGroupId();
-        for(MergeObjectInfo sibling : fHandler.getMergeObjectInfos()) {
-            if(sibling != info && groupId.equals(sibling.getMoveGroupId())) {
-                sibling.setUserChoice(choice);
-                fTableViewer.update(sibling, null);
-            }
-        }
+        // Do nothing for move-group items — element choices are independent
     }
     
     // ===========================================================

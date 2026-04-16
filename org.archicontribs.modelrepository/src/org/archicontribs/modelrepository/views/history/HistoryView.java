@@ -12,6 +12,7 @@ import org.archicontribs.modelrepository.actions.RestoreCommitAction;
 import org.archicontribs.modelrepository.actions.UndoLastCommitAction;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
+import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
@@ -35,6 +36,7 @@ import org.eclipse.swt.custom.SashForm;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.Menu;
 import org.eclipse.ui.IActionBars;
@@ -338,17 +340,30 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
             // Set label text
             fRepoLabel.setText(Messages.HistoryView_0 + " " + selectedRepository.getName()); //$NON-NLS-1$
             
-            // Set History first
-            getHistoryViewer().doSetInput(selectedRepository);
-            
-            // Set Branches
-            getBranchesViewer().doSetInput(selectedRepository);
-            
-            // Update actions
-            fActionExtractCommit.setRepository(selectedRepository);
-            fActionRestoreCommit.setRepository(selectedRepository);
-            fActionUndoLastCommit.setRepository(selectedRepository);
-            fActionResetToRemoteCommit.setRepository(selectedRepository);
+            // Load git data on background thread to keep UI responsive
+            final IArchiRepository repo = selectedRepository;
+            new Thread(() -> {
+                try {
+                    BranchStatus branchStatus = repo.getBranchStatus();
+                    Display display = fRepoLabel.getDisplay();
+                    if(!display.isDisposed()) {
+                        display.asyncExec(() -> {
+                            if(!fRepoLabel.isDisposed() && repo.equals(fSelectedRepository)) {
+                                getHistoryViewer().doSetInput(repo, branchStatus);
+                                getBranchesViewer().doSetInput(branchStatus);
+                                
+                                fActionExtractCommit.setRepository(repo);
+                                fActionRestoreCommit.setRepository(repo);
+                                fActionUndoLastCommit.setRepository(repo);
+                                fActionResetToRemoteCommit.setRepository(repo);
+                            }
+                        });
+                    }
+                }
+                catch(Exception ex) {
+                    ex.printStackTrace();
+                }
+            }, "HistoryView-LoadBranches").start(); //$NON-NLS-1$
         }
     }
     
@@ -359,7 +374,23 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                 case IRepositoryListener.HISTORY_CHANGED:
                     fRepoLabel.setText(Messages.HistoryView_0 + " " + repository.getName()); //$NON-NLS-1$
                     fCommentViewer.setCommit(null);
-                    getHistoryViewer().setInput(repository);
+                    // Load commit history on background thread
+                    new Thread(() -> {
+                        try {
+                            BranchStatus branchStatus = repository.getBranchStatus();
+                            Display display = fRepoLabel.getDisplay();
+                            if(!display.isDisposed()) {
+                                display.asyncExec(() -> {
+                                    if(!fRepoLabel.isDisposed() && repository.equals(fSelectedRepository)) {
+                                        getHistoryViewer().doSetInput(repository, branchStatus);
+                                    }
+                                });
+                            }
+                        }
+                        catch(Exception ex) {
+                            ex.printStackTrace();
+                        }
+                    }, "HistoryView-RefreshHistory").start(); //$NON-NLS-1$
                     break;
                     
                 case IRepositoryListener.REPOSITORY_DELETED:
@@ -373,7 +404,23 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                     break;
 
                 case IRepositoryListener.BRANCHES_CHANGED:
-                    getBranchesViewer().doSetInput(fSelectedRepository);
+                    // Load branch data on background thread
+                    new Thread(() -> {
+                        try {
+                            BranchStatus branchStatus = repository.getBranchStatus();
+                            Display display = fRepoLabel.getDisplay();
+                            if(!display.isDisposed()) {
+                                display.asyncExec(() -> {
+                                    if(!fRepoLabel.isDisposed() && repository.equals(fSelectedRepository)) {
+                                        getBranchesViewer().doSetInput(branchStatus);
+                                    }
+                                });
+                            }
+                        }
+                        catch(Exception ex) {
+                            ex.printStackTrace();
+                        }
+                    }, "HistoryView-RefreshBranches").start(); //$NON-NLS-1$
                     break;
                     
                 default:

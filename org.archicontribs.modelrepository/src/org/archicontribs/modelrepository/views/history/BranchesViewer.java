@@ -87,6 +87,13 @@ public class BranchesViewer extends ComboViewer {
             ex.printStackTrace();
         }
         
+        doSetInput(branchStatus);
+    }
+    
+    /**
+     * Set input with a pre-computed BranchStatus to avoid redundant git operations.
+     */
+    void doSetInput(BranchStatus branchStatus) {
         setInput(branchStatus);
         
         // Set selection to current branch

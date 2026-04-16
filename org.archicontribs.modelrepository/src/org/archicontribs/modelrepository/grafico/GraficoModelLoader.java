@@ -293,13 +293,20 @@ public class GraficoModelLoader {
                 IEditorModelManager.INSTANCE.openModel(graficoModel);
                 reopenEditors(graficoModel, openModelIDs);
             } finally {
-                // Restore shell state if it changed during close/open
-                if(wasMaximized && !shell.getMaximized()) {
-                    shell.setMaximized(true);
-                } else if(!wasMaximized) {
-                    shell.setBounds(savedBounds);
-                }
                 shell.setRedraw(true);
+                
+                // Defer shell state restoration to after the current event loop completes.
+                // Setting maximized/bounds while layout is still recalculating causes a
+                // visible minimize/maximize flash on Windows.
+                shell.getDisplay().asyncExec(() -> {
+                    if(!shell.isDisposed()) {
+                        if(wasMaximized && !shell.getMaximized()) {
+                            shell.setMaximized(true);
+                        } else if(!wasMaximized) {
+                            shell.setBounds(savedBounds);
+                        }
+                    }
+                });
             }
         }
     }

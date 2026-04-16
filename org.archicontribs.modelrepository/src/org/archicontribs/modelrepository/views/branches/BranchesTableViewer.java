@@ -102,6 +102,25 @@ public class BranchesTableViewer extends TableViewer {
         //}
     }
     
+    /**
+     * Set input with a pre-computed BranchStatus to avoid redundant git operations.
+     * The content provider will use the BranchStatus directly instead of calling getBranchStatus().
+     */
+    public void doSetInput(IArchiRepository archiRepo, BranchStatus branchStatus) {
+        fPrecomputedBranchStatus = branchStatus;
+        setInput(archiRepo);
+        fPrecomputedBranchStatus = null;
+        
+        // Do the Layout kludge
+        getTable().getParent().layout();
+    }
+    
+    /**
+     * Pre-computed BranchStatus passed via doSetInput(repo, status).
+     * Used by BranchesContentProvider to avoid redundant getBranchStatus() calls.
+     */
+    private BranchStatus fPrecomputedBranchStatus;
+    
     // ===============================================================================================
 	// ===================================== Table Model ==============================================
 	// ===============================================================================================
@@ -129,7 +148,9 @@ public class BranchesTableViewer extends TableViewer {
                 }
                 
                 try {
-                    BranchStatus status = repo.getBranchStatus();
+                    BranchStatus status = fPrecomputedBranchStatus != null 
+                            ? fPrecomputedBranchStatus 
+                            : repo.getBranchStatus();
                     return status.getLocalAndUntrackedRemoteBranches().toArray();
                 }
                 catch(IOException | GitAPIException ex) {

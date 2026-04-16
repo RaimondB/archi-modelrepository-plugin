@@ -8,7 +8,9 @@ package org.archicontribs.modelrepository.merge;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.grafico.GraficoResourceLoader;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.ecore.EObject;
 
 import com.archimatetool.model.IArchimateModel;
@@ -77,8 +79,15 @@ class MergeObjectInfo {
         int lastSlash = xmlPath.lastIndexOf('/');
         this.folderPath = lastSlash > 0 ? xmlPath.substring(0, lastSlash) : ""; //$NON-NLS-1$
         
+        long t = System.nanoTime();
         objects[OURS] = loadEObject(handler.getLocalRef());
+        long oursTime = System.nanoTime() - t;
+        t = System.nanoTime();
         objects[THEIRS] = loadEObject(handler.getTheirRef());
+        long theirsTime = System.nanoTime() - t;
+        log(IStatus.INFO, "[MergeObjectInfo] loadEObject('" + xmlPath + "'): ours=" + oursTime / 1_000_000 //$NON-NLS-1$ //$NON-NLS-2$
+                + "ms(" + (objects[OURS] != null ? "found" : "null") + "), theirs=" + theirsTime / 1_000_000 //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                + "ms(" + (objects[THEIRS] != null ? "found" : "null") + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
     }
     
     String getXMLPath() {
@@ -141,6 +150,13 @@ class MergeObjectInfo {
      */
     boolean isPartOfMove() {
         return moveGroupId != null;
+    }
+    
+    /**
+     * @return true if resolveMovedObject() found the element in the other model
+     */
+    boolean isResolvedAsMove() {
+        return resolvedAsMove;
     }
     
     /**
@@ -253,5 +269,15 @@ class MergeObjectInfo {
         }
 
         return ArchimateModelUtils.getObjectByID(model, id);
+    }
+    
+    /**
+     * Log a message via the plugin logger, tolerating null plugin instance (e.g. in tests)
+     */
+    private static void log(int severity, String message) {
+        ModelRepositoryPlugin plugin = ModelRepositoryPlugin.getInstance();
+        if(plugin != null) {
+            plugin.log(severity, message, null);
+        }
     }
 }

@@ -107,16 +107,14 @@ public class GraficoModelImporter {
     private Map<String, IIdentifier> fIDLookup;
     
     /**
-     * ThreadLocal batch buffer for producers to reduce queue contention.
-     * Each virtual thread accumulates up to PRODUCER_BATCH_SIZE items before
-     * flushing to the queue. This reduces queue.put() operations from 26,679
-     * to ~1,300 (20x reduction), dramatically reducing lock contention.
-     * 
-     * CRITICAL: Must flush remaining items when thread completes or on last file.
+     * Batch size for virtual thread producers.
+     * Each virtual thread processes PRODUCER_BATCH_SIZE files sequentially,
+     * then flushes all results to the queue in one operation.
+     * With 26,666 files ÷ 100 = ~267 virtual threads (vs 26,666 before).
+     * Reduces: thread creation, JGit pack lock contention, queue lock contention,
+     * AtomicInteger CAS operations, and ThreadLocal overhead.
      */
-    private static final int PRODUCER_BATCH_SIZE = 20;
-    private static final ThreadLocal<List<ElementWithFolder>> PRODUCER_BATCH_BUFFER = 
-        ThreadLocal.withInitial(() -> new ArrayList<>(PRODUCER_BATCH_SIZE));
+    private static final int PRODUCER_BATCH_SIZE = 100;
     
     /**
      * Unresolved missing objects
@@ -850,10 +848,11 @@ public class GraficoModelImporter {
             
             consumerThread.start();
             
-            // Fire producers using virtual threads
-            for (CommitTreeEntry entry : elementFiles) {
+            // Fire producers using virtual threads — batched to reduce contention
+            for (int i = 0; i < elementFiles.size(); i += PRODUCER_BATCH_SIZE) {
+                final List<CommitTreeEntry> batch = elementFiles.subList(i, Math.min(i + PRODUCER_BATCH_SIZE, elementFiles.size()));
                 fIoExecutor.execute(() -> {
-                    readParseAndQueueFromCommit(entry, elementQueue, remainingElements, producerError, totalModelFiles);
+                    readParseAndQueueFromCommitBatch(batch, elementQueue, remainingElements, producerError, totalModelFiles);
                 });
             }
             
@@ -924,57 +923,41 @@ public class GraficoModelImporter {
     }
     
     /**
-     * Read, parse and queue element from git commit.
+     * Process a batch of commit tree entries: read from git, parse XML, queue results.
      */
-    private void readParseAndQueueFromCommit(CommitTreeEntry entry, BlockingQueue<ElementWithFolder> queue,
+    private void readParseAndQueueFromCommitBatch(List<CommitTreeEntry> batch, BlockingQueue<ElementWithFolder> queue,
             AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
+        List<ElementWithFolder> localResults = new ArrayList<>(batch.size());
+        int processedInBatch = 0;
+        
         try {
-            ObjectLoader loader = fGitRepository.open(entry.objectId());
-            byte[] bytes = loader.getCachedBytes();
-            
-            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                fIDLookup.put(eObject.getId(), eObject);
-                
-                if (fProgressReporter != null) {
-                    fProgressReporter.incrementProduced();
+            for (CommitTreeEntry entry : batch) {
+                try {
+                    ObjectLoader loader = fGitRepository.open(entry.objectId());
+                    byte[] bytes = loader.getCachedBytes();
+                    
+                    try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                        IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
+                        fIDLookup.put(eObject.getId(), eObject);
+                        
+                        if (fProgressReporter != null) {
+                            fProgressReporter.incrementProduced();
+                        }
+                        
+                        localResults.add(new ElementWithFolder(entry.folderPath(), eObject));
+                        processedInBatch++;
+                    }
+                } catch (IOException e) {
+                    errorFlag.set(true);
+                    localResults.add(new ElementWithFolder(entry.folderPath(), null));
+                    processedInBatch++;
                 }
-                
-                // Use thread-local batching like the DirCache version
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                localBatch.add(new ElementWithFolder(entry.folderPath(), eObject));
-                
-                int remainingCount = remaining.get();
-                if (localBatch.size() >= PRODUCER_BATCH_SIZE || remainingCount <= PRODUCER_BATCH_SIZE) {
-                    queue.addAll(localBatch);
-                    localBatch.clear();
-                }
-            }
-        } catch (IOException e) {
-            errorFlag.set(true);
-            try {
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                if (!localBatch.isEmpty()) {
-                    queue.addAll(localBatch);
-                    localBatch.clear();
-                }
-                queue.put(new ElementWithFolder(entry.folderPath(), null));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
             }
         } finally {
-            remaining.decrementAndGet();
-            
-            try {
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                if (!localBatch.isEmpty()) {
-                    queue.addAll(localBatch);
-                    localBatch.clear();
-                }
-            } catch (Exception e) {
-                // Ignore
+            if (!localResults.isEmpty()) {
+                queue.addAll(localResults);
             }
-            PRODUCER_BATCH_BUFFER.remove();
+            remaining.addAndGet(-processedInBatch);
         }
     }
     
@@ -1741,9 +1724,19 @@ public class GraficoModelImporter {
         String modelPrefix = IGraficoConstants.MODEL_FOLDER + "/"; //$NON-NLS-1$
         String imagesPrefix = IGraficoConstants.IMAGES_FOLDER + "/"; //$NON-NLS-1$
         
+        int conflictStageEntries = 0;
+        
         for (int i = 0; i < fDirCache.getEntryCount(); i++) {
             DirCacheEntry entry = fDirCache.getEntry(i);
             String path = entry.getPathString();
+            
+            // Skip conflict stage entries (stages 1,2,3 = base, ours, theirs).
+            // During an unresolved merge, conflicting files appear multiple times
+            // with different stages. We only want stage 0 (merged/resolved) entries.
+            if (entry.getStage() != 0) {
+                conflictStageEntries++;
+                continue;
+            }
             
             boolean isModelFile = path.startsWith(modelPrefix);
             boolean isImageFile = path.startsWith(imagesPrefix);
@@ -1764,6 +1757,12 @@ public class GraficoModelImporter {
             ObjectId objectId = entry.getObjectId();
             
             entries.add(new DirCacheFileEntry(path, absolutePath, folderPath, isFolderXml, isModelFile, isImageFile, objectId));
+        }
+        
+        if (conflictStageEntries > 0) {
+            ModelRepositoryPlugin.getInstance().log(IStatus.WARNING,
+                    "[GraficoModelImporter] DirCache: skipped " + conflictStageEntries  //$NON-NLS-1$
+                    + " conflict-stage entries (stages 1,2,3). Total entries collected: " + entries.size(), null); //$NON-NLS-1$
         }
         
         return entries;
@@ -1983,10 +1982,10 @@ public class GraficoModelImporter {
         phaseStart = System.nanoTime();
         if (!elementFiles.isEmpty()) {
             // UNBOUNDED LinkedBlockingQueue - no capacity limit
-            // With ThreadLocal batching, producers accumulate 20 items before adding to queue.
-            // This reduces queue operations from 26,679 to ~1,334.
-            // Making queue unbounded eliminates the last contention point: producers waiting for space.
-            // Memory impact: 26,679 items × ~2KB = ~50MB peak (acceptable for faster throughput)
+            // With batched virtual threads (PRODUCER_BATCH_SIZE files per thread),
+            // each thread accumulates results locally then flushes in one addAll() call.
+            // This reduces queue operations from 26,666 to ~267.
+            // Memory impact: 26,666 items × ~2KB = ~50MB peak (acceptable for faster throughput)
             BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
@@ -2007,7 +2006,7 @@ public class GraficoModelImporter {
             final AtomicInteger activeBatches = PERF_LOGGING ? new AtomicInteger(0) : null;
             final AtomicInteger peakActiveBatches = PERF_LOGGING ? new AtomicInteger(0) : null;
             
-            logPerfMessage("  Phase2 config: Virtual Threads (one per file), queue=UNBOUNDED"); //$NON-NLS-1$
+            logPerfMessage("  Phase2 config: Virtual Threads (batched, " + PRODUCER_BATCH_SIZE + " files/thread), queue=UNBOUNDED"); //$NON-NLS-1$ //$NON-NLS-2$
             
             // CRITICAL: Start consumer thread FIRST, then fire producers
             // Consumer must run concurrently with producers to drain queue as items arrive
@@ -2143,22 +2142,33 @@ public class GraficoModelImporter {
             // NOW fire producers - consumer is already running and ready to drain
             long producerStart = System.nanoTime();
             
-            // Fire ALL file reads using virtual threads
-            // Each virtual thread: read file (I/O) → parse → queue
-            for (DirCacheFileEntry entry : elementFiles) {
+            // Batch files into groups of PRODUCER_BATCH_SIZE and fire one virtual thread per batch.
+            // Each virtual thread processes all files in its batch sequentially, then flushes
+            // results to the queue in one addAll() call. This reduces:
+            // - Virtual threads: 26,666 → ~267 (100x reduction)
+            // - JGit pack lock contention: 267 concurrent threads vs 26,666
+            // - Queue lock operations: ~267 addAll() vs 26,666 individual puts
+            // - AtomicInteger CAS: ~267 decrements vs 26,666
+            int batchCount = 0;
+            for (int i = 0; i < elementFiles.size(); i += PRODUCER_BATCH_SIZE) {
+                final List<DirCacheFileEntry> batch = elementFiles.subList(i, Math.min(i + PRODUCER_BATCH_SIZE, elementFiles.size()));
+                batchCount++;
                 fIoExecutor.execute(() -> {
                     if (PERF_LOGGING && activeBatches != null && peakActiveBatches != null) {
                         activeBatches.incrementAndGet();
                         peakActiveBatches.updateAndGet(peak -> Math.max(peak, activeBatches.get()));
                     }
                     try {
-                        readParseAndQueueStreaming(entry, elementQueue, remainingElements, producerError, totalModelFiles);
+                        readParseAndQueueBatch(batch, elementQueue, remainingElements, producerError, totalModelFiles);
                     } finally {
                         if (PERF_LOGGING && activeBatches != null) {
                             activeBatches.decrementAndGet();
                         }
                     }
                 });
+            }
+            if (PERF_LOGGING) {
+                logPerfMessage("  Phase2 fired " + batchCount + " batch producers for " + elementFiles.size() + " files"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             }
             
             // Calculate how long it took to fire all producer tasks
@@ -2248,286 +2258,69 @@ public class GraficoModelImporter {
     private record RawFileData(DirCacheFileEntry entry, byte[] bytes) {}
     
     /**
-     * Read, parse, and queue an element using STREAMING I/O.
-     * Parses XML directly from FileInputStream - no intermediate byte buffer.
-     * This allows overlapped I/O and parsing within each file.
-     * 
-     * Combined with semaphore control (max 1000 concurrent), this provides:
-     * - Bounded parallelism (no queue contention from 26,680 threads)
-     * - Streaming parsing (I/O and XML parsing overlap)
-     * - Backpressure via bounded queue
-     * 
-     * @param entry The DirCache file entry
-     * @param queue The queue to put parsed elements into
-     * @param remaining Counter for remaining elements (decremented on completion)
-     * @param errorFlag Set to true if any producer encounters an error
-     * @param totalModelFiles Total files for progress reporting
+     * Process a batch of files in a single virtual thread: read from git, parse XML, queue results.
+     * Accumulates all results locally, then flushes to the queue in one addAll() call.
+     * This dramatically reduces lock contention vs one-thread-per-file:
+     * - ONE queue lock acquisition per batch (vs per file)
+     * - ONE remaining.addAndGet() per batch (vs per file CAS)
+     * - ~267 threads contending on JGit pack locks (vs 26,666)
      */
-    private void readParseAndQueueStreaming(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
+    private void readParseAndQueueBatch(List<DirCacheFileEntry> batch, BlockingQueue<ElementWithFolder> queue,
             AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
-        // Read from git object database instead of filesystem to reduce syscalls:
-        // - No stat() to get metadata
-        // - No open() to get file descriptor  
-        // - Single read from pack file instead of multiple filesystem reads
-        //
-        // SAFETY: This method is only called from loadModelWithDirCache(), which is only
-        // called when initDirCacheForImport() returns true (meaning fGitRepository is initialized).
+        List<ElementWithFolder> localResults = new ArrayList<>(batch.size());
+        int processedInBatch = 0;
+        
         try {
             if (fGitRepository == null) {
-                throw new IllegalStateException("readParseAndQueueStreaming called without git repository initialized"); //$NON-NLS-1$
+                throw new IllegalStateException("readParseAndQueueBatch called without git repository initialized"); //$NON-NLS-1$
             }
             
-            // PROFILING: Break down the per-file average
-            long ioStart = PERF_LOGGING ? System.nanoTime() : 0;
-            
-            // Read from git object database using ObjectId from DirCache
-            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
-            ObjectLoader loader = fGitRepository.open(entry.objectId());
-            byte[] bytes = loader.getCachedBytes();
-            
-            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
-                long ioTime = PERF_LOGGING ? (parseStart - ioStart) : 0;  // Time to read from object DB
-                
-                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                long parseEnd = PERF_LOGGING ? System.nanoTime() : 0;
-                long parseTime = PERF_LOGGING ? (parseEnd - parseStart) : 0;
-                
-                fIDLookup.put(eObject.getId(), eObject);
-                if (PERF_LOGGING && fProducerReadTime != null) {
-                    fProducerReadTime.add(System.nanoTime() - readStart);
-                }
-                
-                // Increment produced BEFORE batching to ensure count reflects items about to enter queue
-                if (fProgressReporter != null) {
-                    fProgressReporter.incrementProduced();
-                }
-                
-                // BATCHING: Add to thread-local buffer instead of directly to queue
-                // This reduces queue.put() operations from 26,679 to ~1,300 (20x reduction)
-                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                localBatch.add(new ElementWithFolder(entry.folderPath(), eObject));
-                
-                int remainingCount = remaining.get();
-                
-                // Flush when batch is full OR this is one of the last files
-                if (localBatch.size() >= PRODUCER_BATCH_SIZE || remainingCount <= PRODUCER_BATCH_SIZE) {
-                    queue.addAll(localBatch);  // ONE lock for entire batch!
-                    localBatch.clear();
-                }
-                
-                long putEnd = PERF_LOGGING ? System.nanoTime() : 0;
-                long putTime = PERF_LOGGING ? (putEnd - putStart) : 0;
-                
-                if (PERF_LOGGING && fProducerQueuePutTime != null) {
-                    fProducerQueuePutTime.add(putTime);
-                }
-                
-                // Every 1000 files, log breakdown to identify bottleneck
-                if (PERF_LOGGING && remainingCount % 1000 == 0) {
-                    logPerfMessage(String.format("  PRODUCER BREAKDOWN: I/O=%dms, Parse=%dms, QueuePut=%dms, BatchSize=%d (remaining=%d)", //$NON-NLS-1$
-                        ioTime / 1_000_000, parseTime / 1_000_000, putTime / 1_000_000, localBatch.size(), remainingCount));
-                }
-            }
-        } catch (IOException e) {
-            errorFlag.set(true);
-            try {
-                // Flush any pending batch on error
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                if (!localBatch.isEmpty()) {
-                    queue.addAll(localBatch);
-                    localBatch.clear();
-                }
-                queue.put(new ElementWithFolder(entry.folderPath(), null));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        } finally {
-            remaining.decrementAndGet();
-            
-            // CRITICAL: Flush any remaining items in thread-local batch when thread completes
-            // This ensures the last 0-19 items don't get stuck in the buffer
-            try {
-                List<ElementWithFolder> localBatch = PRODUCER_BATCH_BUFFER.get();
-                if (!localBatch.isEmpty()) {
-                    queue.addAll(localBatch);
-                    localBatch.clear();
-                }
-            } catch (Exception e) {
-                // Ignore - queue might be closed or thread interrupted
-            }
-            
-            // Clean up thread-local to avoid memory leak
-            PRODUCER_BATCH_BUFFER.remove();
-            
-            // Progress reporting moved to consumer to avoid contention
-        }
-    }
-    
-    /**
-     * Read, parse, and queue an element DIRECTLY on virtual thread.
-     * No CPU executor handoff - parsing is only 3% of total time, so keep it simple.
-     * Maximum I/O parallelism: each of 26,680 files gets its own virtual thread.
-     * 
-     * @param entry The DirCache file entry
-     * @param queue The queue to put parsed elements into
-     * @param remaining Counter for remaining elements (decremented on completion)
-     * @param errorFlag Set to true if any producer encounters an error
-     * @param totalModelFiles Total files for progress reporting
-     */
-    private void readParseAndQueueDirect(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
-            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
-        try {
-            // I/O: Read file (this is 97% of time on cold cache)
-            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
-            byte[] bytes = Files.readAllBytes(entry.absolutePath());
-            if (PERF_LOGGING && fProducerReadTime != null) {
-                fProducerReadTime.add(System.nanoTime() - readStart);
-            }
-            
-            // CPU: Parse XML (only 3% of time, OK to do on virtual thread)
-            long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
-            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                fIDLookup.put(eObject.getId(), eObject);
-                if (PERF_LOGGING && fProducerParseTime != null) {
-                    fProducerParseTime.add(System.nanoTime() - parseStart);
-                }
-                
-                // Put into queue for consumer (may block if queue is full)
-                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
-                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
-                if (PERF_LOGGING && fProducerQueuePutTime != null) {
-                    fProducerQueuePutTime.add(System.nanoTime() - putStart);
-                }
-                if (fProgressReporter != null) {
-                    fProgressReporter.incrementProduced();
-                }
-            }
-        } catch (IOException | InterruptedException e) {
-            errorFlag.set(true);
-            try {
-                queue.put(new ElementWithFolder(entry.folderPath(), null));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        } finally {
-            remaining.decrementAndGet();
-            // Progress reporting moved to consumer to avoid contention
-        }
-    }
-    
-    /**
-     * Read, parse, and queue an element for the consumer thread.
-     * 
-     * CRITICAL ARCHITECTURE: Split I/O from CPU work!
-     * - Virtual threads: ONLY for blocking I/O (Files.readAllBytes)
-     * - ForkJoinPool: For CPU-bound XML parsing
-     * 
-     * Why this matters:
-     * - Virtual threads are efficient for I/O because they "park" when blocked
-     * - But XML parsing is CPU-bound and "pins" the carrier thread
-     * - Pinned carrier threads limit concurrency to ~20 (number of carriers)
-     * - By handing off to ForkJoinPool, we get 20 parallel parsers + unlimited I/O
-     * 
-     * @param entry The DirCache file entry
-     * @param queue The queue to put parsed elements into
-     * @param remaining Counter for remaining elements (decremented on completion)
-     * @param errorFlag Set to true if any producer encounters an error
-     * @param totalModelFiles Total files for progress reporting
-     */
-    private void readParseAndQueueElement(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
-            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
-        try {
-            // STEP 1: I/O on virtual thread - this parks, doesn't pin
-            byte[] bytes = Files.readAllBytes(entry.absolutePath());
-            
-            // STEP 2: Hand off to CPU executor for XML parsing
-            // This keeps virtual threads free for more I/O
-            fCpuExecutor.execute(() -> {
-                try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                    IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                    fIDLookup.put(eObject.getId(), eObject);
+            for (DirCacheFileEntry entry : batch) {
+                try {
+                    long readStart = PERF_LOGGING ? System.nanoTime() : 0;
+                    ObjectLoader loader = fGitRepository.open(entry.objectId());
+                    byte[] bytes = loader.getCachedBytes();
+                    long ioTime = PERF_LOGGING ? System.nanoTime() - readStart : 0;
                     
-                    // Put into queue for consumer
-                    queue.put(new ElementWithFolder(entry.folderPath(), eObject));
+                    long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
+                    IIdentifier eObject;
+                    try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
+                        eObject = GraficoResourceLoader.loadEObject(inputStream);
+                    }
+                    long parseTime = PERF_LOGGING ? System.nanoTime() - parseStart : 0;
+                    
+                    fIDLookup.put(eObject.getId(), eObject);
+                    localResults.add(new ElementWithFolder(entry.folderPath(), eObject));
+                    processedInBatch++;
+                    
+                    if (PERF_LOGGING && fProducerReadTime != null) {
+                        fProducerReadTime.add(ioTime + parseTime);
+                    }
+                    
                     if (fProgressReporter != null) {
                         fProgressReporter.incrementProduced();
                     }
-                } catch (IOException | InterruptedException e) {
+                } catch (IOException e) {
                     errorFlag.set(true);
-                    try {
-                        queue.put(new ElementWithFolder(entry.folderPath(), null));
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                } finally {
-                    remaining.decrementAndGet();
-                    // Progress reporting moved to consumer to avoid contention
+                    localResults.add(new ElementWithFolder(entry.folderPath(), null));
+                    processedInBatch++;
                 }
-            });
-        } catch (IOException e) {
-            errorFlag.set(true);
-            remaining.decrementAndGet();
-            try {
-                queue.put(new ElementWithFolder(entry.folderPath(), null));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-    
-    /**
-     * Read, parse, and queue an element for the consumer thread (batched version).
-     * This is called sequentially within a batch on ForkJoinPool, so only one file 
-     * handle is open at a time per batch.
-     * 
-     * @param entry The DirCache file entry
-     * @param queue The queue to put parsed elements into
-     * @param remaining Counter for remaining elements (decremented on completion)
-     * @param errorFlag Set to true if any producer encounters an error
-     * @param totalModelFiles Total files for progress reporting
-     */
-    private void readParseAndQueueBatched(DirCacheFileEntry entry, BlockingQueue<ElementWithFolder> queue,
-            AtomicInteger remaining, AtomicBoolean errorFlag, int totalModelFiles) {
-        try {
-            // Synchronous I/O - OK because we're in a ForkJoinPool batch
-            // Only one file open per batch (sequential within batch)
-            long readStart = PERF_LOGGING ? System.nanoTime() : 0;
-            byte[] bytes = Files.readAllBytes(entry.absolutePath());
-            if (PERF_LOGGING && fProducerReadTime != null) {
-                fProducerReadTime.add(System.nanoTime() - readStart);
-            }
-            
-            long parseStart = PERF_LOGGING ? System.nanoTime() : 0;
-            try (InputStream inputStream = new java.io.ByteArrayInputStream(bytes)) {
-                IIdentifier eObject = GraficoResourceLoader.loadEObject(inputStream);
-                fIDLookup.put(eObject.getId(), eObject);
-                if (PERF_LOGGING && fProducerParseTime != null) {
-                    fProducerParseTime.add(System.nanoTime() - parseStart);
-                }
-                
-                // Put into queue for consumer (may block if queue is full = backpressure)
-                long putStart = PERF_LOGGING ? System.nanoTime() : 0;
-                queue.put(new ElementWithFolder(entry.folderPath(), eObject));
-                if (PERF_LOGGING && fProducerQueuePutTime != null) {
-                    fProducerQueuePutTime.add(System.nanoTime() - putStart);
-                }
-                if (fProgressReporter != null) {
-                    fProgressReporter.incrementProduced();
-                }
-            }
-        } catch (IOException | InterruptedException e) {
-            errorFlag.set(true);
-            try {
-                queue.put(new ElementWithFolder(entry.folderPath(), null));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
             }
         } finally {
-            remaining.decrementAndGet();
-            // Progress reporting moved to consumer to avoid contention
+            // Flush all results to queue in ONE lock acquisition
+            if (!localResults.isEmpty()) {
+                queue.addAll(localResults);
+            }
+            
+            // Decrement remaining by entire batch count in ONE CAS
+            remaining.addAndGet(-processedInBatch);
+            
+            // Log batch summary (ONE log per batch, not per file)
+            if (PERF_LOGGING) {
+                int remainingCount = remaining.get();
+                logPerfMessage(String.format("  BATCH COMPLETE: %d files processed, remaining=%d", //$NON-NLS-1$
+                    processedInBatch, remainingCount));
+            }
         }
     }
     

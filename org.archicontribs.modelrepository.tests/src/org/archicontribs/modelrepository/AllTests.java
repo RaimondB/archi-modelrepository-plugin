@@ -10,6 +10,7 @@ import org.archicontribs.modelrepository.authentication.CryptoDataTests;
 import org.archicontribs.modelrepository.grafico.ArchiRepositoryTests;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoaderTests;
 import org.archicontribs.modelrepository.grafico.GraficoUtilsTests;
+import org.archicontribs.modelrepository.merge.MergeConflictHandlerTests;
 import org.junit.platform.suite.api.SelectClasses;
 import org.junit.platform.suite.api.Suite;
 import org.junit.platform.suite.api.SuiteDisplayName;
@@ -19,7 +20,8 @@ import org.junit.platform.suite.api.SuiteDisplayName;
     ArchiRepositoryTests.class,
     GraficoModelLoaderTests.class,
     GraficoUtilsTests.class,
-    CryptoDataTests.class
+    CryptoDataTests.class,
+    MergeConflictHandlerTests.class
 })
 @SuiteDisplayName("All Model Repository Tests")
 public class AllTests {
