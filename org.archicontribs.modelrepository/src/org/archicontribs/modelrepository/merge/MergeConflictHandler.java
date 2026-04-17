@@ -41,8 +41,10 @@ import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.swt.widgets.Shell;
 
+import com.archimatetool.model.FolderType;
 import com.archimatetool.model.IArchimateModel;
 import com.archimatetool.model.IFolder;
+import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
 
 /**
@@ -536,12 +538,13 @@ public class MergeConflictHandler {
         long mergeStart = System.nanoTime();
         List<String> ours = new ArrayList<>();
         List<String> theirs = new ArrayList<>();
-        // resolvedAsMove elements need special handling: git stage THEIRS
-        // doesn't exist at the conflict path (theirs deleted/moved it), so
-        // normal checkout would silently fail.  Instead, we always checkout
-        // OURS to resolve the git conflict. Content + location is then
-        // handled by consolidateMoveGroups() (all moves route through MoveGroups).
-        List<String> moveResolved = new ArrayList<>();
+        // resolvedAsMove elements: one side modified, the other moved to a
+        // different folder. Git sees delete+modify → conflict at the OLD path.
+        // The element also exists at the NEW path (auto-merged by git).
+        // We must: (1) resolve the git conflict at the old path,
+        //          (2) apply the user's content choice at the new path,
+        //          (3) git-add both paths so the index is clean.
+        List<MergeObjectInfo> moveResolvedInfos = new ArrayList<>();
         
         for(MergeObjectInfo info : getMergeObjectInfos()) {
             // Move group items are handled by consolidateMoveGroups()
@@ -550,9 +553,7 @@ public class MergeConflictHandler {
             }
             
             if(info.isResolvedAsMove()) {
-                // Always checkout OURS to resolve the git conflict at the old path.
-                // Content/location choice is handled by cleanupAutoMergedDuplicates().
-                moveResolved.add(info.getXMLPath());
+                moveResolvedInfos.add(info);
                 log(IStatus.INFO, "[MergeConflictHandler] merge() resolvedAsMove: " + info.getXMLPath() //$NON-NLS-1$
                         + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
                 continue;
@@ -569,7 +570,7 @@ public class MergeConflictHandler {
         }
         
         log(IStatus.INFO, "[MergeConflictHandler] merge() checkout: ours=" + ours.size() + ", theirs=" + theirs.size() //$NON-NLS-1$ //$NON-NLS-2$
-                + ", moveResolved=" + moveResolved.size() //$NON-NLS-1$
+                + ", moveResolved=" + moveResolvedInfos.size() //$NON-NLS-1$
                 + ", moveGroupItems=" + getMergeObjectInfos().stream().filter(MergeObjectInfo::isPartOfMove).count()); //$NON-NLS-1$
         
         long t = System.nanoTime();
@@ -580,10 +581,10 @@ public class MergeConflictHandler {
             if(!theirs.isEmpty()) {
                 checkout(git, Stage.THEIRS, theirs);
             }
-            // Resolve git conflicts for moved elements by checking out OURS
-            // (the only stage that exists at the conflict path)
-            if(!moveResolved.isEmpty()) {
-                checkout(git, Stage.OURS, moveResolved);
+            
+            // Handle move-resolved elements: resolve conflict + apply content at new path
+            if(!moveResolvedInfos.isEmpty()) {
+                resolveMoveResolvedElements(git, moveResolvedInfos);
             }
         }
         log(IStatus.INFO, "[MergeConflictHandler] merge() checkout done: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
@@ -612,6 +613,149 @@ public class MergeConflictHandler {
         log(IStatus.INFO, "[MergeConflictHandler] merge() total: " + (System.nanoTime() - mergeStart) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
     }
     
+    /**
+     * Handle resolvedAsMove elements that are NOT part of a MoveGroup.
+     * These are elements that moved between different folders (different folder IDs),
+     * not a whole-folder move. Git sees delete+modify → conflict at the old path.
+     * The element also exists at the new path (auto-merged by git).
+     * 
+     * <p>For each element:
+     * <ul>
+     * <li>Determine which side has content at the conflict path (OURS or THEIRS)</li>
+     * <li>Checkout that stage to resolve conflict markers</li>
+     * <li>Find the element's new path from the model that moved it</li>
+     * <li>If user chose the modifier's content: copy to new path, delete old path</li>
+     * <li>If user chose the mover's content: just delete old path (new path already correct)</li>
+     * <li>git-add both paths to resolve the index</li>
+     * </ul></p>
+     */
+    private void resolveMoveResolvedElements(Git git, List<MergeObjectInfo> infos) throws IOException, GitAPIException {
+        File repoRoot = fArchiRepo.getLocalRepositoryFolder();
+        Set<String> pathsToAdd = new LinkedHashSet<>();
+        
+        for(MergeObjectInfo info : infos) {
+            String oldXmlPath = info.getXMLPath(); // conflict path (old location)
+            File oldFile = new File(repoRoot, oldXmlPath);
+            
+            // Determine which side has content at the conflict path
+            byte[] headContent = null;
+            try {
+                headContent = fArchiRepo.getFileContents(oldXmlPath, getLocalRef());
+            } catch(IOException e) { /* Fall through */ }
+            
+            // Checkout the stage that has content to get a clean file
+            Stage resolveStage = (headContent != null) ? Stage.OURS : Stage.THEIRS;
+            checkout(git, resolveStage, List.of(oldXmlPath));
+            
+            // Find the new path: the element in the model that MOVED it
+            // If OURS has content at old path → THEIRS moved it → new path from theirModel
+            // If THEIRS has content at old path → OURS moved it → new path from ourModel
+            EObject movedElement;
+            if(headContent != null) {
+                // OURS modified here, THEIRS moved → find in theirModel
+                movedElement = info.getEObject(MergeObjectInfo.THEIRS);
+            } else {
+                // THEIRS modified here, OURS moved → find in ourModel
+                movedElement = info.getEObject(MergeObjectInfo.OURS);
+            }
+            
+            String newXmlPath = computeGraficoPath(movedElement);
+            File newFile = (newXmlPath != null) ? new File(repoRoot, newXmlPath) : null;
+            
+            log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: " + oldXmlPath //$NON-NLS-1$
+                    + " → " + newXmlPath //$NON-NLS-1$
+                    + ", resolveStage=" + resolveStage //$NON-NLS-1$
+                    + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            
+            if(newFile != null && !oldXmlPath.equals(newXmlPath)) {
+                // Determine if user wants the modifier's content or the mover's version
+                boolean userWantsModifierContent;
+                if(headContent != null) {
+                    // OURS modified, THEIRS moved. OURS = modifier.
+                    userWantsModifierContent = (info.getUserChoice() == MergeObjectInfo.OURS);
+                } else {
+                    // THEIRS modified, OURS moved. THEIRS = modifier.
+                    userWantsModifierContent = (info.getUserChoice() == MergeObjectInfo.THEIRS);
+                }
+                
+                if(userWantsModifierContent) {
+                    // Copy modifier's content from old path to new path
+                    newFile.getParentFile().mkdirs();
+                    Files.copy(oldFile.toPath(), newFile.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                // else: new path already has the mover's content (auto-merged)
+                
+                // Delete old file (the element moved away)
+                oldFile.delete();
+                
+                // Stage both paths
+                pathsToAdd.add(info.getFolderPath());
+                pathsToAdd.add(newXmlPath.substring(0, newXmlPath.lastIndexOf('/')));
+            } else {
+                // Can't determine new path — just stage old path to resolve conflict
+                pathsToAdd.add(info.getFolderPath());
+            }
+        }
+        
+        // Git-add all affected paths to resolve conflicts in the index
+        if(!pathsToAdd.isEmpty()) {
+            log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: staging " + pathsToAdd.size() + " paths: " + pathsToAdd); //$NON-NLS-1$ //$NON-NLS-2$
+            AddCommand addNew = git.add();
+            AddCommand addUpdated = git.add().setUpdate(true);
+            for(String path : pathsToAdd) {
+                addNew.addFilepattern(path);
+                addUpdated.addFilepattern(path);
+            }
+            addNew.call();
+            addUpdated.call();
+        }
+    }
+    
+    /**
+     * Compute the GRAFICO file path for a model element by traversing its containment hierarchy.
+     * @return path relative to repo root (e.g. "model/application/folderX/BusinessActor_id-abc.xml"), or null
+     */
+    private String computeGraficoPath(EObject element) {
+        if(element == null) {
+            return null;
+        }
+        
+        // Build filename: ElementType_id-xxx.xml
+        String className = element.getClass().getSimpleName();
+        // EMF implementation classes end with "Impl" — strip it
+        if(className.endsWith("Impl")) { //$NON-NLS-1$
+            className = className.substring(0, className.length() - 4);
+        }
+        String id = (element instanceof IIdentifier) ? ((IIdentifier)element).getId() : null;
+        if(id == null) {
+            return null;
+        }
+        String filename = className + "_" + id + ".xml"; //$NON-NLS-1$ //$NON-NLS-2$
+        
+        // Build folder path by walking up the containment tree
+        StringBuilder folderPath = new StringBuilder();
+        EObject container = element.eContainer();
+        List<String> segments = new ArrayList<>();
+        while(container instanceof IFolder folder) {
+            String folderName = (folder.getType() == FolderType.USER)
+                    ? folder.getId() : folder.getType().toString();
+            segments.add(0, folderName);
+            container = container.eContainer();
+        }
+        
+        if(segments.isEmpty()) {
+            return null;
+        }
+        
+        folderPath.append(IGraficoConstants.MODEL_FOLDER);
+        for(String seg : segments) {
+            folderPath.append('/').append(seg);
+        }
+        
+        return folderPath + "/" + filename; //$NON-NLS-1$
+    }
+
     /**
      * After merge(), consolidate move groups by resolving chosen-path conflicts,
      * moving unique elements from the unchosen path to the chosen path,
