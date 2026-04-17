@@ -55,25 +55,25 @@ public class GraficoModelLoaderTests {
     }
 
     // ========================================================================
-    // extractIdFromFolderXml tests
+    // GraficoUtils XML extraction tests (canonical location)
     // ========================================================================
 
     @Test
     public void extractIdFromFolderXml_ReturnsId() {
         byte[] content = "<archimate:Folder id=\"id-abc123\" name=\"Test\"/>".getBytes(StandardCharsets.UTF_8);
-        assertEquals("id-abc123", GraficoModelLoader.extractIdFromFolderXml(content));
+        assertEquals("id-abc123", GraficoUtils.extractIdFromFolderXml(content));
     }
 
     @Test
     public void extractIdFromFolderXml_ReturnsNull_WhenNoIdAttribute() {
         byte[] content = "<archimate:Folder name=\"Test\"/>".getBytes(StandardCharsets.UTF_8);
-        assertNull(GraficoModelLoader.extractIdFromFolderXml(content));
+        assertNull(GraficoUtils.extractIdFromFolderXml(content));
     }
 
     @Test
     public void extractIdFromFolderXml_ReturnsNull_WhenEmptyContent() {
         byte[] content = "".getBytes(StandardCharsets.UTF_8);
-        assertNull(GraficoModelLoader.extractIdFromFolderXml(content));
+        assertNull(GraficoUtils.extractIdFromFolderXml(content));
     }
 
     @Test
@@ -82,48 +82,48 @@ public class GraficoModelLoaderTests {
                 + "    xmlns:archimate=\"http://www.archimatetool.com/archimate\"\n"
                 + "    name=\"Business\"\n"
                 + "    id=\"id-folder-biz\"/>\n";
-        assertEquals("id-folder-biz", GraficoModelLoader.extractIdFromFolderXml(xml.getBytes(StandardCharsets.UTF_8)));
+        assertEquals("id-folder-biz", GraficoUtils.extractIdFromFolderXml(xml.getBytes(StandardCharsets.UTF_8)));
     }
 
     // ========================================================================
-    // extractNameFromFolderXml tests
+    // GraficoUtils extractNameFromFolderXml tests
     // ========================================================================
 
     @Test
     public void extractNameFromFolderXml_ReturnsName() {
         byte[] content = "<archimate:Folder id=\"id-1\" name=\"Business\"/>".getBytes(StandardCharsets.UTF_8);
-        assertEquals("Business", GraficoModelLoader.extractNameFromFolderXml(content));
+        assertEquals("Business", GraficoUtils.extractNameFromFolderXml(content));
     }
 
     @Test
     public void extractNameFromFolderXml_DecodesXmlEntities() {
         byte[] content = "<archimate:Folder id=\"id-1\" name=\"A &amp; B &lt;C&gt; &quot;D&quot;\"/>".getBytes(StandardCharsets.UTF_8);
-        assertEquals("A & B <C> \"D\"", GraficoModelLoader.extractNameFromFolderXml(content));
+        assertEquals("A & B <C> \"D\"", GraficoUtils.extractNameFromFolderXml(content));
     }
 
     @Test
     public void extractNameFromFolderXml_ReturnsNull_WhenNoNameAttribute() {
         byte[] content = "<archimate:Folder id=\"id-1\"/>".getBytes(StandardCharsets.UTF_8);
-        assertNull(GraficoModelLoader.extractNameFromFolderXml(content));
+        assertNull(GraficoUtils.extractNameFromFolderXml(content));
     }
 
     // ========================================================================
-    // escapeXml tests
+    // GraficoUtils escapeXml tests
     // ========================================================================
 
     @Test
     public void escapeXml_PassesThroughPlainText() {
-        assertEquals("hello world", GraficoModelLoader.escapeXml("hello world"));
+        assertEquals("hello world", GraficoUtils.escapeXml("hello world"));
     }
 
     @Test
     public void escapeXml_EscapesSpecialCharacters() {
-        assertEquals("A &amp; B &lt;C&gt; &quot;D&quot;", GraficoModelLoader.escapeXml("A & B <C> \"D\""));
+        assertEquals("A &amp; B &lt;C&gt; &quot;D&quot;", GraficoUtils.escapeXml("A & B <C> \"D\""));
     }
 
     @Test
     public void escapeXml_HandlesEmptyString() {
-        assertEquals("", GraficoModelLoader.escapeXml(""));
+        assertEquals("", GraficoUtils.escapeXml(""));
     }
 
     // ========================================================================
@@ -281,7 +281,7 @@ public class GraficoModelLoaderTests {
 
         File folderXml = new File(dir, "folder.xml");
         String content = Files.readString(folderXml.toPath());
-        String id = GraficoModelLoader.extractIdFromFolderXml(content.getBytes(StandardCharsets.UTF_8));
+        String id = GraficoUtils.extractIdFromFolderXml(content.getBytes(StandardCharsets.UTF_8));
         assertNotNull(id);
         assertTrue(id.startsWith("id-"));
         assertTrue(id.length() > 10); // UUID-based, should be long

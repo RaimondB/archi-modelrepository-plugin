@@ -494,7 +494,7 @@ public class GraficoModelLoader {
         removeDuplicateElements(oldDir, destDir);
         
         // 3. Create [MERGE FIX] at new location (gets a new ID, since old location keeps original)
-        String newFolderName = extractNameFromFolderXml(
+        String newFolderName = GraficoUtils.extractNameFromFolderXml(
                 Files.readAllBytes(new File(destDir, IGraficoConstants.FOLDER_XML).toPath()));
         createMergeFixFolderXml(destDir, newFolderName != null ? newFolderName : destDir.getName());
         repairedDirPatterns.add(newDirPattern);
@@ -814,13 +814,13 @@ public class GraficoModelLoader {
                 
                 if(historicalContent != null) {
                     // Found in history - extract the ID to check for moves
-                    String historicalId = extractIdFromFolderXml(historicalContent);
+                    String historicalId = GraficoUtils.extractIdFromFolderXml(historicalContent);
                     
                     if(historicalId != null && existingFolderIds.contains(historicalId)) {
                         // ID already exists elsewhere = this was a MOVE, not a delete.
                         // Collect move info for interactive resolution.
-                        File destDir = findFolderDirById(modelDir, historicalId);
-                        String folderName = extractNameFromFolderXml(historicalContent);
+                        File destDir = GraficoUtils.findFolderDirById(modelDir, historicalId);
+                        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
                         
                         if(destDir != null) {
                             // Classify elements: which are duplicates, which are unique
@@ -859,7 +859,7 @@ public class GraficoModelLoader {
                         if(historicalId != null) {
                             existingFolderIds.add(historicalId); // Track for subsequent dirs
                         }
-                        String folderName = extractNameFromFolderXml(historicalContent);
+                        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
                         fRepairDetails.add("Restored folder.xml from git history: " + dirPattern //$NON-NLS-1$
                                 + (folderName != null ? " (" + folderName + ")" : "")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
                         log(IStatus.INFO, "[GraficoModelLoader] Restored folder.xml from git history: " + relativePath); //$NON-NLS-1$
@@ -947,7 +947,7 @@ public class GraficoModelLoader {
         if(folderXml.exists()) {
             try {
                 byte[] content = Files.readAllBytes(folderXml.toPath());
-                String id = extractIdFromFolderXml(content);
+                String id = GraficoUtils.extractIdFromFolderXml(content);
                 if(id != null) {
                     idMap.computeIfAbsent(id, k -> new java.util.ArrayList<>()).add(dir);
                 }
@@ -994,11 +994,11 @@ public class GraficoModelLoader {
             byte[] content1 = null;
             try {
                 content1 = Files.readAllBytes(new File(dir1, IGraficoConstants.FOLDER_XML).toPath());
-                name1 = extractNameFromFolderXml(content1);
+                name1 = GraficoUtils.extractNameFromFolderXml(content1);
             } catch(IOException e) { /* use dir name */ }
             try {
                 byte[] content2 = Files.readAllBytes(new File(dir2, IGraficoConstants.FOLDER_XML).toPath());
-                name2 = extractNameFromFolderXml(content2);
+                name2 = GraficoUtils.extractNameFromFolderXml(content2);
             } catch(IOException e) { /* use dir name */ }
             
             String folderName = name1 != null ? name1 : (name2 != null ? name2 : folderId);
@@ -1054,44 +1054,6 @@ public class GraficoModelLoader {
     }
     
     /**
-     * Extract the id attribute from a folder.xml content.
-     * Uses simple string matching to avoid XML parsing overhead.
-     */
-    static String extractIdFromFolderXml(byte[] content) {
-        String xml = new String(content, java.nio.charset.StandardCharsets.UTF_8);
-        int idStart = xml.indexOf("id=\""); //$NON-NLS-1$
-        if(idStart < 0) {
-            return null;
-        }
-        idStart += 4; // skip past id="
-        int idEnd = xml.indexOf('"', idStart);
-        if(idEnd < 0) {
-            return null;
-        }
-        return xml.substring(idStart, idEnd);
-    }
-    
-    /**
-     * Extract the name attribute from a folder.xml content.
-     * Uses simple string matching to avoid XML parsing overhead.
-     */
-    static String extractNameFromFolderXml(byte[] content) {
-        String xml = new String(content, java.nio.charset.StandardCharsets.UTF_8);
-        int nameStart = xml.indexOf("name=\""); //$NON-NLS-1$
-        if(nameStart < 0) {
-            return null;
-        }
-        nameStart += 6; // skip past name="
-        int nameEnd = xml.indexOf('"', nameStart);
-        if(nameEnd < 0) {
-            return null;
-        }
-        return xml.substring(nameStart, nameEnd)
-                .replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
-                .replace("&quot;", "\""); //$NON-NLS-1$ //$NON-NLS-2$
-    }
-    
-    /**
      * Create a "[MERGE FIX]" folder.xml with a new UUID.
      * This is used when a folder was moved (so the original ID exists elsewhere)
      * or when the folder.xml was never found in history.
@@ -1107,55 +1069,9 @@ public class GraficoModelLoader {
         File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
         String xml = "<archimate:Folder\n" //$NON-NLS-1$
                 + "    xmlns:archimate=\"http://www.archimatetool.com/archimate\"\n" //$NON-NLS-1$
-                + "    name=\"" + escapeXml(displayName) + "\"\n" //$NON-NLS-1$ //$NON-NLS-2$
-                + "    id=\"" + escapeXml(newId) + "\"/>\n"; //$NON-NLS-1$ //$NON-NLS-2$
+                + "    name=\"" + GraficoUtils.escapeXml(displayName) + "\"\n" //$NON-NLS-1$ //$NON-NLS-2$
+                + "    id=\"" + GraficoUtils.escapeXml(newId) + "\"/>\n"; //$NON-NLS-1$ //$NON-NLS-2$
         Files.writeString(folderXml.toPath(), xml);
-    }
-    
-    /**
-     * Escape special XML characters in a string.
-     */
-    static String escapeXml(String s) {
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
-                .replace("\"", "&quot;"); //$NON-NLS-1$ //$NON-NLS-2$
-    }
-
-    /**
-     * Find the directory whose folder.xml has the given ID.
-     * Used to locate where a folder was moved TO after detecting a duplicate ID.
-     * 
-     * @param modelDir The model root directory to search
-     * @param folderId The folder ID to find
-     * @return The directory containing the matching folder.xml, or null if not found
-     */
-    File findFolderDirById(File modelDir, String folderId) {
-        return findFolderDirByIdRecursive(modelDir, folderId);
-    }
-
-    private File findFolderDirByIdRecursive(File dir, String folderId) {
-        File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
-        if(folderXml.exists()) {
-            try {
-                byte[] content = Files.readAllBytes(folderXml.toPath());
-                String id = extractIdFromFolderXml(content);
-                if(folderId.equals(id)) {
-                    return dir;
-                }
-            } catch(IOException e) {
-                // Skip unreadable files
-            }
-        }
-
-        File[] subdirs = dir.listFiles(File::isDirectory);
-        if(subdirs != null) {
-            for(File subdir : subdirs) {
-                File found = findFolderDirByIdRecursive(subdir, folderId);
-                if(found != null) {
-                    return found;
-                }
-            }
-        }
-        return null;
     }
 
     /**

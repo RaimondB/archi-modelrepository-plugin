@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 
 import org.eclipse.jgit.errors.ConfigInvalidException;
 import org.eclipse.jgit.lib.ConfigConstants;
@@ -328,5 +329,110 @@ public class GraficoUtils {
         }
         
         return count.get();
+    }
+    
+    // ==================== XML Attribute Extraction ====================
+    
+    /**
+     * Extract a named attribute value from XML content using simple string matching.
+     * Avoids full XML parsing overhead for lightweight reads of folder.xml files.
+     * 
+     * @param content the raw XML bytes
+     * @param attributeName the attribute name (e.g. "id", "name")
+     * @return the attribute value, or null if not found
+     */
+    public static String extractXmlAttribute(byte[] content, String attributeName) {
+        String xml = new String(content, StandardCharsets.UTF_8);
+        String searchStr = attributeName + "=\""; //$NON-NLS-1$
+        int start = xml.indexOf(searchStr);
+        if(start < 0) return null;
+        start += searchStr.length();
+        int end = xml.indexOf('"', start);
+        if(end < 0) return null;
+        return xml.substring(start, end);
+    }
+    
+    /**
+     * Extract the id attribute from a folder.xml content.
+     */
+    public static String extractIdFromFolderXml(byte[] content) {
+        return extractXmlAttribute(content, "id"); //$NON-NLS-1$
+    }
+    
+    /**
+     * Extract the name attribute from a folder.xml content, with XML entity decoding.
+     */
+    public static String extractNameFromFolderXml(byte[] content) {
+        String name = extractXmlAttribute(content, "name"); //$NON-NLS-1$
+        if(name == null) return null;
+        return unescapeXml(name);
+    }
+    
+    /**
+     * Escape special XML characters in a string.
+     */
+    public static String escapeXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
+                .replace("\"", "&quot;"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Unescape XML entities back to plain characters.
+     */
+    public static String unescapeXml(String s) {
+        return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$
+                .replace("&quot;", "\""); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    // ==================== Folder Search ====================
+    
+    /**
+     * Recursively search for a directory whose folder.xml contains the given ID.
+     * 
+     * @param dir the directory to start searching from
+     * @param folderId the folder ID to find
+     * @return the directory containing the matching folder.xml, or null
+     */
+    public static File findFolderDirById(File dir, String folderId) {
+        return findFolderDirById(dir, folderId, null);
+    }
+    
+    /**
+     * Recursively search for a directory whose folder.xml contains the given ID,
+     * optionally filtering which directories to check (but always recursing into children).
+     * 
+     * @param dir the directory to start searching from
+     * @param folderId the folder ID to find
+     * @param checkDir predicate controlling which directories have their folder.xml checked;
+     *                 directories that fail the test are skipped but their children are still visited.
+     *                 Pass null to check all directories.
+     * @return the directory containing the matching folder.xml, or null
+     */
+    public static File findFolderDirById(File dir, String folderId, Predicate<File> checkDir) {
+        // Only check this directory's folder.xml if it passes the filter
+        if(checkDir == null || checkDir.test(dir)) {
+            File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
+            if(folderXml.exists()) {
+                try {
+                    byte[] content = Files.readAllBytes(folderXml.toPath());
+                    String id = extractIdFromFolderXml(content);
+                    if(folderId.equals(id)) {
+                        return dir;
+                    }
+                } catch(IOException e) {
+                    // Skip unreadable files
+                }
+            }
+        }
+        
+        // Always recurse into children, even if this dir was filtered out
+        File[] subdirs = dir.listFiles(File::isDirectory);
+        if(subdirs != null) {
+            for(File subdir : subdirs) {
+                File found = findFolderDirById(subdir, folderId, checkDir);
+                if(found != null) return found;
+            }
+        }
+        return null;
     }
 }

@@ -20,6 +20,7 @@ import java.util.Set;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
+import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -421,34 +422,14 @@ public class MergeConflictHandler {
     private String findFolderOnDisk(String folderId, Set<String> excludePaths) {
         File modelDir = new File(fArchiRepo.getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
         if(!modelDir.isDirectory()) return null;
-        return findFolderByIdRecursive(folderId, excludePaths, modelDir);
-    }
-    
-    private String findFolderByIdRecursive(String folderId, Set<String> excludePaths, File dir) {
-        String relativePath = fArchiRepo.getLocalRepositoryFolder().toPath()
-                .relativize(dir.toPath()).toString().replace('\\', '/');
         
-        if(!excludePaths.contains(relativePath)) {
-            File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
-            if(folderXml.exists()) {
-                try {
-                    byte[] content = Files.readAllBytes(folderXml.toPath());
-                    String id = extractFolderIdFromXml(content);
-                    if(folderId.equals(id)) {
-                        return relativePath;
-                    }
-                } catch(IOException e) { /* skip */ }
-            }
-        }
-        
-        File[] subdirs = dir.listFiles(File::isDirectory);
-        if(subdirs != null) {
-            for(File subdir : subdirs) {
-                String found = findFolderByIdRecursive(folderId, excludePaths, subdir);
-                if(found != null) return found;
-            }
-        }
-        return null;
+        File repoRoot = fArchiRepo.getLocalRepositoryFolder();
+        File found = GraficoUtils.findFolderDirById(modelDir, folderId, dir -> {
+            String rel = repoRoot.toPath().relativize(dir.toPath()).toString().replace('\\', '/');
+            return !excludePaths.contains(rel);
+        });
+        if(found == null) return null;
+        return repoRoot.toPath().relativize(found.toPath()).toString().replace('\\', '/');
     }
     
     private static String stripModelPrefix(String path) {
@@ -489,7 +470,7 @@ public class MergeConflictHandler {
         try {
             byte[] content = fArchiRepo.getFileContents(xmlPath, getLocalRef());
             if(content != null) {
-                return extractFolderIdFromXml(content);
+                return GraficoUtils.extractIdFromFolderXml(content);
             }
         } catch(IOException e) {
             // Fall through
@@ -499,26 +480,13 @@ public class MergeConflictHandler {
         try {
             byte[] content = fArchiRepo.getFileContents(xmlPath, getTheirRef());
             if(content != null) {
-                return extractFolderIdFromXml(content);
+                return GraficoUtils.extractIdFromFolderXml(content);
             }
         } catch(IOException e) {
             // Fall through
         }
         
         return null;
-    }
-    
-    /**
-     * Extract the id attribute from folder.xml content using simple string matching.
-     */
-    private static String extractFolderIdFromXml(byte[] content) {
-        String xml = new String(content, java.nio.charset.StandardCharsets.UTF_8);
-        int idStart = xml.indexOf("id=\""); //$NON-NLS-1$
-        if(idStart < 0) return null;
-        idStart += 4;
-        int idEnd = xml.indexOf('"', idStart);
-        if(idEnd < 0) return null;
-        return xml.substring(idStart, idEnd);
     }
     
     public boolean openConflictsDialog(String message) {
@@ -701,14 +669,7 @@ public class MergeConflictHandler {
         // Git-add all affected paths to resolve conflicts in the index
         if(!pathsToAdd.isEmpty()) {
             log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: staging " + pathsToAdd.size() + " paths: " + pathsToAdd); //$NON-NLS-1$ //$NON-NLS-2$
-            AddCommand addNew = git.add();
-            AddCommand addUpdated = git.add().setUpdate(true);
-            for(String path : pathsToAdd) {
-                addNew.addFilepattern(path);
-                addUpdated.addFilepattern(path);
-            }
-            addNew.call();
-            addUpdated.call();
+            stagePathsWithJGit(git, pathsToAdd);
         }
     }
     
@@ -927,14 +888,7 @@ public class MergeConflictHandler {
         if(!tryNativeGitAdd(repoRoot, affectedPaths)) {
             // Fall back to JGit with targeted paths
             try(Git git = Git.open(repoRoot)) {
-                AddCommand addNew = git.add();
-                AddCommand addUpdated = git.add().setUpdate(true);
-                for(String path : affectedPaths) {
-                    addNew.addFilepattern(path);
-                    addUpdated.addFilepattern(path);
-                }
-                addNew.call();
-                addUpdated.call();
+                stagePathsWithJGit(git, affectedPaths);
             }
         }
     }
@@ -949,6 +903,20 @@ public class MergeConflictHandler {
                 dir.delete();
             }
         }
+    }
+    
+    /**
+     * Stage paths using JGit — adds new files and updates/removes existing ones.
+     */
+    private static void stagePathsWithJGit(Git git, Set<String> paths) throws GitAPIException {
+        AddCommand addNew = git.add();
+        AddCommand addUpdated = git.add().setUpdate(true);
+        for(String path : paths) {
+            addNew.addFilepattern(path);
+            addUpdated.addFilepattern(path);
+        }
+        addNew.call();
+        addUpdated.call();
     }
     
     /**
