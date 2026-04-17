@@ -70,6 +70,14 @@ public class MergeConflictHandler {
         final String theirsFolderPath;
         
         /**
+         * True when OURS (HEAD) moved the folder and THEIRS modified elements at the
+         * old location. This reverses which git stage has content at each path:
+         * normally OURS stage has content at oursFolderPath, but when oursIsTheMover,
+         * THEIRS stage has content at oursFolderPath (the old location) instead.
+         */
+        final boolean oursIsTheMover;
+        
+        /**
          * The user's location choice for this folder move.
          * OURS = keep old location, THEIRS = keep new location.
          * Default = THEIRS (keep new).
@@ -80,7 +88,8 @@ public class MergeConflictHandler {
         MoveGroup(String moveGroupId, String folderName, 
                   String oldLocationBreadcrumb, String newLocationBreadcrumb,
                   List<MergeObjectInfo> relatedInfos, List<MergeObjectInfo> folderInfos,
-                  String oursFolderPath, String theirsFolderPath) {
+                  String oursFolderPath, String theirsFolderPath,
+                  boolean oursIsTheMover) {
             this.moveGroupId = moveGroupId;
             this.folderName = folderName;
             this.oldLocationBreadcrumb = oldLocationBreadcrumb;
@@ -89,6 +98,7 @@ public class MergeConflictHandler {
             this.folderInfos = folderInfos;
             this.oursFolderPath = oursFolderPath;
             this.theirsFolderPath = theirsFolderPath;
+            this.oursIsTheMover = oursIsTheMover;
         }
     }
     
@@ -326,13 +336,22 @@ public class MergeConflictHandler {
                 continue;
             }
             
+            // Determine which side is the mover.
+            // oursFolderPath = old location (conflict path), theirsFolderPath = new location (disk).
+            // Check if OURS has content at the conflict path - if not, OURS is the mover.
+            byte[] headContent = null;
+            try {
+                headContent = fArchiRepo.getFileContents(info.getXMLPath(), getLocalRef());
+            } catch(IOException e) { /* Fall through */ }
+            boolean oursIsTheMover = (headContent == null);
+            
             String oursFP = folderPath;
             String theirsFP = otherPath;
             
             processedFolderPaths.add(oursFP);
             processedFolderPaths.add(theirsFP);
             
-            buildMoveGroup(folderId, new ArrayList<>(), oursFP, theirsFP);
+            buildMoveGroup(folderId, new ArrayList<>(), oursFP, theirsFP, oursIsTheMover);
         }
     }
     
@@ -342,6 +361,12 @@ public class MergeConflictHandler {
      */
     private void buildMoveGroup(String folderId, List<MergeObjectInfo> folderConflictInfos,
                                 String oursFolderPath, String theirsFolderPath) {
+        buildMoveGroup(folderId, folderConflictInfos, oursFolderPath, theirsFolderPath, false);
+    }
+    
+    private void buildMoveGroup(String folderId, List<MergeObjectInfo> folderConflictInfos,
+                                String oursFolderPath, String theirsFolderPath,
+                                boolean oursIsTheMover) {
         String moveGroupId = "move:" + folderId; //$NON-NLS-1$
         
         // Get folder name from either model
@@ -351,11 +376,15 @@ public class MergeConflictHandler {
         }
         String folderName = (folderObj instanceof INameable) ? ((INameable)folderObj).getName() : ""; //$NON-NLS-1$
         
-        // Build breadcrumbs from models (ours = old location, theirs = new location)
+        // Build breadcrumbs from models.
+        // When THEIRS moved (normal): ours model = old location, theirs model = new location.
+        // When OURS moved: ours model = new location, theirs model = old location → swap.
         EObject oursFolder = com.archimatetool.model.util.ArchimateModelUtils.getObjectByID(fOurModel, folderId);
         EObject theirsFolder = com.archimatetool.model.util.ArchimateModelUtils.getObjectByID(fTheirModel, folderId);
-        String oldBreadcrumb = (oursFolder != null) ? buildBreadcrumb(oursFolder) : stripModelPrefix(oursFolderPath);
-        String newBreadcrumb = (theirsFolder != null) ? buildBreadcrumb(theirsFolder) : stripModelPrefix(theirsFolderPath);
+        String oursBreadcrumb = (oursFolder != null) ? buildBreadcrumb(oursFolder) : stripModelPrefix(oursFolderPath);
+        String theirsBreadcrumb = (theirsFolder != null) ? buildBreadcrumb(theirsFolder) : stripModelPrefix(theirsFolderPath);
+        String oldBreadcrumb = oursIsTheMover ? theirsBreadcrumb : oursBreadcrumb;
+        String newBreadcrumb = oursIsTheMover ? oursBreadcrumb : theirsBreadcrumb;
         
         String moveDesc = Messages.MergeConflictHandler_3 + oldBreadcrumb + " \u2194 " + newBreadcrumb; //$NON-NLS-1$
         
@@ -379,7 +408,7 @@ public class MergeConflictHandler {
         
         fMoveGroups.add(new MoveGroup(moveGroupId, folderName,
                 oldBreadcrumb, newBreadcrumb, allRelated, folderConflictInfos,
-                oursFolderPath, theirsFolderPath));
+                oursFolderPath, theirsFolderPath, oursIsTheMover));
     }
     
     /**
@@ -510,8 +539,8 @@ public class MergeConflictHandler {
         // resolvedAsMove elements need special handling: git stage THEIRS
         // doesn't exist at the conflict path (theirs deleted/moved it), so
         // normal checkout would silently fail.  Instead, we always checkout
-        // OURS to resolve the git conflict, then handle content + location
-        // separately in cleanupAutoMergedDuplicates().
+        // OURS to resolve the git conflict. Content + location is then
+        // handled by consolidateMoveGroups() (all moves route through MoveGroups).
         List<String> moveResolved = new ArrayList<>();
         
         for(MergeObjectInfo info : getMergeObjectInfos()) {
@@ -559,15 +588,6 @@ public class MergeConflictHandler {
         }
         log(IStatus.INFO, "[MergeConflictHandler] merge() checkout done: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
-        // Clean up auto-merged duplicates for moved elements that went through
-        // the normal merge path (not part of a MoveGroup). When one branch moves
-        // an element to a different folder and the other branch modifies it, git
-        // auto-merges the copy at the new location while conflicting at the old.
-        // After checkout resolves the conflict, the duplicate must be removed.
-        t = System.nanoTime();
-        cleanupAutoMergedDuplicates();
-        log(IStatus.INFO, "[MergeConflictHandler] merge() cleanupAutoMergedDuplicates done: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
-        
         // Consolidate move groups: resolve chosen-path conflicts, move unique
         // elements from unchosen to chosen path, delete unchosen path, stage all.
         t = System.nanoTime();
@@ -590,83 +610,6 @@ public class MergeConflictHandler {
         }
         
         log(IStatus.INFO, "[MergeConflictHandler] merge() total: " + (System.nanoTime() - mergeStart) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
-    }
-    
-    /**
-     * Handle auto-merged duplicates for elements that were moved by one branch
-     * and modified by another. These elements go through the normal merge path
-     * (not MoveGroups) when the move is to a different folder (different ID).
-     * 
-     * <p>Git auto-merges the copy at the new location (no conflict), but the
-     * old location conflicts. After checkout resolves the old-location conflict,
-     * the duplicate must be reconciled based on the user's choice:</p>
-     * 
-     * <ul>
-     *   <li><b>OURS</b>: keep our content at the old (conflict) path, delete
-     *       the auto-merged copy at the new path.</li>
-     *   <li><b>THEIRS</b>: delete our file at the old (conflict) path, keep
-     *       the auto-merged copy at the new path (theirs' content + location).</li>
-     * </ul>
-     */
-    private void cleanupAutoMergedDuplicates() {
-        File repoRoot = fArchiRepo.getLocalRepositoryFolder();
-        File modelDir = new File(repoRoot, IGraficoConstants.MODEL_FOLDER);
-        if(!modelDir.isDirectory()) return;
-        
-        for(MergeObjectInfo info : fMergeObjectInfos) {
-            // Only process moved elements that are NOT part of a MoveGroup
-            if(!info.isResolvedAsMove() || info.isPartOfMove() || info.isFolderXml()) {
-                continue;
-            }
-            
-            String xmlPath = info.getXMLPath();
-            String filename = xmlPath.substring(xmlPath.lastIndexOf('/') + 1);
-            File conflictFile = new File(repoRoot, xmlPath);
-            
-            if(info.getUserChoice() == MergeObjectInfo.OURS) {
-                // OURS: keep conflict file (our content), delete auto-merged copies elsewhere
-                List<File> duplicates = new ArrayList<>();
-                findFileRecursive(modelDir, filename, conflictFile, duplicates);
-                
-                if(!duplicates.isEmpty()) {
-                    log(IStatus.INFO, "[MergeConflictHandler] cleanupAutoMergedDuplicates (OURS): removing " //$NON-NLS-1$
-                            + duplicates.size() + " auto-merged copy(s) of " + filename //$NON-NLS-1$
-                            + " (keeping conflict file at " + xmlPath + ")"); //$NON-NLS-1$ //$NON-NLS-2$
-                    for(File dup : duplicates) {
-                        log(IStatus.INFO, "[MergeConflictHandler]   deleting " + dup.getAbsolutePath()); //$NON-NLS-1$
-                        dup.delete();
-                    }
-                }
-            }
-            else {
-                // THEIRS: delete the conflict file (old path), keep auto-merged copy at new path
-                // The auto-merged copy has theirs' content at theirs' location — which is
-                // exactly what the user chose.
-                log(IStatus.INFO, "[MergeConflictHandler] cleanupAutoMergedDuplicates (THEIRS): deleting " //$NON-NLS-1$
-                        + "conflict file at " + xmlPath + " (keeping auto-merged copy at new location)"); //$NON-NLS-1$ //$NON-NLS-2$
-                if(conflictFile.exists()) {
-                    conflictFile.delete();
-                }
-            }
-        }
-    }
-    
-    /**
-     * Recursively find files with the given name under dir, excluding the
-     * specified file.
-     */
-    private static void findFileRecursive(File dir, String filename, File excludeFile, List<File> results) {
-        File[] children = dir.listFiles();
-        if(children == null) return;
-        
-        for(File child : children) {
-            if(child.isDirectory()) {
-                findFileRecursive(child, filename, excludeFile, results);
-            }
-            else if(child.getName().equals(filename) && !child.equals(excludeFile)) {
-                results.add(child);
-            }
-        }
     }
     
     /**
@@ -737,9 +680,14 @@ public class MergeConflictHandler {
             }
             if(!oursCheckoutPaths.isEmpty()) {
                 try(Git git = Git.open(repoRoot)) {
-                    // At the unchosen path, OURS stage has content (theirs deleted/moved)
-                    Stage stage = unchosenPath.equals(group.oursFolderPath)
-                            ? Stage.OURS : Stage.THEIRS;
+                    // Determine which git stage has content at the unchosen path.
+                    // Normally OURS stage has content at oursFolderPath, but when
+                    // OURS is the mover, THEIRS has content there instead.
+                    boolean oursStageAtUnchosen = unchosenPath.equals(group.oursFolderPath);
+                    if(group.oursIsTheMover) {
+                        oursStageAtUnchosen = !oursStageAtUnchosen;
+                    }
+                    Stage stage = oursStageAtUnchosen ? Stage.OURS : Stage.THEIRS;
                     checkout(git, stage, oursCheckoutPaths);
                 }
             }
@@ -790,16 +738,17 @@ public class MergeConflictHandler {
                         MergeObjectInfo conflictInfo = unchosenConflictElements.get(f.getName());
                         
                         if(conflictInfo != null) {
-                            // This is a conflicting element with a user-chosen content version.
-                            if(conflictInfo.getUserChoice() == MergeObjectInfo.OURS) {
-                                // User wants OUR content (e.g. the renamed version).
-                                // f has been resolved to clean ours content above.
+                            // Determine which side's content is at the unchosen path (resolved in step 2).
+                            // Normally the unchosen path has OURS content; when OURS moved, it has THEIRS.
+                            int contentAtUnchosen = group.oursIsTheMover
+                                    ? MergeObjectInfo.THEIRS : MergeObjectInfo.OURS;
+                            if(conflictInfo.getUserChoice() == contentAtUnchosen) {
+                                // User wants the content version that's at the unchosen path.
                                 // Overwrite the auto-merged copy at the chosen path.
                                 Files.copy(f.toPath(), dest.toPath(),
                                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                             }
-                            // If user chose THEIRS: dest already has theirs content
-                            // (auto-merged from the move branch). Nothing to copy.
+                            // Otherwise: dest already has the correct content.
                             f.delete();
                         }
                         else if(!dest.exists()) {
