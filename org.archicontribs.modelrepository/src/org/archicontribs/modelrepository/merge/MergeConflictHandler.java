@@ -689,12 +689,12 @@ public class MergeConflictHandler {
                 // Delete old file (the element moved away)
                 oldFile.delete();
                 
-                // Stage both paths
-                pathsToAdd.add(info.getFolderPath());
-                pathsToAdd.add(newXmlPath.substring(0, newXmlPath.lastIndexOf('/')));
+                // Stage specific files only (not whole directories)
+                pathsToAdd.add(oldXmlPath);
+                pathsToAdd.add(newXmlPath);
             } else {
                 // Can't determine new path — just stage old path to resolve conflict
-                pathsToAdd.add(info.getFolderPath());
+                pathsToAdd.add(oldXmlPath);
             }
         }
         
