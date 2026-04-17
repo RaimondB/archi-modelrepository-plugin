@@ -11,6 +11,35 @@ This document defines the test scenarios for GRAFICO merge operations involving 
 5. **Engine/presentation split**: All merge logic in `MergeConflictHandler` (headless engine). Dialog is presentation-only. Enables future CLI merge command for CI pipelines.
 6. **Real git in tests**: All tests use real JGit repos — real branches, real merges, real disk I/O. No mocking. No dialog code.
 7. **Git move at commit**: Future optimization; cannot be assumed due to mixed plugin versions.
+8. **Two-phase merge**: `MergeConflictHandler` resolves git conflicts (conflicting merges only). `GraficoModelLoader.repairMissingFolderXml()` runs AFTER for ALL merges (clean + conflicting) to detect orphaned elements, duplicate folders, and restore missing folder.xml files.
+9. **Directory name = folder ID**: For USER folders, the GRAFICO directory name IS the folder ID (`getNameFor()` in exporter). This enables O(1) ID lookup from directory listing without reading folder.xml.
+
+## Architecture: Two-Phase Merge
+
+```
+git merge
+    │
+    ├─ CONFLICTING ──► MergeConflictHandler.merge()
+    │                      │
+    │                      ▼
+    │                  consolidateMoveGroups()  (MoveGroup path)
+    │                      │
+    ├─ MERGED (clean) ─────┤
+    │                      │
+    ▼                      ▼
+GraficoModelLoader.repairMissingFolderXml()
+    │
+    ├─ Detect orphaned dirs (missing folder.xml + has elements)
+    ├─ Detect duplicate folder IDs (same ID at multiple paths)
+    ├─ Restore from git history or create [MERGE FIX]
+    └─ Classify elements (duplicate vs unique)
+```
+
+### Dead code removed: `cleanupAutoMergedDuplicates()`
+Investigation proved this method processes 0 elements across all scenarios. All move
+conflicts route through MoveGroup/consolidateMoveGroups() because git auto-merges
+copies at the new path, causing `GraficoModelImporter` to see both sides in the same
+folder. The method and its helper `findFileRecursive()` have been removed.
 
 ## Primary Bug
 
@@ -25,7 +54,9 @@ Branch A moves 10 elements from folderX → folderY. Branch B modifies 2 (one pr
 
 ## Category A: Element Move to Different Folder (different folder ID) + Modify
 
-These go through `cleanupAutoMergedDuplicates()`, NOT MoveGroup.
+Despite different folder IDs, these route through MoveGroup/consolidateMoveGroups() because
+git auto-merges copies at the new path. GraficoModelImporter sees both ours and theirs
+elements in the same folder, causing detectFolderMoves() Pass 3 to create a MoveGroup.
 
 | ID | Scenario | User Choice | Expected | Status |
 |----|----------|-------------|----------|--------|
@@ -44,10 +75,33 @@ These go through MoveGroup + `consolidateMoveGroups()`.
 |----|----------|-------------|----------|--------|
 | B1 | Folder move+rename + 1 elem rename | New loc + OURS content | Elem at new loc with B's content | COVERED |
 | **B2** | **Folder (10 elems) moved, 2 modified** | **New loc, mixed content** | **Per-element content honored** | **NEW (BUG)** |
-| **B3** | Folder moved + new elem added at old loc | New location | New elem follows to chosen loc | **NEW** |
-| **B4** | Folder moved + elem deleted by B | New location | Deleted elem absent | **NEW** |
+| **B3** | Folder moved + new elem added at old loc | New location | New elem follows to chosen loc | **NEW (REPAIR)** |
+| **B4** | Folder moved + elem deleted by B | New location | Deleted elem absent | **NEW (DEFER)** |
 | **B5** | Nested folder move + deep elem modify | New loc + OURS content | Nested move, content preserved | **NEW** |
-| **B6** | Both branches move same folder to diff locs | User picks one | Chosen loc kept, other cleaned up | **NEW** |
+| **B6** | Both branches move same folder to diff locs | User picks one | Chosen loc kept, other cleaned up | **NEW (REPAIR)** |
+
+**B3, B6**: Clean merges — handled by `GraficoModelLoader.repairMissingFolderXml()` (Phase 2).
+**B4**: Requires cross-path deletion detection (deferred — see below).
+
+### B6: Duplicate Folder ID — Data Corruption Risk
+
+When both branches move the same folder (same ID) to different locations, git merges cleanly
+with the folder duplicated at both paths. On next export, both map to the same directory
+(`getNameFor()` returns folder ID), causing silent data loss:
+
+1. Second folder.xml overwrites first → one folder disappears
+2. Elements from lost folder silently reassigned to surviving folder
+3. Corruption propagates to all collaborators on next merge
+
+**Fix**: `repairMissingFolderXml()` extended with `detectDuplicateFolderIds()` — scans
+directory names (= folder IDs for USER folders) to find duplicates without reading folder.xml.
+
+### B4: Cross-Path Deletion (Deferred)
+
+B deleted element R at old path. A moved folder (with R) to new path. Git auto-merges A's
+copy at new path (non-conflicting add). B's deletion is lost because git operates on paths.
+Detecting this requires comparing merge parents to find "element deleted by one parent,
+moved by other." This is deferred to a future PR.
 
 ## Category C: GraficoModelLoader Repair Path (no git conflicts)
 

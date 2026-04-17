@@ -563,6 +563,44 @@ readParse cumulative = 3,813,430ms
 Number of files = 26,680
 Per-file average = 142,932μs ≈ 143ms (includes I/O wait + parse)
 
+---
+
+## Merge Move Detection: Two-Phase Architecture
+
+### Design
+
+Folder moves during merge are handled in two phases:
+
+1. **MergeConflictHandler** (conflict time): Only runs for CONFLICTING merges. Detects move groups
+   via `detectFolderMoves()` 3-pass algorithm + `consolidateMoveGroups()`.
+2. **GraficoModelLoader.repairMissingFolderXml()** (repair time): Runs for ALL merges (clean + conflicting).
+   Detects orphaned elements, duplicate folder IDs, restores missing folder.xml.
+
+### Dead Code Removal: cleanupAutoMergedDuplicates
+
+`cleanupAutoMergedDuplicates()` in MergeConflictHandler was dead code — it processed 0 elements across
+all test scenarios. This is because git auto-merges folder moves (both sides copy to new path), so
+all moves route through the MoveGroup/consolidateMoveGroups() path instead.
+
+### Duplicate Folder ID Detection (B6 Scenario)
+
+When both branches move the same folder to different locations, git merges cleanly → duplicate folder IDs.
+`detectDuplicateFolderIds()` in GraficoModelLoader scans the folder ID map for IDs that appear
+in multiple directories and creates `FolderMoveInfo` entries for resolution.
+
+**Data corruption chain if undetected**: Both folders export to the same directory (getNameFor returns
+folder ID) → second folder.xml overwrites first → folder A disappears → elements silently reassigned.
+
+### KEEP_NEW_LOCATION Behavior
+
+When user chooses KEEP_NEW_LOCATION for a folder move:
+- **Duplicate elements** at old location are removed (same file exists at destination)
+- **Unique elements** at old location are **moved** to the new location (not kept with [MERGE FIX])
+- Empty old directory is cleaned up (deleted)
+- If old directory has subdirectories, it gets [MERGE FIX] folder.xml
+
+This behavior avoids creating orphan [MERGE FIX] folders and ensures all elements follow the move.
+
 Wall clock = 15.5s
 Effective parallelism = 3,813,430ms / 15,500ms ≈ 246 concurrent operations
 ```

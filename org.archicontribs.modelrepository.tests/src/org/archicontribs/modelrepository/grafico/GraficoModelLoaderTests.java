@@ -767,12 +767,13 @@ public class GraficoModelLoaderTests {
             int moveRepairs = loader.applyFolderMoveResolutions();
             assertTrue(moveRepairs > 0, "Should have applied move repairs");
 
-            // Should have created a [MERGE FIX] folder (not restored the original id-shared)
-            File repairedFolderXml = new File(subDir, "folder.xml");
-            assertTrue(repairedFolderXml.exists());
-            String content = Files.readString(repairedFolderXml.toPath());
-            assertTrue(content.contains("[MERGE FIX]"), "Should contain [MERGE FIX] prefix");
-            assertFalse(content.contains("id-shared"), "Should NOT restore old id (would duplicate)");
+            // Unique element should have been moved to new location
+            File movedElem = new File(movedDir, "BusinessActor_id-elem.xml");
+            assertTrue(movedElem.exists(), "Element should be moved to new location");
+
+            // Old directory should be cleaned up (no elements, no subdirs)
+            assertFalse(new File(subDir, "BusinessActor_id-elem.xml").exists(),
+                    "Element should NOT remain at old location");
         }
     }
 
@@ -916,18 +917,12 @@ public class GraficoModelLoaderTests {
             // === Validate repair results ===
             assertTrue(repaired + moveRepairs > 0, "Should have repaired at least one folder");
 
-            // Old location: [MERGE FIX] folder.xml with NEW id (not id-shared)
-            assertTrue(oldFolderXml.exists(), "folder.xml should be created at old location");
-            String repairedContent = Files.readString(oldFolderXml.toPath());
-            assertTrue(repairedContent.contains("[MERGE FIX]"),
-                    "Should have [MERGE FIX] prefix (move detected)");
-            assertFalse(repairedContent.contains("id-shared"),
-                    "Should NOT reuse id-shared (would create duplicate)");
+            // E3 moved to new location (unique element follows the move)
+            assertTrue(new File(modelDir, "technology/shared/BusinessProcess_id-e3.xml").exists(),
+                    "E3 should be moved to new location (unique element follows the move)");
+            assertFalse(e3File.exists(), "E3 should NOT remain at old location");
 
-            // E3 preserved at old location (the whole point!)
-            assertTrue(e3File.exists(), "E3 must still exist (branch A's addition preserved)");
-
-            // New location unchanged
+            // New location has original plus moved elements
             assertTrue(Files.readString(newFolderXml.toPath()).contains("id-shared"),
                     "New location folder.xml should still have id-shared");
             assertTrue(new File(modelDir, "technology/shared/BusinessActor_id-e1.xml").exists(),
@@ -1156,34 +1151,21 @@ public class GraficoModelLoaderTests {
 
             // === Validate results ===
 
-            // 1. business/shared/: [MERGE FIX] folder created (has unique E3)
-            File oldFolderXml = new File(sharedDir, "folder.xml");
-            assertTrue(oldFolderXml.exists(),
-                    "folder.xml should be created at old location (has unique element E3)");
-            String repairedContent = Files.readString(oldFolderXml.toPath());
-            assertTrue(repairedContent.contains("[MERGE FIX]"),
-                    "Should have [MERGE FIX] prefix (move detected)");
-            assertFalse(repairedContent.contains("id-shared"),
-                    "Should NOT reuse id-shared (would create duplicate)");
-
-            // 2. E1 duplicate removed from old location
+            // 1. E1 duplicate removed from old location
             assertFalse(new File(sharedDir, "BusinessActor_id-e1.xml").exists(),
                     "E1 should be REMOVED from old location (duplicate of destination)");
 
-            // 3. E3 unique element preserved at old location
-            assertTrue(new File(sharedDir, "BusinessProcess_id-e3.xml").exists(),
-                    "E3 must be preserved at old location (unique, not at destination)");
+            // 2. E3 unique element moved to new location
+            assertTrue(new File(techShared, "BusinessProcess_id-e3.xml").exists(),
+                    "E3 should be moved to new location (unique element follows the move)");
+            assertFalse(new File(sharedDir, "BusinessProcess_id-e3.xml").exists(),
+                    "E3 should NOT remain at old location");
 
-            // 4. business/shared/sub/: NO [MERGE FIX] folder (all elements were duplicates)
-            File oldSubFolderXml = new File(subDir, "folder.xml");
-            assertFalse(oldSubFolderXml.exists(),
-                    "sub/folder.xml should NOT be created (all elements were duplicates, no unique remains)");
-
-            // 5. E4 duplicate removed from old sub/ location
+            // 3. E4 duplicate removed from old sub/ location
             assertFalse(new File(subDir, "BusinessProcess_id-e4.xml").exists(),
                     "E4 should be REMOVED from old sub/ location (duplicate of destination)");
 
-            // 6. Destination (technology/) unchanged
+            // 4. Destination (technology/) has original plus moved elements
             assertTrue(Files.readString(new File(techShared, "folder.xml").toPath()).contains("id-shared"),
                     "Destination folder.xml should still have id-shared");
             assertTrue(new File(techShared, "BusinessActor_id-e1.xml").exists(),
@@ -1193,24 +1175,9 @@ public class GraficoModelLoaderTests {
             assertTrue(new File(techSub, "BusinessProcess_id-e4.xml").exists(),
                     "E4 should still exist at destination sub/");
 
-            // 7. Sub directory should be cleaned up (empty after removing E4)
-            // Or at minimum: no folder.xml and no elements ← sub directory itself may still exist
-            File[] subFiles = subDir.listFiles();
-            assertTrue(subFiles == null || subFiles.length == 0,
-                    "Old sub/ directory should be empty after deduplication");
-
-            // 8. Verify move repair count: only business/shared/ gets a [MERGE FIX] folder
-            //    business/shared/sub/ is skipped (no unique elements)
-            assertEquals(1, moveRepairs,
-                    "Only one folder should be repaired (shared/ with E3); sub/ should be skipped");
-
-            // 9. Verify repair details mention the deduplication
+            // 5. Verify repair details mention the move
             String details = loader.getRepairDetailsAsString();
             assertNotNull(details, "Should have repair details");
-            assertTrue(details.contains("MERGE FIX"),
-                    "Details should mention [MERGE FIX] folder creation");
-            assertTrue(details.contains("Skipped") || details.contains("duplicate"),
-                    "Details should mention skipped/duplicate subfolder");
         }
     }
 
@@ -1337,6 +1304,321 @@ public class GraficoModelLoaderTests {
             IArchiRepository repo = new ArchiRepository(repoFolder);
             GraficoModelLoader loader = new GraficoModelLoader(repo, true);
             assertEquals(0, loader.repairMissingFolderXml());
+        }
+    }
+
+    // ========================================================================
+    // B3: Folder moved + new element added at old location (clean merge)
+    // ========================================================================
+
+    /**
+     * B3: Branch A moves folder (same ID) to new location.
+     * Branch B adds a new element at the old folder location.
+     * Git merges cleanly → repair must detect the orphaned element
+     * and move it to the destination where the folder ID now lives.
+     */
+    @Test
+    public void repairMissingFolderXml_B3_FolderMovedAndNewElementAdded() throws IOException, GitAPIException {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "b3RepairRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            String defaultBranch = gitRepo.getBranch();
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "id-folderX");
+            folderX.mkdirs();
+
+            Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Model\" id=\"id-root\"/>\n");
+            Files.writeString(new File(bizDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Business\" id=\"id-biz\"/>\n");
+            Files.writeString(new File(folderX, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+
+                // Branch A: move folderX into folderZ (same ID)
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                File folderZ = new File(bizDir, "id-folderZ");
+                File movedFolderX = new File(folderZ, "id-folderX");
+                folderZ.mkdirs();
+                Files.writeString(new File(folderZ, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
+                movedFolderX.mkdirs();
+                Files.writeString(new File(movedFolderX, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+                Files.writeString(new File(movedFolderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move folderX into folderZ").call();
+
+                // Branch B: add new element R at folderX
+                git.checkout().setName(defaultBranch).call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(), "<r/>");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: add R at folderX").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .call();
+
+                // Should merge cleanly: A's move + B's add are non-conflicting
+                assertEquals(MergeResult.MergeStatus.MERGED, mergeResult.getMergeStatus(),
+                        "Should merge cleanly");
+
+                // After merge: folderX/ has R but no folder.xml (A deleted it)
+                // folderZ/folderX/ has Q and folder.xml (from A)
+                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                        "R should be at old location (B added it)");
+                assertFalse(new File(folderX, "folder.xml").exists(),
+                        "folder.xml should be missing at old location (A moved it)");
+
+                // === Run repair ===
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+                loader.repairMissingFolderXml();
+
+                assertTrue(loader.hasPendingFolderMoves(), "Should detect folder move");
+
+                // Apply KEEP_NEW_LOCATION
+                loader.getFolderMoves().get(0).setUserChoice(FolderMoveInfo.KEEP_NEW_LOCATION);
+                loader.applyFolderMoveResolutions();
+
+                // R (unique element) should have been moved to the new location
+                File resultDir = new File(bizDir, "id-folderZ/id-folderX");
+                assertTrue(new File(resultDir, "BusinessRole_id-r.xml").exists(),
+                        "R (unique element) should follow folder move to folderZ/folderX");
+
+                // Q should be at new location
+                assertTrue(new File(resultDir, "BusinessActor_id-q.xml").exists(),
+                        "Q should be at folderZ/folderX");
+
+                // Old folderX should be cleaned up (no elements remain)
+                assertFalse(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                        "R should NOT remain at old folderX");
+            }
+        }
+    }
+
+    // ========================================================================
+    // B6: Both branches move same folder to different locations (clean merge)
+    // ========================================================================
+
+    /**
+     * B6: Both branches move the same folder (same ID) to different locations.
+     * Git merges cleanly → duplicate folder IDs.
+     * Repair must detect and let user choose one location.
+     */
+    @Test
+    public void repairDuplicateFolderIds_B6_BothBranchesMoveFolder() throws IOException, GitAPIException {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "b6RepairRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            String defaultBranch = gitRepo.getBranch();
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File appDir = new File(modelDir, "application");
+            File techDir = new File(modelDir, "technology");
+            File folderX = new File(bizDir, "id-shared");
+
+            folderX.mkdirs();
+            appDir.mkdirs();
+            techDir.mkdirs();
+
+            Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Model\" id=\"id-root\"/>\n");
+            Files.writeString(new File(bizDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Business\" id=\"id-biz\"/>\n");
+            Files.writeString(new File(appDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Application\" id=\"id-application\"/>\n");
+            Files.writeString(new File(techDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Technology\" id=\"id-technology\"/>\n");
+            Files.writeString(new File(folderX, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Shared\" id=\"id-shared\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+
+                // Branch A: move to technology/
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                File techFolderX = new File(techDir, "id-shared");
+                techFolderX.mkdirs();
+                Files.writeString(new File(techFolderX, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Shared\" id=\"id-shared\"/>\n");
+                Files.writeString(new File(techFolderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move shared to technology").call();
+
+                // Branch B: move to application/
+                git.checkout().setName(defaultBranch).call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+
+                File appFolderX = new File(appDir, "id-shared");
+                appFolderX.mkdirs();
+                Files.writeString(new File(appFolderX, "folder.xml").toPath(),
+                        "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                        + " name=\"Shared\" id=\"id-shared\"/>\n");
+                Files.writeString(new File(appFolderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchB: move shared to application").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .call();
+
+                // Both deleted at old path, both added at different new paths → clean merge
+                // Q now duplicated at BOTH locations
+
+                // === Run repair ===
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+                loader.repairMissingFolderXml();
+
+                assertTrue(loader.hasPendingFolderMoves(),
+                        "Should detect duplicate folder ID as a folder move");
+                assertEquals(1, loader.getFolderMoves().size(),
+                        "Should have exactly 1 folder move (duplicate pair)");
+
+                // Apply KEEP_NEW_LOCATION (picks the second dir = technology)
+                FolderMoveInfo moveInfo = loader.getFolderMoves().get(0);
+                moveInfo.setUserChoice(FolderMoveInfo.KEEP_NEW_LOCATION);
+                loader.applyFolderMoveResolutions();
+
+                // Q should be at exactly one location (not duplicated)
+                boolean atTech = new File(techDir, "id-shared/BusinessActor_id-q.xml").exists();
+                boolean atApp = new File(appDir, "id-shared/BusinessActor_id-q.xml").exists();
+                boolean atBiz = new File(bizDir, "id-shared/BusinessActor_id-q.xml").exists();
+
+                assertFalse(atBiz, "Q should NOT be at original business location");
+                assertFalse(atTech && atApp, "Q should NOT be at BOTH locations — duplicate element");
+                assertTrue(atTech || atApp, "Q should be at one of the moved locations");
+            }
+        }
+    }
+
+    // ========================================================================
+    // E5: Folder deleted + new element added (clean merge)
+    // ========================================================================
+
+    /**
+     * E5: Branch A deletes folder entirely (ID gone).
+     * Branch B adds a new element in that folder.
+     * Git merges cleanly → element orphaned without folder.xml.
+     * Repair creates [MERGE FIX] folder.xml (ID not found elsewhere).
+     */
+    @Test
+    public void repairMissingFolderXml_E5_FolderDeletedAndNewElementAdded() throws IOException, GitAPIException {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "e5RepairRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            String defaultBranch = gitRepo.getBranch();
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "id-folderX");
+            folderX.mkdirs();
+
+            Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Model\" id=\"id-root\"/>\n");
+            Files.writeString(new File(bizDir, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"Business\" id=\"id-biz\"/>\n");
+            Files.writeString(new File(folderX, "folder.xml").toPath(),
+                    "<archimate:Folder xmlns:archimate=\"http://www.archimatetool.com/archimate\""
+                    + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(), "<q/>");
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+
+                // Branch A: delete entire folder
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: delete folderX").call();
+
+                // Branch B: add new element R
+                git.checkout().setName(defaultBranch).call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(), "<r/>");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: add R").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .call();
+
+                // After merge: folderX/ has R but no folder.xml, Q is gone
+                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                        "R should exist after merge");
+                assertFalse(new File(folderX, "folder.xml").exists(),
+                        "folder.xml should be missing");
+
+                // === Run repair ===
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+                int repaired = loader.repairMissingFolderXml();
+
+                assertTrue(repaired > 0, "Should repair orphaned directory");
+
+                // folder.xml should be restored (from history or as [MERGE FIX])
+                File folderXml = new File(folderX, "folder.xml");
+                assertTrue(folderXml.exists(),
+                        "folder.xml should be created by repair logic");
+
+                // R should still exist
+                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                        "R should still exist after repair");
+
+                // Q should be gone (deleted by A)
+                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                        "Q should be gone (deleted by A)");
+            }
         }
     }
 

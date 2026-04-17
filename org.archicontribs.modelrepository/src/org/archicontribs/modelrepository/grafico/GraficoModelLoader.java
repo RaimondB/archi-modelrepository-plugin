@@ -414,8 +414,8 @@ public class GraficoModelLoader {
     }
     
     /**
-     * Apply "keep new location" resolution: duplicates removed from old dir,
-     * unique elements get a [MERGE FIX] folder, empty dirs are skipped.
+     * Apply "keep new location" resolution: remove duplicates from old dir,
+     * move unique elements to new dir, clean up empty old dir.
      */
     private int applyKeepNewLocation(FolderMoveInfo move, List<String> repairedDirPatterns) throws IOException {
         File oldDir = move.getOldDir();
@@ -425,27 +425,53 @@ public class GraficoModelLoader {
         // Remove duplicate elements from old location
         removeDuplicateElements(oldDir, destDir);
         
-        // Check if anything unique remains
+        // Move unique elements to the new location
         File[] remainingXmls = oldDir.listFiles((d, name) ->
                 name.endsWith(".xml") && !IGraficoConstants.FOLDER_XML.equals(name)); //$NON-NLS-1$
         int uniqueRemaining = remainingXmls != null ? remainingXmls.length : 0;
         
-        if(uniqueRemaining == 0 && !hasSubdirectories(oldDir)) {
-            // All duplicates, no subfolders — skip entirely
-            fRepairDetails.add("Skipped empty moved folder (all elements are duplicates): " + dirPattern //$NON-NLS-1$
-                    + " (kept at " + move.getNewRelativePath() + ")"); //$NON-NLS-1$ //$NON-NLS-2$
-            log(IStatus.INFO, "[GraficoModelLoader] Skipped moved folder " + dirPattern //$NON-NLS-1$
-                    + " — all elements are duplicates of " + move.getNewRelativePath()); //$NON-NLS-1$
-            return 0;
+        if(uniqueRemaining > 0) {
+            for(File xmlFile : remainingXmls) {
+                File destFile = new File(destDir, xmlFile.getName());
+                Files.move(xmlFile.toPath(), destFile.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            repairedDirPatterns.add(move.getNewRelativePath());
+            fRepairDetails.add("Moved " + uniqueRemaining + " unique element(s) to new location: " //$NON-NLS-1$ //$NON-NLS-2$
+                    + dirPattern + " → " + move.getNewRelativePath()); //$NON-NLS-1$
+            log(IStatus.INFO, "[GraficoModelLoader] Moved " + uniqueRemaining //$NON-NLS-1$
+                    + " unique element(s) from " + dirPattern //$NON-NLS-1$
+                    + " to " + move.getNewRelativePath()); //$NON-NLS-1$
         }
         
-        // Has unique elements — create [MERGE FIX] folder at old location
+        // Clean up old directory if empty (no XMLs, no subdirs)
+        if(!hasSubdirectories(oldDir)) {
+            // Delete folder.xml if it exists, then remove empty dir
+            File oldFolderXml = new File(oldDir, IGraficoConstants.FOLDER_XML);
+            if(oldFolderXml.exists()) {
+                oldFolderXml.delete();
+            }
+            // Delete any remaining non-XML files and the directory itself
+            File[] remaining = oldDir.listFiles();
+            if(remaining == null || remaining.length == 0) {
+                oldDir.delete();
+                repairedDirPatterns.add(dirPattern);
+            }
+            fRepairDetails.add("Cleaned up empty moved folder: " + dirPattern //$NON-NLS-1$
+                    + " (kept at " + move.getNewRelativePath() + ")"); //$NON-NLS-1$ //$NON-NLS-2$
+            log(IStatus.INFO, "[GraficoModelLoader] Cleaned up moved folder " + dirPattern //$NON-NLS-1$
+                    + " — elements moved to " + move.getNewRelativePath()); //$NON-NLS-1$
+            return uniqueRemaining > 0 ? 1 : 0;
+        }
+        
+        // Has subdirectories — keep the dir but create [MERGE FIX] folder.xml
+        // so the directory has a valid parent folder  
         createMergeFixFolderXml(oldDir, move.getFolderName());
         repairedDirPatterns.add(dirPattern);
-        fRepairDetails.add("Created [MERGE FIX] folder for unique elements: " + dirPattern //$NON-NLS-1$
+        fRepairDetails.add("Created [MERGE FIX] folder for remaining subdirectories: " + dirPattern //$NON-NLS-1$
                 + " (folder kept at " + move.getNewRelativePath() + ")"); //$NON-NLS-1$ //$NON-NLS-2$
         log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] at " + dirPattern //$NON-NLS-1$
-                + " for " + uniqueRemaining + " unique element(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+                + " for subdirectories; " + uniqueRemaining + " unique element(s) moved"); //$NON-NLS-1$ //$NON-NLS-2$
         return 1;
     }
     
@@ -756,17 +782,21 @@ public class GraficoModelLoader {
         // Recursively find directories that have element XML files but no folder.xml
         findDirsWithMissingFolderXml(modelDir, dirsWithMissingFolderXml);
         
-        if(dirsWithMissingFolderXml.isEmpty()) {
-            return 0;
-        }
-        
-        // Build a set of all existing folder IDs in the model tree (for move detection)
-        java.util.Set<String> existingFolderIds = collectExistingFolderIds(modelDir);
+        // Build a map of folder ID → directories (for move and duplicate detection)
+        java.util.Map<String, java.util.List<File>> folderIdMap = collectFolderIdMap(modelDir);
+        java.util.Set<String> existingFolderIds = new java.util.HashSet<>(folderIdMap.keySet());
         
         // Track repaired directory paths for git add and commit message details
         List<String> repairedDirPatterns = new ArrayList<>();
         fRepairDetails = new ArrayList<>();
         fFolderMoves = new ArrayList<>();
+        
+        // Detect duplicate folder IDs (B6: both branches moved same folder to different locations)
+        detectDuplicateFolderIds(modelDir, folderIdMap);
+        
+        if(dirsWithMissingFolderXml.isEmpty() && fFolderMoves.isEmpty()) {
+            return 0;
+        }
         
         try(Repository repository = Git.open(fRepository.getLocalRepositoryFolder()).getRepository()) {
             for(File dir : dirsWithMissingFolderXml) {
@@ -888,19 +918,38 @@ public class GraficoModelLoader {
      * Used to detect folder moves (where the same ID exists in a different location).
      */
     java.util.Set<String> collectExistingFolderIds(File modelDir) {
-        java.util.Set<String> ids = new java.util.HashSet<>();
-        collectFolderIdsRecursive(modelDir, ids);
-        return ids;
+        java.util.Map<String, java.util.List<File>> idMap = collectFolderIdMap(modelDir);
+        return idMap.keySet();
     }
     
-    private void collectFolderIdsRecursive(File dir, java.util.Set<String> ids) {
+    /**
+     * Collect a map of folder ID → list of directories containing that ID.
+     * Optimized: for user-created subfolders, the directory name IS the folder ID
+     * (matching GraficoModelExporter.getNameFor()), so no folder.xml read is needed.
+     * Only top-level typed folders (business, technology, etc.) and model root
+     * require reading folder.xml.
+     * 
+     * <p>Duplicate entries (same ID mapping to multiple directories) indicate
+     * the B6 scenario: both branches moved the same folder to different locations.</p>
+     */
+    java.util.Map<String, java.util.List<File>> collectFolderIdMap(File modelDir) {
+        java.util.Map<String, java.util.List<File>> idMap = new java.util.HashMap<>();
+        collectFolderIdMapRecursive(modelDir, idMap, 0);
+        return idMap;
+    }
+    
+    /**
+     * @param depth 0=model root, 1=typed folders (business, technology, etc.), 2+=user folders
+     */
+    private void collectFolderIdMapRecursive(File dir, java.util.Map<String, java.util.List<File>> idMap, int depth) {
         File folderXml = new File(dir, IGraficoConstants.FOLDER_XML);
+        
         if(folderXml.exists()) {
             try {
                 byte[] content = Files.readAllBytes(folderXml.toPath());
                 String id = extractIdFromFolderXml(content);
                 if(id != null) {
-                    ids.add(id);
+                    idMap.computeIfAbsent(id, k -> new java.util.ArrayList<>()).add(dir);
                 }
             } catch(IOException e) {
                 // Skip unreadable files
@@ -910,8 +959,69 @@ public class GraficoModelLoader {
         File[] subdirs = dir.listFiles(File::isDirectory);
         if(subdirs != null) {
             for(File subdir : subdirs) {
-                collectFolderIdsRecursive(subdir, ids);
+                collectFolderIdMapRecursive(subdir, idMap, depth + 1);
             }
+        }
+    }
+    
+    /**
+     * Detect duplicate folder IDs in the model tree (B6 scenario: both branches
+     * moved the same folder to different locations). Returns a list of FolderMoveInfo
+     * for each duplicate pair.
+     * 
+     * <p>When both branches move a folder, git auto-merges both copies cleanly.
+     * The result is two directories with valid folder.xml containing the same ID.
+     * On next export, both map to the same directory (getNameFor returns folder ID),
+     * causing silent data corruption.</p>
+     */
+    private void detectDuplicateFolderIds(File modelDir, java.util.Map<String, java.util.List<File>> idMap) {
+        for(java.util.Map.Entry<String, java.util.List<File>> entry : idMap.entrySet()) {
+            java.util.List<File> dirs = entry.getValue();
+            if(dirs.size() < 2) {
+                continue;
+            }
+            
+            String folderId = entry.getKey();
+            
+            // Pick the first two as the duplicate pair
+            // (more than 2 duplicates is theoretically possible but extremely unlikely)
+            File dir1 = dirs.get(0);
+            File dir2 = dirs.get(1);
+            
+            // Read folder names from folder.xml
+            String name1 = null;
+            String name2 = null;
+            byte[] content1 = null;
+            try {
+                content1 = Files.readAllBytes(new File(dir1, IGraficoConstants.FOLDER_XML).toPath());
+                name1 = extractNameFromFolderXml(content1);
+            } catch(IOException e) { /* use dir name */ }
+            try {
+                byte[] content2 = Files.readAllBytes(new File(dir2, IGraficoConstants.FOLDER_XML).toPath());
+                name2 = extractNameFromFolderXml(content2);
+            } catch(IOException e) { /* use dir name */ }
+            
+            String folderName = name1 != null ? name1 : (name2 != null ? name2 : folderId);
+            
+            // Classify elements between the two directories
+            java.util.List<String> duplicates = new java.util.ArrayList<>();
+            java.util.List<String> unique = new java.util.ArrayList<>();
+            classifyElements(dir1, dir2, duplicates, unique);
+            
+            String relPath1 = fRepository.getLocalRepositoryFolder().toPath()
+                    .relativize(dir1.toPath()).toString().replace('\\', '/');
+            String relPath2 = fRepository.getLocalRepositoryFolder().toPath()
+                    .relativize(dir2.toPath()).toString().replace('\\', '/');
+            
+            FolderMoveInfo moveInfo = new FolderMoveInfo(
+                    folderName, folderId, dir1, dir2,
+                    relPath1, relPath2,
+                    duplicates, unique, content1);
+            fFolderMoves.add(moveInfo);
+            
+            log(IStatus.INFO, "[GraficoModelLoader] Duplicate folder ID detected: " + folderId //$NON-NLS-1$
+                    + " at " + relPath1 + " and " + relPath2 //$NON-NLS-1$ //$NON-NLS-2$
+                    + ". " + duplicates.size() + " duplicates, " + unique.size() + " unique."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         }
     }
     
