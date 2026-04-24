@@ -12,6 +12,7 @@
 #       "MavenPath": "C:\\path\\to\\mvn.cmd"
 #   }
 
+[CmdletBinding()]
 param(
     [string]$OutputDir = "",
     [string]$DistDir = "",

@@ -17,3 +17,6 @@ examples/
 
 # Local build configuration (user-specific paths)
 build-config.local.json
+
+# Accidental directories from GNU-style args (e.g. --skipMaven instead of -SkipMaven)
+--*
