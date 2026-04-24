@@ -776,18 +776,13 @@ public class GraficoModelLoader {
             return 0;
         }
         
-        int repaired = 0;
         List<File> dirsWithMissingFolderXml = new ArrayList<>();
-        
-        // Recursively find directories that have element XML files but no folder.xml
         findDirsWithMissingFolderXml(modelDir, dirsWithMissingFolderXml);
         
         // Build a map of folder ID → directories (for move and duplicate detection)
         java.util.Map<String, java.util.List<File>> folderIdMap = collectFolderIdMap(modelDir);
         java.util.Set<String> existingFolderIds = new java.util.HashSet<>(folderIdMap.keySet());
         
-        // Track repaired directory paths for git add and commit message details
-        List<String> repairedDirPatterns = new ArrayList<>();
         fRepairDetails = new ArrayList<>();
         fFolderMoves = new ArrayList<>();
         
@@ -798,93 +793,121 @@ public class GraficoModelLoader {
             return 0;
         }
         
+        // Repair each directory that is missing its folder.xml
+        List<String> repairedDirPatterns = new ArrayList<>();
         try(Repository repository = Git.open(fRepository.getLocalRepositoryFolder()).getRepository()) {
             for(File dir : dirsWithMissingFolderXml) {
-                String relativePath = fRepository.getLocalRepositoryFolder().toPath()
-                        .relativize(dir.toPath().resolve(IGraficoConstants.FOLDER_XML))
-                        .toString().replace('\\', '/');
-                
-                // Compute directory pattern for git add (stages folder.xml + all element XMLs)
                 String dirPattern = fRepository.getLocalRepositoryFolder().toPath()
                         .relativize(dir.toPath())
                         .toString().replace('\\', '/');
                 
-                // Try to restore from git history at this exact path
-                byte[] historicalContent = loadFolderXmlFromHistory(repository, relativePath);
-                
-                if(historicalContent != null) {
-                    // Found in history - extract the ID to check for moves
-                    String historicalId = GraficoUtils.extractIdFromFolderXml(historicalContent);
-                    
-                    if(historicalId != null && existingFolderIds.contains(historicalId)) {
-                        // ID already exists elsewhere = this was a MOVE, not a delete.
-                        // Collect move info for interactive resolution.
-                        File destDir = GraficoUtils.findFolderDirById(modelDir, historicalId);
-                        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
-                        
-                        if(destDir != null) {
-                            // Classify elements: which are duplicates, which are unique
-                            List<String> duplicates = new ArrayList<>();
-                            List<String> unique = new ArrayList<>();
-                            classifyElements(dir, destDir, duplicates, unique);
-                            
-                            String destRelPath = fRepository.getLocalRepositoryFolder().toPath()
-                                    .relativize(destDir.toPath())
-                                    .toString().replace('\\', '/');
-                            
-                            FolderMoveInfo moveInfo = new FolderMoveInfo(
-                                    folderName != null ? folderName : dir.getName(),
-                                    historicalId, dir, destDir,
-                                    dirPattern, destRelPath,
-                                    duplicates, unique, historicalContent);
-                            fFolderMoves.add(moveInfo);
-                            
-                            log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
-                                    + " (id " + historicalId + " exists at " + destRelPath //$NON-NLS-1$ //$NON-NLS-2$
-                                    + "). " + duplicates.size() + " duplicates, " + unique.size() + " unique."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-                            // Don't repair yet — wait for user resolution
-                            continue;
-                        }
-                        
-                        // destDir not found (shouldn't happen but be safe) — fall through to [MERGE FIX]
-                        createMergeFixFolderXml(dir, folderName != null ? folderName : dir.getName());
-                        fRepairDetails.add("Created [MERGE FIX] folder for moved folder: " + dirPattern //$NON-NLS-1$
-                                + " (original id " + historicalId + " exists elsewhere)"); //$NON-NLS-1$ //$NON-NLS-2$
-                        log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
-                                + " (id " + historicalId + " exists elsewhere). Created [MERGE FIX] folder."); //$NON-NLS-1$ //$NON-NLS-2$
-                    } else {
-                        // ID doesn't exist elsewhere - safe to restore from history
-                        File folderXmlFile = new File(dir, IGraficoConstants.FOLDER_XML);
-                        Files.write(folderXmlFile.toPath(), historicalContent);
-                        if(historicalId != null) {
-                            existingFolderIds.add(historicalId); // Track for subsequent dirs
-                        }
-                        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
-                        fRepairDetails.add("Restored folder.xml from git history: " + dirPattern //$NON-NLS-1$
-                                + (folderName != null ? " (" + folderName + ")" : "")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-                        log(IStatus.INFO, "[GraficoModelLoader] Restored folder.xml from git history: " + relativePath); //$NON-NLS-1$
-                    }
-                } else {
-                    // Not found in history at all - create a merge-fix folder
-                    createMergeFixFolderXml(dir, dir.getName());
-                    fRepairDetails.add("Created [MERGE FIX] folder (no history found): " + dirPattern); //$NON-NLS-1$
-                    log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] folder.xml for " + relativePath); //$NON-NLS-1$
+                if(repairSingleMissingFolderXml(repository, modelDir, dir, dirPattern, existingFolderIds)) {
+                    repairedDirPatterns.add(dirPattern);
                 }
-                
-                repairedDirPatterns.add(dirPattern);
-                repaired++;
             }
         }
         
-        // Stage ALL files in repaired directories so the DirCache-based importer can
-        // see them. This includes the folder.xml we just created AND any element XML
-        // files that exist on disk but aren't in the git index (e.g. after a merge).
-        // Without this, elements show up as both "added" and "removed" in review.
+        // Stage ALL files in repaired directories
         if(!repairedDirPatterns.isEmpty()) {
             stageDirectories(repairedDirPatterns);
         }
         
-        return repaired;
+        return repairedDirPatterns.size();
+    }
+    
+    /**
+     * Repair a single directory that is missing its folder.xml.
+     * Tries to restore from git history; creates [MERGE FIX] if no history found;
+     * detects folder moves when the historical ID already exists elsewhere.
+     * 
+     * @return true if the directory was repaired (restored or [MERGE FIX] created)
+     */
+    private boolean repairSingleMissingFolderXml(Repository repository, File modelDir, File dir,
+            String dirPattern, java.util.Set<String> existingFolderIds) throws IOException {
+        String relativePath = fRepository.getLocalRepositoryFolder().toPath()
+                .relativize(dir.toPath().resolve(IGraficoConstants.FOLDER_XML))
+                .toString().replace('\\', '/');
+        
+        byte[] historicalContent = loadFolderXmlFromHistory(repository, relativePath);
+        
+        if(historicalContent == null) {
+            // Not found in history — create a merge-fix folder
+            createMergeFixFolderXml(dir, dir.getName());
+            fRepairDetails.add("Created [MERGE FIX] folder (no history found): " + dirPattern); //$NON-NLS-1$
+            log(IStatus.INFO, "[GraficoModelLoader] Created [MERGE FIX] folder.xml for " + relativePath); //$NON-NLS-1$
+            return true;
+        }
+        
+        String historicalId = GraficoUtils.extractIdFromFolderXml(historicalContent);
+        
+        if(historicalId != null && existingFolderIds.contains(historicalId)) {
+            // ID already exists elsewhere = folder move
+            return handleFolderMoveDetection(modelDir, dir, dirPattern, relativePath,
+                    historicalContent, historicalId);
+        }
+        
+        // ID doesn't exist elsewhere — safe to restore from history
+        restoreFolderXmlFromHistory(dir, dirPattern, relativePath, historicalContent,
+                historicalId, existingFolderIds);
+        return true;
+    }
+    
+    /**
+     * Handle case where a missing folder.xml has an ID that already exists elsewhere (= move).
+     * Collects a FolderMoveInfo for interactive resolution, or creates [MERGE FIX] as fallback.
+     * @return true if a [MERGE FIX] was created, false if move was deferred to user
+     */
+    private boolean handleFolderMoveDetection(File modelDir, File dir, String dirPattern,
+            String relativePath, byte[] historicalContent, String historicalId) throws IOException {
+        File destDir = GraficoUtils.findFolderDirById(modelDir, historicalId);
+        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
+        
+        if(destDir != null) {
+            List<String> duplicates = new ArrayList<>();
+            List<String> unique = new ArrayList<>();
+            classifyElements(dir, destDir, duplicates, unique);
+            
+            String destRelPath = fRepository.getLocalRepositoryFolder().toPath()
+                    .relativize(destDir.toPath())
+                    .toString().replace('\\', '/');
+            
+            FolderMoveInfo moveInfo = new FolderMoveInfo(
+                    folderName != null ? folderName : dir.getName(),
+                    historicalId, dir, destDir,
+                    dirPattern, destRelPath,
+                    duplicates, unique, historicalContent);
+            fFolderMoves.add(moveInfo);
+            
+            log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
+                    + " (id " + historicalId + " exists at " + destRelPath //$NON-NLS-1$ //$NON-NLS-2$
+                    + "). " + duplicates.size() + " duplicates, " + unique.size() + " unique."); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            return false; // Not repaired yet — deferred to user
+        }
+        
+        // destDir not found (shouldn't happen) — fall through to [MERGE FIX]
+        createMergeFixFolderXml(dir, folderName != null ? folderName : dir.getName());
+        fRepairDetails.add("Created [MERGE FIX] folder for moved folder: " + dirPattern //$NON-NLS-1$
+                + " (original id " + historicalId + " exists elsewhere)"); //$NON-NLS-1$ //$NON-NLS-2$
+        log(IStatus.INFO, "[GraficoModelLoader] Folder move detected for " + relativePath //$NON-NLS-1$
+                + " (id " + historicalId + " exists elsewhere). Created [MERGE FIX] folder."); //$NON-NLS-1$ //$NON-NLS-2$
+        return true;
+    }
+    
+    /**
+     * Restore a folder.xml from historical content (no move conflict).
+     */
+    private void restoreFolderXmlFromHistory(File dir, String dirPattern, String relativePath,
+            byte[] historicalContent, String historicalId, java.util.Set<String> existingFolderIds)
+            throws IOException {
+        File folderXmlFile = new File(dir, IGraficoConstants.FOLDER_XML);
+        Files.write(folderXmlFile.toPath(), historicalContent);
+        if(historicalId != null) {
+            existingFolderIds.add(historicalId);
+        }
+        String folderName = GraficoUtils.extractNameFromFolderXml(historicalContent);
+        fRepairDetails.add("Restored folder.xml from git history: " + dirPattern //$NON-NLS-1$
+                + (folderName != null ? " (" + folderName + ")" : "")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        log(IStatus.INFO, "[GraficoModelLoader] Restored folder.xml from git history: " + relativePath); //$NON-NLS-1$
     }
     
     /**

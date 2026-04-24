@@ -218,18 +218,7 @@ public class MergeConflictHandler {
         fMoveGroups = new ArrayList<>();
         
         // Pass 1: Index folder.xml conflicts by their folder ID
-        Map<String, List<MergeObjectInfo>> folderIdToInfos = new HashMap<>();
-        
-        for(MergeObjectInfo info : fMergeObjectInfos) {
-            if(!info.isFolderXml()) {
-                continue;
-            }
-            
-            String folderId = getFolderIdFromConflict(info);
-            if(folderId != null) {
-                folderIdToInfos.computeIfAbsent(folderId, k -> new ArrayList<>()).add(info);
-            }
-        }
+        Map<String, List<MergeObjectInfo>> folderIdToInfos = indexFolderConflictsByID();
         
         // Collect all conflict folder paths (to exclude from disk scan)
         Set<String> conflictFolderPaths = new HashSet<>();
@@ -243,6 +232,38 @@ public class MergeConflictHandler {
         Set<String> processedFolderPaths = new HashSet<>();
         
         // Pass 2: Create MoveGroups from folder.xml conflicts
+        createMoveGroupsFromFolderConflicts(folderIdToInfos, conflictFolderPaths, processedFolderPaths);
+        
+        // Pass 3: Detect moves for element-only conflicts (no folder.xml in conflict list)
+        detectMovesFromElementConflicts(processedFolderPaths);
+    }
+    
+    /**
+     * Pass 1: Index all conflicting folder.xml files by their folder ID.
+     */
+    private Map<String, List<MergeObjectInfo>> indexFolderConflictsByID() {
+        Map<String, List<MergeObjectInfo>> folderIdToInfos = new HashMap<>();
+        
+        for(MergeObjectInfo info : fMergeObjectInfos) {
+            if(!info.isFolderXml()) {
+                continue;
+            }
+            
+            String folderId = getFolderIdFromConflict(info);
+            if(folderId != null) {
+                folderIdToInfos.computeIfAbsent(folderId, k -> new ArrayList<>()).add(info);
+            }
+        }
+        return folderIdToInfos;
+    }
+    
+    /**
+     * Pass 2: Create MoveGroups from paired or single folder.xml conflicts.
+     * Paired = two folder.xml conflicts share the same ID at different paths.
+     * Single = one folder.xml conflict whose ID matches a non-conflicting folder on disk.
+     */
+    private void createMoveGroupsFromFolderConflicts(Map<String, List<MergeObjectInfo>> folderIdToInfos,
+            Set<String> conflictFolderPaths, Set<String> processedFolderPaths) {
         for(Map.Entry<String, List<MergeObjectInfo>> entry : folderIdToInfos.entrySet()) {
             String folderId = entry.getKey();
             List<MergeObjectInfo> infos = entry.getValue();
@@ -289,19 +310,17 @@ public class MergeConflictHandler {
             processedFolderPaths.add(theirsFolderPath);
             buildMoveGroup(folderId, infos, oursFolderPath, theirsFolderPath);
         }
-        
-        // Pass 3: Detect moves for element-only conflicts (no folder.xml in conflict list).
-        // This happens when branch A moves a folder (git sees delete+create of folder.xml)
-        // and branch B only modifies an element inside the folder. Git auto-merges folder.xml
-        // (delete wins) but the element file conflicts. We detect this by checking if the
-        // element was resolved as moved (resolvedAsMove = true) and its containing folders
-        // differ between ours and theirs models.
+    }
+    
+    /**
+     * Pass 3: Detect moves from element-only conflicts where no folder.xml is in conflict.
+     * This happens when branch A moves a folder and branch B modifies an element inside it.
+     * Git auto-merges the folder.xml but the element file conflicts.
+     */
+    private void detectMovesFromElementConflicts(Set<String> processedFolderPaths) {
         for(MergeObjectInfo info : fMergeObjectInfos) {
-            if(info.isFolderXml() || info.isPartOfMove()) {
+            if(info.isFolderXml() || info.isPartOfMove() || !info.isResolvedAsMove()) {
                 continue;
-            }
-            if(!info.isResolvedAsMove()) {
-                continue; // Not a moved element
             }
             String folderPath = info.getFolderPath();
             if(processedFolderPaths.contains(folderPath)) {
@@ -309,14 +328,13 @@ public class MergeConflictHandler {
             }
             
             // The element exists in both models (after resolveMovedObject).
-            // Find the folder ID from the ours model (the element's parent folder at the old path).
             EObject oursElement = info.getEObject(MergeObjectInfo.OURS);
             EObject theirsElement = info.getEObject(MergeObjectInfo.THEIRS);
             if(oursElement == null || theirsElement == null) {
                 continue;
             }
             
-            // Get containing folders from both models
+            // Get containing folders from both models — must be same folder ID
             EObject oursContainer = oursElement.eContainer();
             EObject theirsContainer = theirsElement.eContainer();
             if(!(oursContainer instanceof IFolder) || !(theirsContainer instanceof IFolder)) {
@@ -330,7 +348,6 @@ public class MergeConflictHandler {
             }
             
             // Same folder ID at different paths = folder move.
-            // Find the theirs folder path on disk.
             Set<String> exclude = new HashSet<>();
             exclude.add(folderPath);
             exclude.addAll(processedFolderPaths);
@@ -340,21 +357,16 @@ public class MergeConflictHandler {
             }
             
             // Determine which side is the mover.
-            // oursFolderPath = old location (conflict path), theirsFolderPath = new location (disk).
-            // Check if OURS has content at the conflict path - if not, OURS is the mover.
             byte[] headContent = null;
             try {
                 headContent = fArchiRepo.getFileContents(info.getXMLPath(), getLocalRef());
             } catch(IOException e) { /* Fall through */ }
             boolean oursIsTheMover = (headContent == null);
             
-            String oursFP = folderPath;
-            String theirsFP = otherPath;
+            processedFolderPaths.add(folderPath);
+            processedFolderPaths.add(otherPath);
             
-            processedFolderPaths.add(oursFP);
-            processedFolderPaths.add(theirsFP);
-            
-            buildMoveGroup(folderId, new ArrayList<>(), oursFP, theirsFP, oursIsTheMover);
+            buildMoveGroup(folderId, new ArrayList<>(), folderPath, otherPath, oursIsTheMover);
         }
     }
     
@@ -504,43 +516,18 @@ public class MergeConflictHandler {
      */
     public void merge() throws IOException, GitAPIException {
         long mergeStart = System.nanoTime();
+        
+        // Categorize conflict infos by resolution type
         List<String> ours = new ArrayList<>();
         List<String> theirs = new ArrayList<>();
-        // resolvedAsMove elements: one side modified, the other moved to a
-        // different folder. Git sees delete+modify → conflict at the OLD path.
-        // The element also exists at the NEW path (auto-merged by git).
-        // We must: (1) resolve the git conflict at the old path,
-        //          (2) apply the user's content choice at the new path,
-        //          (3) git-add both paths so the index is clean.
         List<MergeObjectInfo> moveResolvedInfos = new ArrayList<>();
-        
-        for(MergeObjectInfo info : getMergeObjectInfos()) {
-            // Move group items are handled by consolidateMoveGroups()
-            if(info.isPartOfMove()) {
-                continue;
-            }
-            
-            if(info.isResolvedAsMove()) {
-                moveResolvedInfos.add(info);
-                log(IStatus.INFO, "[MergeConflictHandler] merge() resolvedAsMove: " + info.getXMLPath() //$NON-NLS-1$
-                        + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-                continue;
-            }
-            
-            // Ours
-            if(info.getUserChoice() == MergeObjectInfo.OURS) {
-                ours.add(info.getXMLPath());
-            }
-            // Theirs
-            else {
-                theirs.add(info.getXMLPath());
-            }
-        }
+        categorizeConflictChoices(ours, theirs, moveResolvedInfos);
         
         log(IStatus.INFO, "[MergeConflictHandler] merge() checkout: ours=" + ours.size() + ", theirs=" + theirs.size() //$NON-NLS-1$ //$NON-NLS-2$
                 + ", moveResolved=" + moveResolvedInfos.size() //$NON-NLS-1$
                 + ", moveGroupItems=" + getMergeObjectInfos().stream().filter(MergeObjectInfo::isPartOfMove).count()); //$NON-NLS-1$
         
+        // Apply checkouts and resolve move-resolved elements
         long t = System.nanoTime();
         try(Git git = Git.open(fArchiRepo.getLocalRepositoryFolder())) {
             if(!ours.isEmpty()) {
@@ -549,21 +536,49 @@ public class MergeConflictHandler {
             if(!theirs.isEmpty()) {
                 checkout(git, Stage.THEIRS, theirs);
             }
-            
-            // Handle move-resolved elements: resolve conflict + apply content at new path
             if(!moveResolvedInfos.isEmpty()) {
                 resolveMoveResolvedElements(git, moveResolvedInfos);
             }
         }
         log(IStatus.INFO, "[MergeConflictHandler] merge() checkout done: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
-        // Consolidate move groups: resolve chosen-path conflicts, move unique
-        // elements from unchosen to chosen path, delete unchosen path, stage all.
+        // Consolidate move groups
         t = System.nanoTime();
         consolidateMoveGroups();
         log(IStatus.INFO, "[MergeConflictHandler] merge() consolidateMoveGroups done: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
-        // Log git status after merge
+        logGitStatusAfterMerge();
+        log(IStatus.INFO, "[MergeConflictHandler] merge() total: " + (System.nanoTime() - mergeStart) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+    
+    /**
+     * Categorize conflict choices into ours/theirs checkout lists and move-resolved list.
+     * Move group items are skipped (handled by consolidateMoveGroups).
+     */
+    private void categorizeConflictChoices(List<String> ours, List<String> theirs,
+            List<MergeObjectInfo> moveResolvedInfos) {
+        for(MergeObjectInfo info : getMergeObjectInfos()) {
+            if(info.isPartOfMove()) {
+                continue;
+            }
+            if(info.isResolvedAsMove()) {
+                moveResolvedInfos.add(info);
+                log(IStatus.INFO, "[MergeConflictHandler] merge() resolvedAsMove: " + info.getXMLPath() //$NON-NLS-1$
+                        + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                continue;
+            }
+            if(info.getUserChoice() == MergeObjectInfo.OURS) {
+                ours.add(info.getXMLPath());
+            } else {
+                theirs.add(info.getXMLPath());
+            }
+        }
+    }
+    
+    /**
+     * Log git status after merge for diagnostics.
+     */
+    private void logGitStatusAfterMerge() throws IOException, GitAPIException {
         try(Git git = Git.open(fArchiRepo.getLocalRepositoryFolder())) {
             org.eclipse.jgit.api.Status gitStatus = git.status().call();
             log(IStatus.INFO, "[MergeConflictHandler] merge() git status: clean=" + gitStatus.isClean() //$NON-NLS-1$
@@ -577,10 +592,7 @@ public class MergeConflictHandler {
                 log(IStatus.WARNING, "[MergeConflictHandler] STILL CONFLICTING: " + gitStatus.getConflicting()); //$NON-NLS-1$
             }
         }
-        
-        log(IStatus.INFO, "[MergeConflictHandler] merge() total: " + (System.nanoTime() - mergeStart) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
     }
-    
     /**
      * Handle resolvedAsMove elements that are NOT part of a MoveGroup.
      * These are elements that moved between different folders (different folder IDs),
@@ -602,68 +614,7 @@ public class MergeConflictHandler {
         Set<String> pathsToAdd = new LinkedHashSet<>();
         
         for(MergeObjectInfo info : infos) {
-            String oldXmlPath = info.getXMLPath(); // conflict path (old location)
-            File oldFile = new File(repoRoot, oldXmlPath);
-            
-            // Determine which side has content at the conflict path
-            byte[] headContent = null;
-            try {
-                headContent = fArchiRepo.getFileContents(oldXmlPath, getLocalRef());
-            } catch(IOException e) { /* Fall through */ }
-            
-            // Checkout the stage that has content to get a clean file
-            Stage resolveStage = (headContent != null) ? Stage.OURS : Stage.THEIRS;
-            checkout(git, resolveStage, List.of(oldXmlPath));
-            
-            // Find the new path: the element in the model that MOVED it
-            // If OURS has content at old path → THEIRS moved it → new path from theirModel
-            // If THEIRS has content at old path → OURS moved it → new path from ourModel
-            EObject movedElement;
-            if(headContent != null) {
-                // OURS modified here, THEIRS moved → find in theirModel
-                movedElement = info.getEObject(MergeObjectInfo.THEIRS);
-            } else {
-                // THEIRS modified here, OURS moved → find in ourModel
-                movedElement = info.getEObject(MergeObjectInfo.OURS);
-            }
-            
-            String newXmlPath = computeGraficoPath(movedElement);
-            File newFile = (newXmlPath != null) ? new File(repoRoot, newXmlPath) : null;
-            
-            log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: " + oldXmlPath //$NON-NLS-1$
-                    + " → " + newXmlPath //$NON-NLS-1$
-                    + ", resolveStage=" + resolveStage //$NON-NLS-1$
-                    + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            
-            if(newFile != null && !oldXmlPath.equals(newXmlPath)) {
-                // Determine if user wants the modifier's content or the mover's version
-                boolean userWantsModifierContent;
-                if(headContent != null) {
-                    // OURS modified, THEIRS moved. OURS = modifier.
-                    userWantsModifierContent = (info.getUserChoice() == MergeObjectInfo.OURS);
-                } else {
-                    // THEIRS modified, OURS moved. THEIRS = modifier.
-                    userWantsModifierContent = (info.getUserChoice() == MergeObjectInfo.THEIRS);
-                }
-                
-                if(userWantsModifierContent) {
-                    // Copy modifier's content from old path to new path
-                    newFile.getParentFile().mkdirs();
-                    Files.copy(oldFile.toPath(), newFile.toPath(),
-                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                }
-                // else: new path already has the mover's content (auto-merged)
-                
-                // Delete old file (the element moved away)
-                oldFile.delete();
-                
-                // Stage specific files only (not whole directories)
-                pathsToAdd.add(oldXmlPath);
-                pathsToAdd.add(newXmlPath);
-            } else {
-                // Can't determine new path — just stage old path to resolve conflict
-                pathsToAdd.add(oldXmlPath);
-            }
+            resolveSingleMoveResolvedElement(git, repoRoot, info, pathsToAdd);
         }
         
         // Git-add all affected paths to resolve conflicts in the index
@@ -671,6 +622,78 @@ public class MergeConflictHandler {
             log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: staging " + pathsToAdd.size() + " paths: " + pathsToAdd); //$NON-NLS-1$ //$NON-NLS-2$
             stagePathsWithJGit(git, pathsToAdd);
         }
+    }
+    
+    /**
+     * Resolve a single move-resolved element: checkout the correct stage,
+     * compute the new path, apply content choice, and collect paths to stage.
+     */
+    private void resolveSingleMoveResolvedElement(Git git, File repoRoot, MergeObjectInfo info,
+            Set<String> pathsToAdd) throws IOException, GitAPIException {
+        String oldXmlPath = info.getXMLPath();
+        File oldFile = new File(repoRoot, oldXmlPath);
+        
+        // Determine which side has content at the conflict path
+        boolean oursHasContent = hasContentAtRef(oldXmlPath, getLocalRef());
+        
+        // Checkout the stage that has content to get a clean file
+        Stage resolveStage = oursHasContent ? Stage.OURS : Stage.THEIRS;
+        checkout(git, resolveStage, List.of(oldXmlPath));
+        
+        // Find the new path from the model that MOVED the element
+        EObject movedElement = oursHasContent
+                ? info.getEObject(MergeObjectInfo.THEIRS)   // OURS modified, THEIRS moved
+                : info.getEObject(MergeObjectInfo.OURS);    // THEIRS modified, OURS moved
+        
+        String newXmlPath = computeGraficoPath(movedElement);
+        File newFile = (newXmlPath != null) ? new File(repoRoot, newXmlPath) : null;
+        
+        log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: " + oldXmlPath //$NON-NLS-1$
+                + " → " + newXmlPath //$NON-NLS-1$
+                + ", resolveStage=" + resolveStage //$NON-NLS-1$
+                + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        
+        if(newFile != null && !oldXmlPath.equals(newXmlPath)) {
+            applyMoveResolvedContentChoice(oldFile, newFile, info, oursHasContent);
+            pathsToAdd.add(oldXmlPath);
+            pathsToAdd.add(newXmlPath);
+        } else {
+            // Can't determine new path — just stage old path to resolve conflict
+            pathsToAdd.add(oldXmlPath);
+        }
+    }
+    
+    /**
+     * Check whether the repository has file content at a given ref.
+     */
+    private boolean hasContentAtRef(String xmlPath, String ref) {
+        try {
+            byte[] content = fArchiRepo.getFileContents(xmlPath, ref);
+            return content != null;
+        } catch(IOException e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Apply the user's content choice for a move-resolved element:
+     * copy modifier's content to new path if chosen, then delete old file.
+     */
+    private void applyMoveResolvedContentChoice(File oldFile, File newFile,
+            MergeObjectInfo info, boolean oursHasContent) throws IOException {
+        // Determine if user wants the modifier's content
+        boolean userWantsModifierContent = oursHasContent
+                ? (info.getUserChoice() == MergeObjectInfo.OURS)    // OURS = modifier
+                : (info.getUserChoice() == MergeObjectInfo.THEIRS); // THEIRS = modifier
+        
+        if(userWantsModifierContent) {
+            newFile.getParentFile().mkdirs();
+            Files.copy(oldFile.toPath(), newFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+        // else: new path already has the mover's content (auto-merged)
+        
+        oldFile.delete();
     }
     
     /**
@@ -736,149 +759,182 @@ public class MergeConflictHandler {
         File repoRoot = fArchiRepo.getLocalRepositoryFolder();
         
         for(MoveGroup group : fMoveGroups) {
-            int locChoice = group.locationChoice;
-            
-            String chosenPath = (locChoice == MergeObjectInfo.OURS)
-                    ? group.oursFolderPath : group.theirsFolderPath;
-            String unchosenPath = (locChoice == MergeObjectInfo.OURS)
-                    ? group.theirsFolderPath : group.oursFolderPath;
-            
-            log(IStatus.INFO, "[MergeConflictHandler] consolidate group '" + group.folderName //$NON-NLS-1$
-                    + "': choice=" + (locChoice == MergeObjectInfo.OURS ? "OURS" : "THEIRS") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-                    + ", chosen=" + chosenPath + ", unchosen=" + unchosenPath //$NON-NLS-1$ //$NON-NLS-2$
-                    + ", relatedInfos=" + group.relatedInfos.size() //$NON-NLS-1$
-                    + ", folderInfos=" + group.folderInfos.size()); //$NON-NLS-1$
-            
-            File chosenDir = new File(repoRoot, chosenPath);
-            File unchosenDir = new File(repoRoot, unchosenPath);
-            chosenDir.mkdirs();
-            
-            // Build set of conflicting element filenames at the unchosen path for
-            // targeted handling (these need content resolution, not just move/delete).
-            Map<String, MergeObjectInfo> unchosenConflictElements = new HashMap<>();
-            for(MergeObjectInfo info : group.relatedInfos) {
-                if(info.isFolderXml()) continue;
-                if(info.getFolderPath().equals(unchosenPath)) {
-                    String filename = info.getXMLPath()
-                            .substring(info.getXMLPath().lastIndexOf('/') + 1);
-                    unchosenConflictElements.put(filename, info);
-                }
-            }
-            
-            // 1. Resolve conflict markers on folder.xml at unchosen path so we can delete cleanly
-            //    Checkout OURS stage (which has content at the old path).
-            List<String> folderConflictsToResolve = new ArrayList<>();
-            for(MergeObjectInfo info : group.folderInfos) {
-                if(info.getFolderPath().equals(unchosenPath)) {
-                    folderConflictsToResolve.add(info.getXMLPath());
-                }
-            }
-            
-            // 2. For each conflicting element at the unchosen path, resolve based on
-            //    the user's per-element content choice.
-            List<String> oursCheckoutPaths = new ArrayList<>(folderConflictsToResolve);
-            for(Map.Entry<String, MergeObjectInfo> entry : unchosenConflictElements.entrySet()) {
-                MergeObjectInfo info = entry.getValue();
-                // Always checkout OURS stage to get clean content at the unchosen path.
-                // The unchosen path is where OURS has real content (theirs deleted it there).
-                oursCheckoutPaths.add(info.getXMLPath());
-            }
-            if(!oursCheckoutPaths.isEmpty()) {
-                try(Git git = Git.open(repoRoot)) {
-                    // Determine which git stage has content at the unchosen path.
-                    // Normally OURS stage has content at oursFolderPath, but when
-                    // OURS is the mover, THEIRS has content there instead.
-                    boolean oursStageAtUnchosen = unchosenPath.equals(group.oursFolderPath);
-                    if(group.oursIsTheMover) {
-                        oursStageAtUnchosen = !oursStageAtUnchosen;
-                    }
-                    Stage stage = oursStageAtUnchosen ? Stage.OURS : Stage.THEIRS;
-                    checkout(git, stage, oursCheckoutPaths);
-                }
-            }
-            
-            // 3. Resolve conflict markers on chosen-path conflict files
-            List<String> chosenConflicts = new ArrayList<>();
-            for(MergeObjectInfo info : group.relatedInfos) {
-                if(info.getFolderPath().equals(chosenPath)) {
-                    Stage stage = (info.getUserChoice() == MergeObjectInfo.OURS)
-                            ? Stage.OURS : Stage.THEIRS;
-                    chosenConflicts.add(info.getXMLPath());
-                }
-            }
-            if(!chosenConflicts.isEmpty()) {
-                try(Git git = Git.open(repoRoot)) {
-                    // Resolve per user choice - but all at once per stage
-                    List<String> oursAtChosen = new ArrayList<>();
-                    List<String> theirsAtChosen = new ArrayList<>();
-                    for(MergeObjectInfo info : group.relatedInfos) {
-                        if(!info.getFolderPath().equals(chosenPath)) continue;
-                        if(info.getUserChoice() == MergeObjectInfo.OURS) {
-                            oursAtChosen.add(info.getXMLPath());
-                        } else {
-                            theirsAtChosen.add(info.getXMLPath());
-                        }
-                    }
-                    if(!oursAtChosen.isEmpty()) {
-                        checkout(git, Stage.OURS, oursAtChosen);
-                    }
-                    if(!theirsAtChosen.isEmpty()) {
-                        checkout(git, Stage.THEIRS, theirsAtChosen);
-                    }
-                }
-            }
-            
-            // 4. Handle files at the unchosen path
-            if(unchosenDir.isDirectory()) {
-                File[] xmlFiles = unchosenDir.listFiles(
-                        (d, name) -> name.endsWith(".xml")); //$NON-NLS-1$
-                if(xmlFiles != null) {
-                    for(File f : xmlFiles) {
-                        if(IGraficoConstants.FOLDER_XML.equals(f.getName())) {
-                            f.delete(); // Remove unchosen folder.xml
-                            continue;
-                        }
-                        
-                        File dest = new File(chosenDir, f.getName());
-                        MergeObjectInfo conflictInfo = unchosenConflictElements.get(f.getName());
-                        
-                        if(conflictInfo != null) {
-                            // Determine which side's content is at the unchosen path (resolved in step 2).
-                            // Normally the unchosen path has OURS content; when OURS moved, it has THEIRS.
-                            int contentAtUnchosen = group.oursIsTheMover
-                                    ? MergeObjectInfo.THEIRS : MergeObjectInfo.OURS;
-                            if(conflictInfo.getUserChoice() == contentAtUnchosen) {
-                                // User wants the content version that's at the unchosen path.
-                                // Overwrite the auto-merged copy at the chosen path.
-                                Files.copy(f.toPath(), dest.toPath(),
-                                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                            }
-                            // Otherwise: dest already has the correct content.
-                            f.delete();
-                        }
-                        else if(!dest.exists()) {
-                            // Non-conflicting unique element — move to chosen path
-                            Files.move(f.toPath(), dest.toPath());
-                        }
-                        else {
-                            // Non-conflicting duplicate — just delete
-                            f.delete();
-                        }
-                    }
-                }
-                
-                // 5. Delete unchosen directory if now empty
-                deleteDirectoryIfEmpty(unchosenDir);
-            }
+            consolidateSingleMoveGroup(repoRoot, group);
         }
         
         // 6. Stage all changes (new, modified, deleted) in affected directories only
+        stageMoveGroupPaths(repoRoot);
+    }
+    
+    /**
+     * Consolidate a single move group: resolve conflicts at both paths,
+     * move unique elements to the chosen path, and clean up the unchosen path.
+     */
+    private void consolidateSingleMoveGroup(File repoRoot, MoveGroup group) throws IOException, GitAPIException {
+        int locChoice = group.locationChoice;
+        
+        String chosenPath = (locChoice == MergeObjectInfo.OURS)
+                ? group.oursFolderPath : group.theirsFolderPath;
+        String unchosenPath = (locChoice == MergeObjectInfo.OURS)
+                ? group.theirsFolderPath : group.oursFolderPath;
+        
+        log(IStatus.INFO, "[MergeConflictHandler] consolidate group '" + group.folderName //$NON-NLS-1$
+                + "': choice=" + (locChoice == MergeObjectInfo.OURS ? "OURS" : "THEIRS") //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                + ", chosen=" + chosenPath + ", unchosen=" + unchosenPath //$NON-NLS-1$ //$NON-NLS-2$
+                + ", relatedInfos=" + group.relatedInfos.size() //$NON-NLS-1$
+                + ", folderInfos=" + group.folderInfos.size()); //$NON-NLS-1$
+        
+        File chosenDir = new File(repoRoot, chosenPath);
+        File unchosenDir = new File(repoRoot, unchosenPath);
+        chosenDir.mkdirs();
+        
+        // Build set of conflicting element filenames at the unchosen path
+        Map<String, MergeObjectInfo> unchosenConflictElements = collectUnchosenConflictElements(group, unchosenPath);
+        
+        // 1-2. Resolve conflict markers at the unchosen path
+        resolveConflictsAtUnchosenPath(repoRoot, group, unchosenPath, unchosenConflictElements);
+        
+        // 3. Resolve conflict markers at the chosen path per user choice
+        resolveConflictsAtChosenPath(repoRoot, group, chosenPath);
+        
+        // 4. Handle files at the unchosen path: move/copy/delete
+        migrateFilesFromUnchosenPath(unchosenDir, chosenDir, unchosenConflictElements, group);
+        
+        // 5. Delete unchosen directory if now empty
+        deleteDirectoryIfEmpty(unchosenDir);
+    }
+    
+    /**
+     * Build a map of filename → MergeObjectInfo for conflicting elements at the unchosen path.
+     */
+    private Map<String, MergeObjectInfo> collectUnchosenConflictElements(MoveGroup group, String unchosenPath) {
+        Map<String, MergeObjectInfo> result = new HashMap<>();
+        for(MergeObjectInfo info : group.relatedInfos) {
+            if(info.isFolderXml()) continue;
+            if(info.getFolderPath().equals(unchosenPath)) {
+                String filename = info.getXMLPath()
+                        .substring(info.getXMLPath().lastIndexOf('/') + 1);
+                result.put(filename, info);
+            }
+        }
+        return result;
+    }
+    
+    /**
+     * Resolve conflict markers at the unchosen path: checkout the correct git stage
+     * for folder.xml and all conflicting elements.
+     */
+    private void resolveConflictsAtUnchosenPath(File repoRoot, MoveGroup group, String unchosenPath,
+            Map<String, MergeObjectInfo> unchosenConflictElements) throws IOException, GitAPIException {
+        // Folder.xml conflicts at the unchosen path
+        List<String> pathsToResolve = new ArrayList<>();
+        for(MergeObjectInfo info : group.folderInfos) {
+            if(info.getFolderPath().equals(unchosenPath)) {
+                pathsToResolve.add(info.getXMLPath());
+            }
+        }
+        
+        // Element conflicts at the unchosen path
+        for(Map.Entry<String, MergeObjectInfo> entry : unchosenConflictElements.entrySet()) {
+            pathsToResolve.add(entry.getValue().getXMLPath());
+        }
+        
+        if(!pathsToResolve.isEmpty()) {
+            try(Git git = Git.open(repoRoot)) {
+                // Determine which git stage has content at the unchosen path.
+                boolean oursStageAtUnchosen = unchosenPath.equals(group.oursFolderPath);
+                if(group.oursIsTheMover) {
+                    oursStageAtUnchosen = !oursStageAtUnchosen;
+                }
+                Stage stage = oursStageAtUnchosen ? Stage.OURS : Stage.THEIRS;
+                checkout(git, stage, pathsToResolve);
+            }
+        }
+    }
+    
+    /**
+     * Resolve conflict markers at the chosen path: checkout per user's content choice.
+     */
+    private void resolveConflictsAtChosenPath(File repoRoot, MoveGroup group, String chosenPath)
+            throws IOException, GitAPIException {
+        List<String> oursAtChosen = new ArrayList<>();
+        List<String> theirsAtChosen = new ArrayList<>();
+        
+        for(MergeObjectInfo info : group.relatedInfos) {
+            if(!info.getFolderPath().equals(chosenPath)) continue;
+            if(info.getUserChoice() == MergeObjectInfo.OURS) {
+                oursAtChosen.add(info.getXMLPath());
+            } else {
+                theirsAtChosen.add(info.getXMLPath());
+            }
+        }
+        
+        if(!oursAtChosen.isEmpty() || !theirsAtChosen.isEmpty()) {
+            try(Git git = Git.open(repoRoot)) {
+                if(!oursAtChosen.isEmpty()) {
+                    checkout(git, Stage.OURS, oursAtChosen);
+                }
+                if(!theirsAtChosen.isEmpty()) {
+                    checkout(git, Stage.THEIRS, theirsAtChosen);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Migrate files from the unchosen directory to the chosen directory.
+     * Conflicting elements use the content the user chose; non-conflicting
+     * unique elements are moved; duplicates are deleted.
+     */
+    private void migrateFilesFromUnchosenPath(File unchosenDir, File chosenDir,
+            Map<String, MergeObjectInfo> unchosenConflictElements, MoveGroup group) throws IOException {
+        if(!unchosenDir.isDirectory()) return;
+        
+        File[] xmlFiles = unchosenDir.listFiles(
+                (d, name) -> name.endsWith(".xml")); //$NON-NLS-1$
+        if(xmlFiles == null) return;
+        
+        for(File f : xmlFiles) {
+            if(IGraficoConstants.FOLDER_XML.equals(f.getName())) {
+                f.delete(); // Remove unchosen folder.xml
+                continue;
+            }
+            
+            File dest = new File(chosenDir, f.getName());
+            MergeObjectInfo conflictInfo = unchosenConflictElements.get(f.getName());
+            
+            if(conflictInfo != null) {
+                // Determine which side's content is at the unchosen path (resolved in step 2).
+                int contentAtUnchosen = group.oursIsTheMover
+                        ? MergeObjectInfo.THEIRS : MergeObjectInfo.OURS;
+                if(conflictInfo.getUserChoice() == contentAtUnchosen) {
+                    // User wants the content version that's at the unchosen path.
+                    Files.copy(f.toPath(), dest.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                f.delete();
+            }
+            else if(!dest.exists()) {
+                // Non-conflicting unique element — move to chosen path
+                Files.move(f.toPath(), dest.toPath());
+            }
+            else {
+                // Non-conflicting duplicate — just delete
+                f.delete();
+            }
+        }
+    }
+    
+    /**
+     * Stage all affected paths from all move groups via native git or JGit fallback.
+     */
+    private void stageMoveGroupPaths(File repoRoot) throws IOException, GitAPIException {
         Set<String> affectedPaths = new LinkedHashSet<>();
         for(MoveGroup group : fMoveGroups) {
-            int locChoice2 = group.locationChoice;
-            affectedPaths.add((locChoice2 == MergeObjectInfo.OURS)
+            int locChoice = group.locationChoice;
+            affectedPaths.add((locChoice == MergeObjectInfo.OURS)
                     ? group.oursFolderPath : group.theirsFolderPath);
-            affectedPaths.add((locChoice2 == MergeObjectInfo.OURS)
+            affectedPaths.add((locChoice == MergeObjectInfo.OURS)
                     ? group.theirsFolderPath : group.oursFolderPath);
         }
         
@@ -886,7 +942,6 @@ public class MergeConflictHandler {
                 + " affected path(s): " + affectedPaths); //$NON-NLS-1$
         
         if(!tryNativeGitAdd(repoRoot, affectedPaths)) {
-            // Fall back to JGit with targeted paths
             try(Git git = Git.open(repoRoot)) {
                 stagePathsWithJGit(git, affectedPaths);
             }
