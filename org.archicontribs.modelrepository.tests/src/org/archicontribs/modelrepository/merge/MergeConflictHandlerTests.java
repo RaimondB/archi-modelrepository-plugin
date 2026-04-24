@@ -16,7 +16,9 @@ import java.nio.file.Files;
 
 import org.archicontribs.modelrepository.GitHelper;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
+import org.archicontribs.modelrepository.grafico.FolderMoveInfo;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
+import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.MergeCommand;
@@ -27,7 +29,6 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import com.archimatetool.editor.utils.FileUtils;
@@ -1200,7 +1201,6 @@ public class MergeConflictHandlerTests {
      *
      * Expected: at chosen location, deleted element should NOT appear.
      */
-    @Disabled("Cross-path deletion detection not yet implemented")
     @Test
     public void merge_B4_FolderMovedAndElementDeleted() throws Exception {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b4DeleteRepo");
@@ -1256,6 +1256,10 @@ public class MergeConflictHandlerTests {
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: delete R").call();
 
+                // Save pre-merge commit IDs for cross-path detection
+                ObjectId oursId = gitRepo.resolve("branchB");
+                ObjectId theirsId = gitRepo.resolve("branchA");
+
                 // Merge
                 MergeResult mergeResult = git.merge()
                         .include(gitRepo.resolve("branchA"))
@@ -1284,6 +1288,9 @@ public class MergeConflictHandlerTests {
                     }
                     handler.merge();
                 }
+
+                // Cross-path deletion detection (Phase 1.5)
+                MergeConflictHandler.detectAndRemoveCrossPathDeletions(gitRepo, oursId, theirsId);
 
                 // Q should be at new location
                 assertTrue(new File(resultDir, "BusinessActor_id-q.xml").exists(),
@@ -1879,6 +1886,652 @@ public class MergeConflictHandlerTests {
                         "R should NOT remain at old folderX");
                 assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
                         "Q should NOT remain at old folderX");
+            }
+        }
+    }
+
+    // ========================================================================
+    // D1: Conflicts AND orphaned dirs (Phase 1 + Phase 2 integration)
+    // ========================================================================
+
+    /**
+     * D1: Branch A moves folderX → folderZ/folderX (same ID, conflict path).
+     * Both branches add independent elements in folderY (clean merge path).
+     * Branch B also modifies Q at old folderX location (creating conflict).
+     *
+     * Phase 1: MergeConflictHandler resolves folderX conflict (folder move).
+     * Phase 2: GraficoModelLoader.repairMissingFolderXml() handles any remaining
+     * orphaned dirs from the clean merge path.
+     *
+     * This is the ONLY test exercising both phases in sequence.
+     */
+    @Test
+    public void merge_D1_ConflictsAndOrphanedDirs() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "d1IntegrationRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+            File folderY = new File(bizDir, "folderY");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            mkdirAndWrite(folderY, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
+            Files.writeString(new File(folderY, "BusinessActor_id-s.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"S\" id=\"id-s\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with Q, folderY with S").call();
+
+                // Branch A: move folderX → folderZ/folderX (same ID) + add T in folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                File folderZ = new File(bizDir, "folderZ");
+                File movedFolderX = new File(folderZ, "folderX");
+                mkdirAndWrite(folderZ, "folder.xml",
+                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
+                mkdirAndWrite(movedFolderX, "folder.xml",
+                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+                Files.writeString(new File(movedFolderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                // Delete at old location
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                // Add T in folderY
+                Files.writeString(new File(folderY, "BusinessRole_id-t.xml").toPath(),
+                        "<archimate:BusinessRole " + NS + " name=\"T\" id=\"id-t\"/>\n");
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move folderX to folderZ, add T in folderY").call();
+
+                // Branch B: modify Q at old folderX + add U in folderY
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q-B\" id=\"id-q\"/>\n");
+                Files.writeString(new File(folderY, "BusinessRole_id-u.xml").toPath(),
+                        "<archimate:BusinessRole " + NS + " name=\"U\" id=\"id-u\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: modify Q, add U in folderY").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                File resultDir = new File(bizDir, "folderZ/folderX");
+
+                // === Phase 1: Handle conflicts ===
+                if(mergeResult.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
+                    IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                    IArchimateModel theirModel;
+                    ObjectId branchAId = gitRepo.resolve("branchA");
+                    try(RevWalk rw = new RevWalk(gitRepo)) {
+                        RevCommit branchACommit = rw.parseCommit(branchAId);
+                        theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                                .importFromCommit(null);
+                    }
+                    IArchiRepository repo = new ArchiRepository(repoFolder);
+                    MergeConflictHandler handler = new MergeConflictHandler(
+                            mergeResult, "branchA", repo, null);
+                    handler.init(null, ourModel, theirModel);
+
+                    // Choose new location for folder move
+                    if(handler.hasMoveGroups()) {
+                        for(MergeConflictHandler.MoveGroup group : handler.getMoveGroups()) {
+                            group.locationChoice = MergeObjectInfo.THEIRS;
+                        }
+                    }
+                    // Accept OURS content (B's modifications) for elements
+                    for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                        if(!info.isFolderXml()) {
+                            info.setUserChoice(MergeObjectInfo.OURS);
+                        }
+                    }
+                    handler.merge();
+                }
+
+                // === Phase 2: Repair any remaining orphans ===
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                GraficoModelLoader loader = new GraficoModelLoader(repo, true);
+                loader.repairMissingFolderXml();
+
+                // Apply any pending folder moves with defaults
+                if(loader.hasPendingFolderMoves()) {
+                    for(FolderMoveInfo moveInfo : loader.getFolderMoves()) {
+                        moveInfo.setUserChoice(FolderMoveInfo.KEEP_NEW_LOCATION);
+                    }
+                    loader.applyFolderMoveResolutions();
+                }
+
+                // === Assertions: no data loss ===
+
+                // Q should be at new location with B's content
+                File qFile = new File(resultDir, "BusinessActor_id-q.xml");
+                assertTrue(qFile.exists(),
+                        "Q should be at folderZ/folderX (moved by A)");
+                String qContent = Files.readString(qFile.toPath());
+                assertTrue(qContent.contains("name=\"Q-B\""),
+                        "Q should have B's content 'Q-B', got: " + qContent);
+
+                // S should still be in folderY (untouched)
+                assertTrue(new File(folderY, "BusinessActor_id-s.xml").exists(),
+                        "S should remain in folderY (untouched)");
+
+                // T (added by A in folderY) should be present
+                assertTrue(new File(folderY, "BusinessRole_id-t.xml").exists(),
+                        "T should be in folderY (added by A)");
+
+                // U (added by B in folderY) should be present
+                assertTrue(new File(folderY, "BusinessRole_id-u.xml").exists(),
+                        "U should be in folderY (added by B)");
+
+                // Old folderX should be cleaned up
+                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT remain at old folderX");
+            }
+        }
+    }
+
+    // ========================================================================
+    // E6: Folder delete vs element modify
+    // ========================================================================
+
+    /**
+     * E6: Branch A deletes entire folderX (folder.xml + all elements).
+     * Branch B modifies element Q inside folderX.
+     * User chooses OURS (keep B's modified version).
+     *
+     * Expected: folderX restored with Q having B's content.
+     * R is gone (A deleted entire folder, B never touched R).
+     */
+    @Test
+    public void merge_E6_FolderDeleteVsElementModify_KeepModified() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "e6FolderDeleteRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
+                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with Q and R").call();
+
+                // Branch A: delete entire folderX
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "BusinessRole_id-r.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: delete entire folderX").call();
+
+                // Branch B: modify Q (rename to Q-modified)
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: rename Q to Q-modified").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                        "Should conflict (A deleted folder+Q, B modified Q)");
+
+                IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                IArchimateModel theirModel;
+                ObjectId branchAId = gitRepo.resolve("branchA");
+                try(RevWalk rw = new RevWalk(gitRepo)) {
+                    RevCommit branchACommit = rw.parseCommit(branchAId);
+                    theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                            .importFromCommit(null);
+                }
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                MergeConflictHandler handler = new MergeConflictHandler(
+                        mergeResult, "branchA", repo, null);
+                handler.init(null, ourModel, theirModel);
+
+                // User chooses OURS (keep B's modified version)
+                for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                    info.setUserChoice(MergeObjectInfo.OURS);
+                }
+                handler.merge();
+
+                // Q should exist with B's modified content
+                File qFile = new File(folderX, "BusinessActor_id-q.xml");
+                assertTrue(qFile.exists(), "Q should exist (user chose to keep B's version)");
+                String content = Files.readString(qFile.toPath());
+                assertTrue(content.contains("name=\"Q-modified\""),
+                        "Q should have B's renamed content 'Q-modified', got: " + content);
+
+                // folder.xml was auto-deleted by git (not conflicting — A deleted, B never touched).
+                // Phase 2 repair restores it for the surviving element.
+                IArchiRepository repo2 = new ArchiRepository(repoFolder);
+                GraficoModelLoader loader = new GraficoModelLoader(repo2, true);
+                loader.repairMissingFolderXml();
+
+                assertTrue(new File(folderX, "folder.xml").exists(),
+                        "folder.xml should be restored by Phase 2 repair");
+            }
+        }
+    }
+
+    /**
+     * E6 variant: User chooses THEIRS (accept deletion).
+     *
+     * Expected: folderX and Q both gone.
+     *
+     * Known gap: the handler uses git checkout --theirs, but stage 3 (theirs)
+     * doesn't exist for a deleted file. The checkout silently does nothing,
+     * leaving Q on disk. The handler needs explicit file deletion support
+     * for "resolve conflict to deleted" scenarios.
+     */
+    @Test
+    public void merge_E6_FolderDeleteVsElementModify_AcceptDelete() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "e6FolderDeleteAcceptRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
+                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with Q and R").call();
+
+                // Branch A: delete entire folderX
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                new File(folderX, "BusinessRole_id-r.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: delete entire folderX").call();
+
+                // Branch B: modify Q (rename to Q-modified)
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: rename Q to Q-modified").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                        "Should conflict (A deleted folder+Q, B modified Q)");
+
+                IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                IArchimateModel theirModel;
+                ObjectId branchAId = gitRepo.resolve("branchA");
+                try(RevWalk rw = new RevWalk(gitRepo)) {
+                    RevCommit branchACommit = rw.parseCommit(branchAId);
+                    theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                            .importFromCommit(null);
+                }
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                MergeConflictHandler handler = new MergeConflictHandler(
+                        mergeResult, "branchA", repo, null);
+                handler.init(null, ourModel, theirModel);
+
+                // User chooses THEIRS (accept A's deletion)
+                for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                    info.setUserChoice(MergeObjectInfo.THEIRS);
+                }
+                handler.merge();
+
+                // Q should NOT exist (user accepted deletion)
+                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT exist (user accepted A's deletion)");
+            }
+        }
+    }
+
+    // ========================================================================
+    // F1: Element move vs element delete (cross-path deletion)
+    // ========================================================================
+
+    /**
+     * F1: Branch A moves element Q from folderX to folderY (different folder IDs).
+     * Branch B deletes element Q at folderX.
+     *
+     * Git sees: both delete at folderX (auto-resolved), A adds at folderY (auto-merged).
+     * Result: Q appears at folderY even though B intended to delete it.
+     * This is the element-level mirror of B4 (folder move + element delete).
+     *
+     * Expected: Q should NOT exist at folderY (B's deletion intent should win).
+     * Current behavior: Q leaks to folderY — cross-path deletion not yet detected.
+     */
+    @Test
+    public void merge_F1_ElementMoveVsElementDelete() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "f1MoveDeleteRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+            File folderY = new File(bizDir, "folderY");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
+                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
+            mkdirAndWrite(folderY, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with Q, R; folderY empty").call();
+
+                // Branch A: move Q from folderX to folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move Q to folderY").call();
+
+                // Branch B: delete Q at folderX
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchB: delete Q").call();
+
+                // Save pre-merge commit IDs for cross-path detection
+                ObjectId oursId = gitRepo.resolve("branchB");
+                ObjectId theirsId = gitRepo.resolve("branchA");
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                // Both delete at folderX → no conflict. A adds at folderY → auto-merged.
+                // Run cross-path deletion detection (Phase 1.5)
+                MergeConflictHandler.detectAndRemoveCrossPathDeletions(gitRepo, oursId, theirsId);
+
+                // Expected (after cross-path deletion detection is implemented):
+                // Q should NOT exist anywhere — B's deletion should be detected.
+                assertFalse(new File(folderY, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT be at folderY (B deleted it, move should not resurrect)");
+                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT be at folderX (both branches removed it)");
+
+                // R should still be at folderX (untouched by both branches)
+                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                        "R should remain at folderX (untouched)");
+            }
+        }
+    }
+
+    // ========================================================================
+    // F2: Element modify vs element move by other branch
+    // ========================================================================
+
+    /**
+     * F2: Branch A moves element Q from folderX to folderY (different folder IDs).
+     * Branch B modifies element Q at folderX (renames to "Q-modified").
+     *
+     * Git sees: A deleted Q at folderX + added Q at folderY. B modified Q at folderX.
+     * Result: CONFLICTING (A delete vs B modify at folderX).
+     *
+     * Handler should detect this as move+modify via resolveMovedObject() / Pass 3.
+     * User chooses: THEIRS location (folderY) + OURS content (B's modification).
+     *
+     * Expected: Q at folderY with name "Q-modified".
+     */
+    @Test
+    public void merge_F2_ElementModifyVsElementMove_TheirsLocationOursContent() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "f2ModifyMoveRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+            File folderY = new File(bizDir, "folderY");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            mkdirAndWrite(folderY, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+
+                // Branch A: move Q from folderX to folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move Q to folderY").call();
+
+                // Branch B: modify Q at folderX (rename to Q-modified)
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: rename Q to Q-modified").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                        "Should conflict (A deleted Q at folderX, B modified Q at folderX)");
+
+                IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                IArchimateModel theirModel;
+                ObjectId branchAId = gitRepo.resolve("branchA");
+                try(RevWalk rw = new RevWalk(gitRepo)) {
+                    RevCommit branchACommit = rw.parseCommit(branchAId);
+                    theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                            .importFromCommit(null);
+                }
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                MergeConflictHandler handler = new MergeConflictHandler(
+                        mergeResult, "branchA", repo, null);
+                handler.init(null, ourModel, theirModel);
+
+                // Should detect as move: Q deleted at folderX by A, but exists at folderY
+                // Set location to THEIRS (accept move to folderY), content to OURS (B's modification)
+                if(handler.hasMoveGroups()) {
+                    for(MergeConflictHandler.MoveGroup group : handler.getMoveGroups()) {
+                        group.locationChoice = MergeObjectInfo.THEIRS;
+                    }
+                }
+                for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                    if(!info.isFolderXml()) {
+                        info.setUserChoice(MergeObjectInfo.OURS);
+                    }
+                }
+                handler.merge();
+
+                // Q should be at folderY with B's modified content
+                File qAtY = new File(folderY, "BusinessActor_id-q.xml");
+                assertTrue(qAtY.exists(),
+                        "Q should be at folderY (user accepted A's move)");
+                String content = Files.readString(qAtY.toPath());
+                assertTrue(content.contains("name=\"Q-modified\""),
+                        "Q should have B's content 'Q-modified', got: " + content);
+
+                // Q should NOT be at folderX
+                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT remain at folderX (moved to folderY)");
+            }
+        }
+    }
+
+    /**
+     * F2 variant: User chooses OURS location (keep at folderX) + OURS content.
+     *
+     * Expected: Q stays at folderX with B's modified content. A's copy at folderY removed.
+     */
+    @Test
+    public void merge_F2_ElementModifyVsElementMove_OursLocationOursContent() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "f2ModifyMoveOursRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+            File folderY = new File(bizDir, "folderY");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            mkdirAndWrite(folderY, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial").call();
+
+                // Branch A: move Q from folderX to folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                new File(folderX, "BusinessActor_id-q.xml").delete();
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move Q to folderY").call();
+
+                // Branch B: modify Q at folderX (rename to Q-modified)
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: rename Q to Q-modified").call();
+
+                // Merge
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                        "Should conflict (A deleted Q at folderX, B modified Q at folderX)");
+
+                IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                IArchimateModel theirModel;
+                ObjectId branchAId = gitRepo.resolve("branchA");
+                try(RevWalk rw = new RevWalk(gitRepo)) {
+                    RevCommit branchACommit = rw.parseCommit(branchAId);
+                    theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                            .importFromCommit(null);
+                }
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                MergeConflictHandler handler = new MergeConflictHandler(
+                        mergeResult, "branchA", repo, null);
+                handler.init(null, ourModel, theirModel);
+
+                // Set location to OURS (keep at folderX), content to OURS (B's modification)
+                if(handler.hasMoveGroups()) {
+                    for(MergeConflictHandler.MoveGroup group : handler.getMoveGroups()) {
+                        group.locationChoice = MergeObjectInfo.OURS;
+                    }
+                }
+                for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                    if(!info.isFolderXml()) {
+                        info.setUserChoice(MergeObjectInfo.OURS);
+                    }
+                }
+                handler.merge();
+
+                // Q should be at folderX with B's modified content
+                File qAtX = new File(folderX, "BusinessActor_id-q.xml");
+                assertTrue(qAtX.exists(),
+                        "Q should remain at folderX (user rejected move)");
+                String content = Files.readString(qAtX.toPath());
+                assertTrue(content.contains("name=\"Q-modified\""),
+                        "Q should have B's content 'Q-modified', got: " + content);
+
+                // Q should NOT be at folderY (move was rejected)
+                assertFalse(new File(folderY, "BusinessActor_id-q.xml").exists(),
+                        "Q should NOT be at folderY (move rejected)");
             }
         }
     }

@@ -22,6 +22,7 @@ import java.util.Set;
 import org.archicontribs.modelrepository.GitHelper;
 import org.archicontribs.modelrepository.grafico.FolderMoveInfo;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.MergeCommand;
 import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;

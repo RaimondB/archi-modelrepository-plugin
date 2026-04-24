@@ -70,6 +70,13 @@ class MergeObjectInfo {
      * meaning this element was moved (not deleted) and both sides are now populated.
      */
     private boolean resolvedAsMove;
+    
+    /**
+     * Track whether the raw file content existed at each ref.
+     * True = file exists in that git ref (may or may not parse into an EObject).
+     * False = file was truly deleted by that side (getFileContents returned null).
+     */
+    private boolean[] rawContentExists = new boolean[2];
 
     MergeObjectInfo(String xmlPath, MergeConflictHandler handler) throws IOException {
         this.handler = handler;
@@ -80,10 +87,10 @@ class MergeObjectInfo {
         this.folderPath = lastSlash > 0 ? xmlPath.substring(0, lastSlash) : ""; //$NON-NLS-1$
         
         long t = System.nanoTime();
-        objects[OURS] = loadEObject(handler.getLocalRef());
+        objects[OURS] = loadEObject(handler.getLocalRef(), OURS);
         long oursTime = System.nanoTime() - t;
         t = System.nanoTime();
-        objects[THEIRS] = loadEObject(handler.getTheirRef());
+        objects[THEIRS] = loadEObject(handler.getTheirRef(), THEIRS);
         long theirsTime = System.nanoTime() - t;
         log(IStatus.INFO, "[MergeObjectInfo] loadEObject('" + xmlPath + "'): ours=" + oursTime / 1_000_000 //$NON-NLS-1$ //$NON-NLS-2$
                 + "ms(" + (objects[OURS] != null ? "found" : "null") + "), theirs=" + theirsTime / 1_000_000 //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
@@ -157,6 +164,15 @@ class MergeObjectInfo {
      */
     boolean isResolvedAsMove() {
         return resolvedAsMove;
+    }
+    
+    /**
+     * @return true if the given side (OURS or THEIRS) is a true deletion — i.e. the
+     * raw file content does not exist at that git ref. This is distinct from the
+     * EObject being null (which can happen if the model import fails to parse the file).
+     */
+    boolean isDeletedBy(int side) {
+        return !rawContentExists[side] && !resolvedAsMove;
     }
     
     /**
@@ -242,14 +258,18 @@ class MergeObjectInfo {
      * We do this because some EObjects have proxy references to other EObjects that would need resolving
      * Returns null if the file contents does not exist (either we or they deleted the object)
      * ref is either ours or theirs
+     * side is OURS or THEIRS (used to track raw content existence)
      */
-    private EObject loadEObject(String ref) throws IOException {
+    private EObject loadEObject(String ref, int side) throws IOException {
         // Load the contents of the ref not the actual file because "theirs" is not an actual file
         byte[] contents = handler.getArchiRepository().getFileContents(xmlPath, ref);
         // Not found so was deleted by us or them
         if(contents == null) {
+            rawContentExists[side] = false;
             return null;
         }
+        
+        rawContentExists[side] = true;
         
         ByteArrayInputStream bis = new ByteArrayInputStream(contents);
         

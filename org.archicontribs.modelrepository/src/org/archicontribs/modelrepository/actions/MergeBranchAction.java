@@ -290,12 +290,13 @@ public class MergeBranchAction extends AbstractModelAction {
         Display.getCurrent().readAndDispatch();  // update dialog
 
         try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
-            ObjectId mergeBase = git.getRepository().resolve(branchToMerge.getShortName());
+            ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
+            ObjectId oursId = git.getRepository().resolve(IGraficoConstants.HEAD);
             
             String mergeMessage = NLS.bind(Messages.MergeBranchAction_2, branchToMerge.getShortName(), currentBranch.getShortName());
             
             MergeResult mergeResult = git.merge()
-                    .include(mergeBase)
+                    .include(theirsId)
                     .setCommit(true)
                     .setFastForward(FastForwardMode.FF)
                     .setStrategy(MergeStrategy.RECURSIVE)
@@ -347,8 +348,18 @@ public class MergeBranchAction extends AbstractModelAction {
             // Reload the model from the Grafico XML files
             GraficoModelLoader loader = new GraficoModelLoader(getRepository());
             
-            // Pre-repair: detect and resolve folder moves before loading the model
+            // Phase 1.5: detect and remove elements deleted by one parent but leaked via move by the other
             long t = System.nanoTime();
+            if(oursId != null && theirsId != null) {
+                int removed = MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+                        git.getRepository(), oursId, theirsId);
+                ModelRepositoryPlugin.getInstance().log(IStatus.INFO,
+                        "[MergeBranchAction] detectAndRemoveCrossPathDeletions: removed=" + removed //$NON-NLS-1$
+                        + " (" + (System.nanoTime() - t) / 1_000_000 + "ms)", null); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+            
+            // Pre-repair: detect and resolve folder moves before loading the model
+            t = System.nanoTime();
             loader.repairMissingFolderXml();
             ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] repairMissingFolderXml: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
             t = System.nanoTime();

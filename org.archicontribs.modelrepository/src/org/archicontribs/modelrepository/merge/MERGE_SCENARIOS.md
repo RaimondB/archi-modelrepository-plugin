@@ -116,7 +116,7 @@ Runs after `handler.merge()` for every merge.
 
 | ID | Scenario | Expected | Status |
 |----|----------|----------|--------|
-| **D1** | Conflicts AND orphaned dirs | Handler first, repair rest; no data loss | **NEW** |
+| **D1** | Conflicts AND orphaned dirs | Handler first, repair rest; no data loss | **COVERED** |
 
 ## Category E: Add and Delete Scenarios
 
@@ -136,7 +136,7 @@ Key distinction: **delete** (ID gone) vs **move** (same ID at different path).
 | ID | Scenario | Expected | Status |
 |----|----------|----------|--------|
 | **E5** | A deletes folder (not moved); B adds new elem in folder | Folder restored at original loc (repair) | **NEW** |
-| **E6** | A deletes folder; B modifies existing elem | Conflict: keep folder or accept delete | **NEW** |
+| **E6** | A deletes folder; B modifies existing elem | Conflict: keep folder or accept delete | **COVERED** |
 | **E7** | A adds new subfolder with elems; B no conflicts | Merged cleanly | **NEW** |
 | **E8** | A deletes folder; B deletes same folder | No conflict; gone | **NEW** |
 
@@ -148,6 +148,19 @@ Key distinction: **delete** (ID gone) vs **move** (same ID at different path).
 | **E10** | A moves folder; B adds new subfolder at old loc | Subfolder follows chosen location | **NEW** |
 
 **Note**: E5 is distinct from E9 — E5 is a true delete (ID gone), E9 is a move (ID at new path). Repair must distinguish: if folder ID exists elsewhere → move; if not → delete requiring restore.
+
+## Category F: Cross-Path Interactions (element-level move vs delete/modify)
+
+These scenarios test element-level moves (different folder IDs) interacting with deletes/modifies by the other branch. Distinct from Category A (which tests same-direction moves) and Category B (folder-level moves).
+
+| ID | Scenario | User Choice | Expected | Status |
+|----|----------|-------------|----------|--------|
+| **F1** | A moves elem to folderY; B deletes same elem | N/A (clean merge) | Elem should NOT exist (B's delete intent lost) | **DEFERRED** |
+| **F2** | A moves elem to folderY; B modifies same elem | Location + content | Elem at chosen loc with chosen content | **COVERED** |
+
+**F1**: Element-level mirror of B4. Git sees both branches delete at old path (auto-resolved) + A's add at new path (auto-merged). B's deletion intent is lost. Requires cross-path deletion detection — same blocker as B4.
+
+**F2**: Reverse of A1-A3 (mover is theirs, modifier is ours). Tests `resolveMovedObject()` / Pass 3 detection when the mover is the remote branch. Two variants tested: accept move + keep content, and reject move + keep content.
 
 ---
 
@@ -183,7 +196,7 @@ Target Location column updates dynamically when folder choice changes.
 |-------|------|
 | 0 | This document |
 | 1 | RED tests: A4, B2 (primary bug) |
-| 2 | RED tests: A5, A6, B3–B6, C1, C2, D1, E1–E10 |
+| 2 | RED tests: A5, A6, B3–B6, C1, C2, D1, E1–E10, F1–F2 |
 | 3 | Fix engine: A4/B2 GREEN |
 | 4 | Fix remaining: all GREEN |
 | 5 | UI consolidation |

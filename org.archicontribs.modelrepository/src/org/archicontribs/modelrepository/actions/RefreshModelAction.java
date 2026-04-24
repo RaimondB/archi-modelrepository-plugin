@@ -27,11 +27,13 @@ import org.eclipse.core.runtime.IStatus;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
+import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.MergeResult.MergeStatus;
 import org.eclipse.jgit.api.PullResult;
 import org.eclipse.jgit.api.errors.CanceledException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.RefNotAdvertisedException;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.osgi.util.NLS;
 import org.eclipse.swt.widgets.Display;
@@ -188,6 +190,12 @@ public class RefreshModelAction extends AbstractModelAction {
     protected int pull(UsernamePassword npw, ProgressMonitorDialog pmDialog) throws IOException, GitAPIException  {
         PullResult pullResult = null;
         
+        // Capture HEAD before pull for cross-path deletion detection
+        ObjectId oursIdBeforePull = null;
+        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
+            oursIdBeforePull = git.getRepository().resolve(IGraficoConstants.HEAD);
+        }
+        
         pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_6);
         Display.getCurrent().readAndDispatch(); // update dialog
         
@@ -268,6 +276,18 @@ public class RefreshModelAction extends AbstractModelAction {
             // We now have to check if model can be reloaded
             pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
             
+            // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
+            if(oursIdBeforePull != null) {
+                try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
+                    ObjectId theirsId = git.getRepository().resolve(
+                            branchStatus.getCurrentRemoteBranch().getFullName());
+                    if(theirsId != null) {
+                        MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+                                git.getRepository(), oursIdBeforePull, theirsId);
+                    }
+                }
+            }
+            
             // Pre-repair: detect and resolve folder moves before loading the model
             loader.repairMissingFolderXml();
             loader.applyFolderMoveResolutions();
@@ -283,6 +303,18 @@ public class RefreshModelAction extends AbstractModelAction {
         } else { 
 		    // Reload the model from the Grafico XML files
 		    pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
+		    
+		    // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
+		    if(oursIdBeforePull != null) {
+		        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
+		            ObjectId theirsId = git.getRepository().resolve(
+		                    branchStatus.getCurrentRemoteBranch().getFullName());
+		            if(theirsId != null) {
+		                MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+		                        git.getRepository(), oursIdBeforePull, theirsId);
+		            }
+		        }
+		    }
 		    
 		    // Pre-repair: detect folder moves before loading the model
 		    loader.repairMissingFolderXml();
