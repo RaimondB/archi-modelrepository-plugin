@@ -5,9 +5,9 @@
 	<classpathentry kind="src" path="src"/>
 	<!-- Bundled library JARs (JGit, SSH, SLF4J) -->
 	<classpathentry exported="true" kind="lib" path="lib/javaewah_1.2.3.jar"/>
-	<classpathentry exported="true" kind="lib" path="lib/org.apache.sshd.osgi_2.16.0.jar"/>
-	<classpathentry exported="true" kind="lib" path="lib/org.eclipse.jgit.ssh.apache_7.5.0.202512021534-r.jar"/>
-	<classpathentry exported="true" kind="lib" path="lib/org.eclipse.jgit_7.5.0.202512021534-r.jar"/>
+	<classpathentry exported="true" kind="lib" path="lib/org.apache.sshd.osgi_2.17.1.jar"/>
+	<classpathentry exported="true" kind="lib" path="lib/org.eclipse.jgit.ssh.apache_7.6.0.202603022253-r.jar"/>
+	<classpathentry exported="true" kind="lib" path="lib/org.eclipse.jgit_7.6.0.202603022253-r.jar"/>
 	<classpathentry exported="true" kind="lib" path="lib/org.slf4j.api_2.0.17.jar"/>
 	<classpathentry exported="true" kind="lib" path="lib/org.slf4j.binding.simple_2.0.17.jar"/>
 	<!--
