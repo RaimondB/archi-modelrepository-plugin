@@ -1,6 +1,7 @@
 # Eclipse build outputs
 bin/
 target/
+dist/
 
 # IDE
 .settings/
