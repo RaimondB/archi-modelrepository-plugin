@@ -151,6 +151,14 @@ public class ArchiRepository implements IArchiRepository {
 
     @Override
     public boolean hasChangesToCommit() throws IOException, GitAPIException {
+        // Try native git status first — much faster than JGit for large repos (30k+ files).
+        // Native git uses multi-threaded working tree scan and OS file caches efficiently.
+        Boolean nativeResult = tryNativeGitStatus();
+        if(nativeResult != null) {
+            return nativeResult;
+        }
+        
+        // Fall back to JGit
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             Status status = git.status().call();
             return !status.isClean();
@@ -173,33 +181,29 @@ public class ArchiRepository implements IArchiRepository {
     
     @Override
     public RevCommit commitChanges(String commitMessage, boolean amend) throws GitAPIException, IOException {
+        // Check if we're in a merge state (MERGE_HEAD exists) — cheap file check
+        boolean isMerging = new File(getLocalRepositoryFolder(), ".git/MERGE_HEAD").exists(); //$NON-NLS-1$
+        
+        // Check if there are changes to commit — use native git status for speed
+        boolean hasChanges = hasChangesToCommit();
+        
+        // Nothing changed and not in a merge — no commit needed
+        if(!hasChanges && !isMerging) {
+            return null;
+        }
+        
+        // Check lock file is deleted
+        checkDeleteLockFile();
+        
+        // Stage all changes (new, modified, deleted) if working tree is dirty.
+        // Native git add -A handles everything in one call — no need for
+        // separate JGit add + rm per missing file.
+        if(hasChanges) {
+            gitAdd();
+        }
+        
+        // Commit — JGit needed for author/message/amend support
         try(Git git = Git.open(getLocalRepositoryFolder())) {
-            Status status = git.status().call();
-            
-            // Check if we're in a merge state (MERGE_HEAD exists)
-            boolean isMerging = new File(getLocalRepositoryFolder(), ".git/MERGE_HEAD").exists(); //$NON-NLS-1$
-            
-            // Nothing changed and not in a merge — no commit needed
-            if(status.isClean() && !isMerging) {
-                return null;
-            }
-            
-            // Check lock file is deleted
-            checkDeleteLockFile();
-            
-            // Stage changes (skip if clean — only here for merge commit)
-            if(!status.isClean()) {
-                // Add modified files to index
-                // Try native Git first (much faster for large repos), falls back to JGit automatically
-                gitAdd();
-                
-                // Add missing files to index
-                for(String s : status.getMissing()) {
-                    git.rm().addFilepattern(s).call();
-                }
-            }
-            
-            // Commit
             CommitCommand commitCommand = git.commit();
             PersonIdent userDetails = getUserDetails();
             commitCommand.setAuthor(userDetails);
@@ -641,7 +645,7 @@ public class ArchiRepository implements IArchiRepository {
      * fetches fresh data. Must be called after any operation that changes HEAD,
      * refs, or the remote tracking state (reset, commit, push, pull).
      */
-    private void invalidateBranchStatusCache() {
+    public void invalidateBranchStatusCache() {
         fCachedBranchStatus = null;
     }
     
@@ -955,6 +959,140 @@ public class ArchiRepository implements IArchiRepository {
         catch(InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new IOException("Git reset interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Try to merge a remote branch using native Git. Native git merge is
+     * dramatically faster than JGit's recursive merger for large repositories
+     * (e.g. 71s JGit vs ~2s native for 48k files).
+     * 
+     * @param remoteBranch the remote branch ref (e.g. "origin/master")
+     * @return {@code Boolean.TRUE} if merge succeeded (clean merge or FF),
+     *         {@code Boolean.FALSE} if conflicts detected (caller should abort and use JGit),
+     *         {@code null} if native git is not available
+     * @throws IOException if the merge command failed for a reason other than conflicts
+     */
+    public Boolean tryNativeGitMerge(String remoteBranch) throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "git", "merge", remoteBranch); //$NON-NLS-1$ //$NON-NLS-2$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            
+            if(exitCode == 0) {
+                // Sync JGit state after native merge
+                Git.open(getLocalRepositoryFolder()).close();
+                invalidateBranchStatusCache();
+                return Boolean.TRUE;
+            }
+            
+            // Exit code 1 = merge conflicts, exit code 128 = fatal error
+            // For conflicts, return false so caller can abort and use JGit
+            String result = output.toString();
+            if(result.contains("CONFLICT") || result.contains("Automatic merge failed")) { //$NON-NLS-1$ //$NON-NLS-2$
+                return Boolean.FALSE;
+            }
+            
+            // Some other failure
+            throw new IOException("Git merge failed (exit " + exitCode + "): " + result); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return null; // Native git not available
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git merge interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Abort a native git merge in progress. Called when native merge detected
+     * conflicts and we need to fall back to JGit merge for conflict handling.
+     */
+    public void abortNativeMerge() throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "git", "merge", "--abort"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Drain output
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                while(reader.readLine() != null) { /* drain */ }
+            }
+            
+            process.waitFor();
+            
+            // Sync JGit state
+            Git.open(getLocalRepositoryFolder()).close();
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git merge --abort interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for status check (much faster than JGit for 30k+ files).
+     * Native git uses multi-threaded working tree scan and OS filesystem caches efficiently.
+     * 
+     * @return Boolean.TRUE if dirty, Boolean.FALSE if clean, null if native git is not available
+     */
+    private Boolean tryNativeGitStatus() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "status", "--porcelain"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read first line only — if there's any output, it's dirty
+            boolean hasOutput = false;
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line = reader.readLine();
+                hasOutput = (line != null);
+                // Drain remaining output to prevent blocking
+                while(reader.readLine() != null) {
+                    // discard
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                return null; // Something went wrong, fall back to JGit
+            }
+            
+            return hasOutput;
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return null; // Native git not available
+            }
+            return null; // Fall back to JGit on any error
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return null;
         }
     }
     

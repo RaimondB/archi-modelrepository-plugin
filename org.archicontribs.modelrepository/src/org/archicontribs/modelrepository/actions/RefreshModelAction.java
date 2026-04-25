@@ -28,12 +28,15 @@ import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.MergeCommand;
+import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.MergeResult.MergeStatus;
-import org.eclipse.jgit.api.PullResult;
 import org.eclipse.jgit.api.errors.CanceledException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.RefNotAdvertisedException;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.osgi.util.NLS;
 import org.eclipse.swt.widgets.Display;
@@ -157,6 +160,9 @@ public class RefreshModelAction extends AbstractModelAction {
     }
     
     protected int init() throws IOException, GitAPIException {
+        long initStart = System.nanoTime();
+        long phaseStart;
+        
         // Offer to save the model if open and dirty
         // We need to do this to keep grafico and temp files in sync
         IArchimateModel model = getRepository().locateModel();
@@ -167,10 +173,16 @@ public class RefreshModelAction extends AbstractModelAction {
         }
         
         // Do the Grafico Export first
+        phaseStart = System.nanoTime();
         getRepository().exportModelToGraficoFiles();
+        logPerf("exportModelToGraficoFiles", phaseStart); //$NON-NLS-1$
         
         // Then offer to Commit
-        if(getRepository().hasChangesToCommit()) {
+        phaseStart = System.nanoTime();
+        boolean hasChanges = getRepository().hasChangesToCommit();
+        logPerf("hasChangesToCommit (init)", phaseStart); //$NON-NLS-1$
+        
+        if(hasChanges) {
             if(!offerToCommitChanges()) {
                 // User cancelled commit dialog - reset staged changes
                 getRepository().resetToRef(IGraficoConstants.HEAD);
@@ -179,61 +191,112 @@ public class RefreshModelAction extends AbstractModelAction {
             notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
         }
         
+        logPerf("=== TOTAL INIT ===", initStart); //$NON-NLS-1$
+        
         return USER_OK;
     }
     
     protected int pull(UsernamePassword npw, IProgressMonitor monitor) throws IOException, GitAPIException  {
-        PullResult pullResult = null;
+        long pullStart = System.nanoTime();
+        long phaseStart;
         
         // Capture HEAD before pull for cross-path deletion detection
         ObjectId oursIdBeforePull = null;
+        phaseStart = System.nanoTime();
         try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
             oursIdBeforePull = git.getRepository().resolve(IGraficoConstants.HEAD);
         }
+        logPerf("Resolve HEAD before pull", phaseStart); //$NON-NLS-1$
         
         monitor.subTask(Messages.RefreshModelAction_6);
         
+        // Phase 1: JGit fetch (handles HTTPS/SSH credentials)
+        FetchResult fetchResult;
+        phaseStart = System.nanoTime();
         try {
-            pullResult = getRepository().pullFromRemote(npw, new ProgressMonitorWrapper(monitor));
+            fetchResult = getRepository().fetchFromRemote(npw, new ProgressMonitorWrapper(monitor), false);
         }
         catch(Exception ex) {
-            // If this exception is thrown then the remote doesn't have the ref which can happen when pulling on a branch,
-            // So quietly absorb this and return OK
             if(ex instanceof RefNotAdvertisedException) {
                 return PULL_STATUS_OK;
             }
-            
             throw ex;
         }
+        logPerf("fetchFromRemote", phaseStart); //$NON-NLS-1$
         
-        // Check for tracking updates
-        FetchResult fetchResult = pullResult.getFetchResult();
         boolean newTrackingRefUpdates = fetchResult != null && !fetchResult.getTrackingRefUpdates().isEmpty();
         
-        // Merge is already up to date...
-        if(pullResult.getMergeResult().getMergeStatus() == MergeStatus.ALREADY_UP_TO_DATE) {
-            // Check if any tracked refs were updated
-            if(newTrackingRefUpdates) {
-                return PULL_STATUS_OK;
+        // Phase 2: Determine if merge is needed
+        phaseStart = System.nanoTime();
+        MergeResult mergeResult = null;
+        
+        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
+            Repository repository = git.getRepository();
+            String currentBranch = repository.getBranch();
+            String remoteBranch = IGraficoConstants.ORIGIN + "/" + currentBranch; //$NON-NLS-1$
+            ObjectId remoteId = repository.resolve(Constants.R_REMOTES + remoteBranch);
+            ObjectId headId = repository.resolve(IGraficoConstants.HEAD);
+            
+            if(remoteId == null || (headId != null && headId.equals(remoteId))) {
+                // Already up to date
+                logPerf("merge (already up to date)", phaseStart); //$NON-NLS-1$
+                if(newTrackingRefUpdates) {
+                    return PULL_STATUS_OK;
+                }
+                return PULL_STATUS_UP_TO_DATE;
             }
             
-            return PULL_STATUS_UP_TO_DATE;
+            // Phase 2a: Try native git merge (dramatically faster for large repos)
+            ArchiRepository archiRepo = (ArchiRepository) getRepository();
+            Boolean nativeResult = archiRepo.tryNativeGitMerge(remoteBranch);
+            
+            if(Boolean.TRUE.equals(nativeResult)) {
+                // Native merge succeeded cleanly
+                logPerf("merge (native git)", phaseStart); //$NON-NLS-1$
+            }
+            else if(Boolean.FALSE.equals(nativeResult)) {
+                // Native merge had conflicts — abort and fall back to JGit
+                archiRepo.abortNativeMerge();
+                logPerf("merge (native git — conflicts, aborted)", phaseStart); //$NON-NLS-1$
+                
+                // Re-open git since abort may have changed state
+                phaseStart = System.nanoTime();
+                try(Git git2 = Git.open(getRepository().getLocalRepositoryFolder())) {
+                    ObjectId freshRemoteId = git2.getRepository().resolve(Constants.R_REMOTES + remoteBranch);
+                    MergeCommand mergeCommand = git2.merge();
+                    mergeCommand.include(remoteBranch, freshRemoteId);
+                    mergeResult = mergeCommand.call();
+                }
+                logPerf("merge (JGit fallback for conflicts)", phaseStart); //$NON-NLS-1$
+            }
+            else {
+                // Native git not available — full JGit merge fallback
+                MergeCommand mergeCommand = git.merge();
+                mergeCommand.include(remoteBranch, remoteId);
+                mergeResult = mergeCommand.call();
+                logPerf("merge (JGit fallback)", phaseStart); //$NON-NLS-1$
+            }
         }
+        
+        // Invalidate branch status cache since refs may have changed
+        ((ArchiRepository) getRepository()).invalidateBranchStatusCache();
         
         monitor.subTask(Messages.RefreshModelAction_7);
         
+        phaseStart = System.nanoTime();
         BranchStatus branchStatus = getRepository().getBranchStatus();
+        logPerf("getBranchStatus", phaseStart); //$NON-NLS-1$
         
         // Setup the Graphico Model Loader
         GraficoModelLoader loader = new GraficoModelLoader(getRepository());
 
-        // Merge failure
-        if(!pullResult.isSuccessful() && pullResult.getMergeResult().getMergeStatus() == MergeStatus.CONFLICTING) {
+        // Merge failure — only possible if JGit merge was used (native merge was either clean or aborted+retried)
+        if(mergeResult != null && mergeResult.getMergeStatus() == MergeStatus.CONFLICTING) {
             // Get the remote ref name
             String remoteRef = branchStatus.getCurrentRemoteBranch().getFullName();
             
             // Try to handle the merge conflict
-            MergeConflictHandler handler = new MergeConflictHandler(pullResult.getMergeResult(), remoteRef,
+            MergeConflictHandler handler = new MergeConflictHandler(mergeResult, remoteRef,
                     getRepository(), fWindow.getShell());
             
             try {
@@ -311,6 +374,7 @@ public class RefreshModelAction extends AbstractModelAction {
 		    
 		    // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
 		    if(oursIdBeforePull != null) {
+		        phaseStart = System.nanoTime();
 		        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
 		            ObjectId theirsId = git.getRepository().resolve(
 		                    branchStatus.getCurrentRemoteBranch().getFullName());
@@ -319,10 +383,13 @@ public class RefreshModelAction extends AbstractModelAction {
 		                        git.getRepository(), oursIdBeforePull, theirsId);
 		            }
 		        }
+		        logPerf("detectAndRemoveCrossPathDeletions", phaseStart); //$NON-NLS-1$
 		    }
 		    
 		    // Pre-repair: detect folder moves before loading the model
+		    phaseStart = System.nanoTime();
 		    loader.repairMissingFolderXml();
+		    logPerf("repairMissingFolderXml", phaseStart); //$NON-NLS-1$
 		    
 		    // Show folder move resolution dialog if moves were detected
 		    if(loader.hasPendingFolderMoves()) {
@@ -334,9 +401,12 @@ public class RefreshModelAction extends AbstractModelAction {
 		    }
 		    
 		    // Apply the user's choices (or defaults if no dialog was needed)
+		    phaseStart = System.nanoTime();
 		    loader.applyFolderMoveResolutions();
+		    logPerf("applyFolderMoveResolutions", phaseStart); //$NON-NLS-1$
 		    
 		    // Reload the model from the Grafico XML files (must be on UI thread)
+		    phaseStart = System.nanoTime();
 		    final IOException[] loadEx = new IOException[1];
 		    Display.getDefault().syncExec(() -> {
 		        try {
@@ -349,10 +419,13 @@ public class RefreshModelAction extends AbstractModelAction {
 		    if(loadEx[0] != null) {
 		        throw loadEx[0];
 		    }
+		    logPerf("loadModel (import GRAFICO)", phaseStart); //$NON-NLS-1$
         }
         
         // Do a commit if needed
+        phaseStart = System.nanoTime();
         boolean hasChanges = getRepository().hasChangesToCommit();
+        logPerf("hasChangesToCommit", phaseStart); //$NON-NLS-1$
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] hasChangesToCommit=" + hasChanges + " (pull path)", null); //$NON-NLS-1$ //$NON-NLS-2$
         java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
@@ -375,10 +448,20 @@ public class RefreshModelAction extends AbstractModelAction {
                 commitMessage += "\n" + repairDetails; //$NON-NLS-1$
             }
 
+            phaseStart = System.nanoTime();
             // TODO - not sure if amend should be false or true here?
             getRepository().commitChanges(commitMessage, false);
+            logPerf("commitChanges", phaseStart); //$NON-NLS-1$
         }
         
+        logPerf("=== TOTAL PULL ===", pullStart); //$NON-NLS-1$
+        
         return PULL_STATUS_OK;
+    }
+    
+    private static void logPerf(String phase, long startNanos) {
+        long ms = (System.nanoTime() - startNanos) / 1_000_000;
+        ModelRepositoryPlugin.getInstance().log(IStatus.INFO,
+                "[RefreshModelAction] " + phase + ": " + ms + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
     }
 }

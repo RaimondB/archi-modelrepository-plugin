@@ -3074,6 +3074,203 @@ public class MergeConflictHandlerTests {
     }
 
     // ========================================================================
+    // Bug regression: remote reorganizes folders — no false deletions
+    // ========================================================================
+
+    /**
+     * Bug regression: when the remote (theirs) moves a folder to a new location,
+     * {@code git diff --diff-filter=D base..theirs} reports every element in the
+     * old folder as "deleted". The old cross-path detection code treated these as
+     * true deletions and removed the files from the working tree — even though
+     * they were just moved to a new path. The fix verifies that an element is
+     * truly absent from the parent's tree (not just relocated) before considering
+     * it deleted.
+     *
+     * Scenario:
+     *   Base:   folderX with elements P, Q, R
+     *   Ours:   unchanged (local is behind)
+     *   Theirs: moves folderX → folderY (P, Q, R now at folderY)
+     *
+     * Expected: after merge + cross-path detection, P, Q, R exist at folderY.
+     */
+    @Test
+    public void merge_G1_RemoteReorganizesFolders_NoFalseDeletions() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "g1ReorgRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-p.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
+            Files.writeString(new File(folderX, "BusinessRole_id-q.xml").toPath(),
+                    "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+            Files.writeString(new File(folderX, "BusinessProcess_id-r.xml").toPath(),
+                    "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with P, Q, R").call();
+
+                // Branch A (theirs/remote): move folderX → folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                File folderY = new File(bizDir, "folderY");
+                mkdirAndWrite(folderY, "folder.xml",
+                        "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderX\"/>\n");
+                Files.writeString(new File(folderY, "BusinessActor_id-p.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
+                Files.writeString(new File(folderY, "BusinessRole_id-q.xml").toPath(),
+                        "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                Files.writeString(new File(folderY, "BusinessProcess_id-r.xml").toPath(),
+                        "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
+                new File(folderX, "BusinessActor_id-p.xml").delete();
+                new File(folderX, "BusinessRole_id-q.xml").delete();
+                new File(folderX, "BusinessProcess_id-r.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: move folderX to folderY").call();
+
+                // Branch B (ours/local): no changes — still at base
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                // Make a trivial commit so merge is not a fast-forward
+                Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                        "<archimate:ArchimateModel " + NS
+                        + " name=\"Test Updated\" id=\"id-model\" version=\"5.0.0\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: trivial update").call();
+
+                ObjectId oursId = gitRepo.resolve("branchB");
+                ObjectId theirsId = gitRepo.resolve("branchA");
+
+                // Merge A into B
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                // Should be MERGED or CONFLICTING — either way, run cross-path detection
+                MergeConflictHandler.detectAndRemoveCrossPathDeletions(gitRepo, oursId, theirsId);
+
+                File folderYResult = new File(bizDir, "folderY");
+
+                // All elements should exist at folderY — NOT deleted by cross-path detection
+                assertTrue(new File(folderYResult, "BusinessActor_id-p.xml").exists(),
+                        "P should be at folderY (not falsely deleted)");
+                assertTrue(new File(folderYResult, "BusinessRole_id-q.xml").exists(),
+                        "Q should be at folderY (not falsely deleted)");
+                assertTrue(new File(folderYResult, "BusinessProcess_id-r.xml").exists(),
+                        "R should be at folderY (not falsely deleted)");
+
+                // Old location should NOT exist
+                assertFalse(folderX.exists(),
+                        "folderX should not exist after merge");
+            }
+        }
+    }
+
+    /**
+     * Bug regression variant: remote adds NEW elements that didn't exist in
+     * the merge base. These should never appear in any deletion set because
+     * they weren't in the base to begin with.
+     *
+     * Scenario:
+     *   Base:   folderX with element P
+     *   Ours:   unchanged (local is behind)
+     *   Theirs: adds Q, R to folderX; also moves folderX → folderY
+     *
+     * Expected: after merge + cross-path detection, P, Q, R exist at folderY.
+     */
+    @Test
+    public void merge_G2_RemoteAddsAndReorganizes_NewElementsPreserved() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "g2AddReorgRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            File modelDir = new File(repoFolder, "model");
+            File bizDir = new File(modelDir, "business");
+            File folderX = new File(bizDir, "folderX");
+
+            writeGraficoModel(modelDir);
+            mkdirAndWrite(bizDir, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
+            mkdirAndWrite(folderX, "folder.xml",
+                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+            Files.writeString(new File(folderX, "BusinessActor_id-p.xml").toPath(),
+                    "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
+            writeStandardFolders(modelDir);
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: folderX with P").call();
+
+                // Branch A (theirs/remote): add Q, R; move folderX → folderY
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+
+                File folderY = new File(bizDir, "folderY");
+                mkdirAndWrite(folderY, "folder.xml",
+                        "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderX\"/>\n");
+                Files.writeString(new File(folderY, "BusinessActor_id-p.xml").toPath(),
+                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
+                Files.writeString(new File(folderY, "BusinessRole_id-q.xml").toPath(),
+                        "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                Files.writeString(new File(folderY, "BusinessProcess_id-r.xml").toPath(),
+                        "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
+                new File(folderX, "BusinessActor_id-p.xml").delete();
+                new File(folderX, "folder.xml").delete();
+                folderX.delete();
+
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: add Q,R and move to folderY").call();
+
+                // Branch B (ours/local): no changes
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                Files.writeString(new File(modelDir, "folder.xml").toPath(),
+                        "<archimate:ArchimateModel " + NS
+                        + " name=\"Test Updated\" id=\"id-model\" version=\"5.0.0\"/>\n");
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("branchB: trivial update").call();
+
+                ObjectId oursId = gitRepo.resolve("branchB");
+                ObjectId theirsId = gitRepo.resolve("branchA");
+
+                git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                MergeConflictHandler.detectAndRemoveCrossPathDeletions(gitRepo, oursId, theirsId);
+
+                File folderYResult = new File(bizDir, "folderY");
+                assertTrue(new File(folderYResult, "BusinessActor_id-p.xml").exists(),
+                        "P should be at folderY");
+                assertTrue(new File(folderYResult, "BusinessRole_id-q.xml").exists(),
+                        "Q (new element) should be at folderY");
+                assertTrue(new File(folderYResult, "BusinessProcess_id-r.xml").exists(),
+                        "R (new element) should be at folderY");
+                assertFalse(folderX.exists(),
+                        "folderX should not exist after merge");
+            }
+        }
+    }
+
+    // ========================================================================
     // Helper methods
     // ========================================================================
 

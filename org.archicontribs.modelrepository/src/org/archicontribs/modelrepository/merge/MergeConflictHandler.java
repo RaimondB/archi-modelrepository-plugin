@@ -1310,20 +1310,42 @@ public class MergeConflictHandler {
     
     /**
      * Use native {@code git diff --name-only --diff-filter=D} to find element IDs
-     * deleted between merge base and each parent. This is fast because:
-     * <ul>
-     * <li>Only returns deleted file paths (not entire tree)</li>
-     * <li>Native git's diff engine is optimized C code</li>
-     * <li>Two process calls regardless of repository size</li>
-     * </ul>
+     * truly deleted between merge base and each parent. An element is "truly deleted"
+     * by a parent if the diff shows it removed at an old path AND it is NOT present
+     * anywhere in that same parent's tree (i.e. not just moved to a new path).
      * 
      * @return true if native git was available, false to indicate JGit fallback needed
      */
     private static boolean collectDeletedIdsNative(File repoRoot, String mergeBaseSha,
             String oursSha, String theirsSha, Set<String> deletedIds) throws IOException {
         try {
-            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, oursSha, deletedIds);
-            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, theirsSha, deletedIds);
+            Set<String> deletedByOurs = new HashSet<>();
+            Set<String> deletedByTheirs = new HashSet<>();
+            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, oursSha, deletedByOurs);
+            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, theirsSha, deletedByTheirs);
+            
+            // git diff --diff-filter=D reports path-based deletions. If a parent
+            // moved a folder, all files at the old path show as "deleted" even
+            // though they exist at the new path. We cross-check against the
+            // same parent's full tree to distinguish true deletions from moves.
+            Set<String> presentInOurs = new HashSet<>();
+            Set<String> presentInTheirs = new HashSet<>();
+            collectPresentIdsFromTree(repoRoot, oursSha, presentInOurs);
+            collectPresentIdsFromTree(repoRoot, theirsSha, presentInTheirs);
+            
+            // Truly deleted by ours: diff says deleted AND not present anywhere in ours
+            for(String id : deletedByOurs) {
+                if(!presentInOurs.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+            // Truly deleted by theirs: diff says deleted AND not present anywhere in theirs
+            for(String id : deletedByTheirs) {
+                if(!presentInTheirs.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+            
             return true;
         }
         catch(IOException ex) {
@@ -1380,8 +1402,48 @@ public class MergeConflictHandler {
     }
     
     /**
+     * Use native {@code git ls-tree -r --name-only} to collect element IDs
+     * present in a commit's tree. Used to cross-check deletion candidates.
+     */
+    private static void collectPresentIdsFromTree(File repoRoot, String commitSha,
+            Set<String> presentIds) throws IOException {
+        ProcessBuilder pb = new ProcessBuilder(
+                "git", "ls-tree", "-r", "--name-only", commitSha, //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                "--", IGraficoConstants.MODEL_FOLDER); //$NON-NLS-1$
+        pb.directory(repoRoot);
+        pb.redirectErrorStream(true);
+        
+        Process process = pb.start();
+        
+        try(BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while((line = reader.readLine()) != null) {
+                String fileName = line.substring(line.lastIndexOf('/') + 1);
+                String id = extractIdFromElementFileName(fileName);
+                if(id != null) {
+                    presentIds.add(id);
+                }
+            }
+        }
+        
+        try {
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("git ls-tree failed with exit code " + exitCode); //$NON-NLS-1$
+            }
+        }
+        catch(InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("git ls-tree interrupted", e); //$NON-NLS-1$
+        }
+    }
+    
+    /**
      * JGit fallback: walk both parent trees and the merge base tree to find
-     * deleted element IDs. Slower than native git but always available.
+     * truly deleted element IDs. Since {@link #collectElementIdsFromTree} is
+     * path-agnostic (collects IDs regardless of folder location), an element
+     * missing from a parent's ID set means it was truly deleted, not just moved.
      */
     private static void collectDeletedIdsJGit(Repository repo, ObjectId oursId,
             ObjectId theirsId, String mergeBaseSha, Set<String> deletedIds) throws IOException {
@@ -1394,13 +1456,13 @@ public class MergeConflictHandler {
             Set<String> oursIds = collectElementIdsFromTree(repo, oursCommit);
             Set<String> theirsIds = collectElementIdsFromTree(repo, theirsCommit);
             
-            // Elements deleted by ours: in base but not in ours
+            // Elements truly deleted by ours: in base but not in ours at any path
             for(String id : baseIds) {
                 if(!oursIds.contains(id)) {
                     deletedIds.add(id);
                 }
             }
-            // Elements deleted by theirs: in base but not in theirs
+            // Elements truly deleted by theirs: in base but not in theirs at any path
             for(String id : baseIds) {
                 if(!theirsIds.contains(id)) {
                     deletedIds.add(id);
