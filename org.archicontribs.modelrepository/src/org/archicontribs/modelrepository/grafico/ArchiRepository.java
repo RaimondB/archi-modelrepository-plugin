@@ -373,26 +373,22 @@ public class ArchiRepository implements IArchiRepository {
     
     @Override
     public boolean isHeadAndRemoteSame() throws IOException, GitAPIException {
-        try(Repository repository = Git.open(getLocalRepositoryFolder()).getRepository()) {
-            // Get remote branch ref
-            BranchInfo currentRemoteBranch = getBranchStatus().getCurrentRemoteBranch();
-            if(currentRemoteBranch == null) {
-                return false;
-            }
-
-            // Remote
-            Ref remoteRef = currentRemoteBranch.getRef();
-            
-            // Head
-            Ref headRef = repository.findRef(HEAD);
-
-            // In case of missing ref return false
-            if(headRef == null || remoteRef == null) {
-                return false;
-            }
-            
-            return headRef.getObjectId().equals(remoteRef.getObjectId());
+        BranchStatus status = getBranchStatus();
+        BranchInfo currentLocal = status.getCurrentLocalBranch();
+        BranchInfo currentRemote = status.getCurrentRemoteBranch();
+        
+        if(currentLocal == null || currentRemote == null) {
+            return false;
         }
+        
+        Ref localRef = currentLocal.getRef();
+        Ref remoteRef = currentRemote.getRef();
+        
+        if(localRef == null || remoteRef == null) {
+            return false;
+        }
+        
+        return localRef.getObjectId().equals(remoteRef.getObjectId());
     }
     
     @Override
@@ -619,9 +615,22 @@ public class ArchiRepository implements IArchiRepository {
         return true;
     }
     
+    /** Cached BranchStatus with a TTL to avoid redundant O(N) computations */
+    private volatile BranchStatus fCachedBranchStatus;
+    private volatile long fBranchStatusTimestamp;
+    private static final long BRANCH_STATUS_TTL_NANOS = 2_000_000_000L; // 2 seconds
+    
     @Override
     public BranchStatus getBranchStatus() throws IOException, GitAPIException {
-        return new BranchStatus(this);
+        long now = System.nanoTime();
+        BranchStatus cached = fCachedBranchStatus;
+        if(cached != null && (now - fBranchStatusTimestamp) < BRANCH_STATUS_TTL_NANOS) {
+            return cached;
+        }
+        BranchStatus fresh = new BranchStatus(this);
+        fCachedBranchStatus = fresh;
+        fBranchStatusTimestamp = System.nanoTime();
+        return fresh;
     }
     
     private String getLatestChecksum() throws IOException {

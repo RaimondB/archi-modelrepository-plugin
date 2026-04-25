@@ -7,10 +7,7 @@ package org.archicontribs.modelrepository.grafico;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.List;
 
-import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.ListBranchCommand.ListMode;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.BranchConfig;
 import org.eclipse.jgit.lib.BranchTrackingStatus;
@@ -19,7 +16,6 @@ import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
-import org.eclipse.jgit.revwalk.RevWalkUtils;
 
 /**
  * BranchInfo
@@ -53,7 +49,8 @@ public class BranchInfo {
     }
     
     /**
-     * Initialise this BranchInfo from the Repository and the Ref
+     * Initialise this BranchInfo from the Repository and the Ref.
+     * isMerged is computed separately by BranchStatus in a single pass.
      */
     private void init(Repository repository, Ref ref) throws IOException, GitAPIException {
         this.ref = ref.getTarget(); // Important! Get the target in case it's a symbolic Ref
@@ -66,19 +63,14 @@ public class BranchInfo {
         isRemoteDeleted = getIsRemoteDeleted(repository);
         isCurrentBranch = getIsCurrentBranch(repository);
         
-        getRevWalkStatus(repository);
+        getLatestCommitStatus(repository);
     }
     
     /**
-     * Refresh this BranchInfo with updated information
-     * @throws IOException
-     * @throws GitAPIException
+     * Set merged status. Called by BranchStatus after computing isMerged for all branches.
      */
-    public void refresh() throws IOException, GitAPIException {
-        try(Git git = Git.open(repoDir)) {
-            Ref ref = git.getRepository().findRef(getFullName());  // Ref will be a different object with a new Repository instance so renew it
-            init(git.getRepository(), ref);
-        }
+    void setMerged(boolean merged) {
+        this.isMerged = merged;
     }
     
     public Ref getRef() {
@@ -195,44 +187,11 @@ public class BranchInfo {
     }
     
     /**
-     * Get status of this branch from a RevWalk
-     * This will get the latest commit for this branch
-     * and whether this branch is merged into another
+     * Get the latest commit for this branch.
      */
-    private void getRevWalkStatus(Repository repository) throws GitAPIException, IOException {
+    private void getLatestCommitStatus(Repository repository) throws IOException {
         try(RevWalk revWalk = new RevWalk(repository)) {
-            // Get the latest commit for this branch
             latestCommit = revWalk.parseCommit(ref.getObjectId());
-            
-            // If this is the master branch isMerged is true
-            if(isMasterBranch()) {
-                isMerged = true;
-            }
-            // Else this is another branch
-            else {
-                // Get all other branch refs
-            	// Setting ListMode to REMOTE lists only remote branches while ALL lists remote and local branches
-                List<Ref> otherRefs = Git.wrap(repository).branchList().setListMode(ListMode.ALL).call();
-                otherRefs.remove(ref); // remove this one
-                
-                // In-built method
-                List<Ref> refs = RevWalkUtils.findBranchesReachableFrom(latestCommit, revWalk, otherRefs);
-                isMerged = !refs.isEmpty(); // If there are other reachable branches then this is merged
-                
-                /* Another method to do this...
-                for(Ref otherRef : otherRefs) {
-                    // Get the other branch's latest commit
-                    RevCommit otherHead = revWalk.parseCommit(otherRef.getObjectId());
-
-                    // If this head is an ancestor of, or the same as, the other head then this is merged
-                    if(revWalk.isMergedInto(latestCommit, otherHead)) {
-                        isMerged = true;
-                        break;
-                    }
-                } */
-            }
-            
-            revWalk.dispose();
         }
     }
     

@@ -97,6 +97,19 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
      * checks repo.equals(fSelectedRepository) and discards stale results.
      */
     private volatile Thread fCurrentLoadThread;
+    
+    /**
+     * Cached HEAD ObjectId from selectionChanged bg thread.
+     * Used by updateActions to cheaply check RestoreCommitAction enablement.
+     */
+    private volatile ObjectId fCachedHeadId;
+    
+    /**
+     * Cached enabled states computed by selectionChanged bg thread.
+     * updateActions reuses these instead of recomputing on each commit click.
+     */
+    private volatile boolean fCachedUndoEnabled;
+    private volatile boolean fCachedResetEnabled;
 
     
     @Override
@@ -275,8 +288,8 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     
     /**
      * Update the Local Actions depending on the local selection.
-     * Expensive shouldBeEnabled() checks are computed on a background thread
-     * to avoid blocking the UI.
+     * Uses cached enabled states from selectionChanged bg thread.
+     * Only RestoreCommitAction needs per-commit check (is commit HEAD?).
      */
     private void updateActions() {
         RevCommit commit = (RevCommit)getHistoryViewer().getStructuredSelection().getFirstElement();
@@ -303,76 +316,17 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
             return;
         }
         
-        // Disable expensive actions while computing enabled state on bg thread
-        fActionRestoreCommit.setEnabled(false);
-        fActionUndoLastCommit.setEnabled(false);
-        fActionResetToRemoteCommit.setEnabled(false);
+        // RestoreCommitAction: enabled if commit is not HEAD (use cached HEAD)
+        boolean restoreEnabled = false;
+        ObjectId headId = fCachedHeadId;
+        if(commit != null && headId != null) {
+            restoreEnabled = !commit.getId().equals(headId);
+        }
+        fActionRestoreCommit.setEnabled(restoreEnabled);
         
-        // Compute expensive enabled states on background thread
-        final IArchiRepository repo = fSelectedRepository;
-        final RevCommit selectedCommit = commit;
-        Thread.ofVirtual().name("HistoryView-UpdateActions").start(() -> { //$NON-NLS-1$
-            try {
-                long t = System.nanoTime();
-                boolean restoreEnabled = false;
-                boolean undoEnabled = false;
-                boolean resetEnabled = false;
-                
-                if(repo != null && repo.getLocalRepositoryFolder().exists()) {
-                    try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
-                        Repository gitRepo = git.getRepository();
-                        ObjectId headID = gitRepo.resolve(IGraficoConstants.HEAD);
-                        
-                        // RestoreCommitAction: enabled if commit is not HEAD
-                        if(selectedCommit != null && headID != null) {
-                            restoreEnabled = !selectedCommit.getId().equals(headID);
-                        }
-                        
-                        // UndoLastCommitAction: enabled if >1 commits on branch AND head != remote
-                        if(headID != null) {
-                            try(RevWalk revWalk = new RevWalk(gitRepo)) {
-                                revWalk.markStart(revWalk.parseCommit(headID));
-                                int count = 0;
-                                for(@SuppressWarnings("unused") RevCommit c : revWalk) {
-                                    count++;
-                                    if(count > 1) {
-                                        break;
-                                    }
-                                }
-                                if(count > 1) {
-                                    undoEnabled = !repo.isHeadAndRemoteSame();
-                                }
-                            }
-                        }
-                        
-                        // ResetToRemoteCommitAction: enabled if remote branch exists AND head != remote
-                        BranchStatus status = repo.getBranchStatus();
-                        if(status != null && status.getCurrentRemoteBranch() != null) {
-                            resetEnabled = !repo.isHeadAndRemoteSame();
-                        }
-                    }
-                }
-                
-                UIPerfLogger.log("[HistoryView]", "updateActions bg computation", t); //$NON-NLS-1$ //$NON-NLS-2$
-                
-                final boolean re = restoreEnabled;
-                final boolean ue = undoEnabled;
-                final boolean rre = resetEnabled;
-                Display display = fRepoLabel.getDisplay();
-                if(!display.isDisposed()) {
-                    display.asyncExec(() -> {
-                        if(!fRepoLabel.isDisposed()) {
-                            fActionRestoreCommit.setEnabled(re);
-                            fActionUndoLastCommit.setEnabled(ue);
-                            fActionResetToRemoteCommit.setEnabled(rre);
-                        }
-                    });
-                }
-            }
-            catch(IOException | GitAPIException ex) {
-                ex.printStackTrace();
-            }
-        });
+        // UndoLastCommitAction and ResetToRemoteCommitAction: use cached states
+        fActionUndoLastCommit.setEnabled(fCachedUndoEnabled);
+        fActionResetToRemoteCommit.setEnabled(fCachedResetEnabled);
     }
     
     private void fillContextMenu(IMenuManager manager) {
@@ -449,9 +403,10 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                     long tActions = System.nanoTime();
                     boolean undoEnabled = false;
                     boolean resetEnabled = false;
+                    ObjectId headID = null;
                     try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
                         Repository gitRepo = git.getRepository();
-                        ObjectId headID = gitRepo.resolve(IGraficoConstants.HEAD);
+                        headID = gitRepo.resolve(IGraficoConstants.HEAD);
                         
                         // UndoLastCommitAction: >1 commits AND head != remote
                         if(headID != null) {
@@ -476,6 +431,11 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                         }
                     }
                     UIPerfLogger.log("[HistoryView]", "selectionChanged action enabled computation", tActions); //$NON-NLS-1$ //$NON-NLS-2$
+                    
+                    // Cache for updateActions() to reuse
+                    fCachedHeadId = headID;
+                    fCachedUndoEnabled = undoEnabled;
+                    fCachedResetEnabled = resetEnabled;
                     
                     final boolean ue = undoEnabled;
                     final boolean rre = resetEnabled;
