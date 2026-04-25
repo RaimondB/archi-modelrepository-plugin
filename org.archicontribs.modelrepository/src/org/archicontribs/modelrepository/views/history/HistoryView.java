@@ -288,7 +288,7 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     
     /**
      * Update the Local Actions depending on the local selection.
-     * Uses cached enabled states from selectionChanged bg thread.
+     * Uses cached enabled states from bg thread computations.
      * Only RestoreCommitAction needs per-commit check (is commit HEAD?).
      */
     private void updateActions() {
@@ -327,6 +327,69 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
         // UndoLastCommitAction and ResetToRemoteCommitAction: use cached states
         fActionUndoLastCommit.setEnabled(fCachedUndoEnabled);
         fActionResetToRemoteCommit.setEnabled(fCachedResetEnabled);
+    }
+    
+    /**
+     * Recompute cached action enabled states on a background thread.
+     * Called from selectionChanged, BRANCHES_CHANGED, and HISTORY_CHANGED handlers.
+     * Updates fCachedHeadId, fCachedUndoEnabled, fCachedResetEnabled, then
+     * posts updateActions() to the UI thread.
+     * 
+     * @param repo The repository to compute states for
+     * @param branchStatus The branch status (already loaded by caller)
+     */
+    private void recomputeActionStates(IArchiRepository repo, BranchStatus branchStatus) {
+        try {
+            long tActions = System.nanoTime();
+            boolean undoEnabled = false;
+            boolean resetEnabled = false;
+            ObjectId headID = null;
+            try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+                Repository gitRepo = git.getRepository();
+                headID = gitRepo.resolve(IGraficoConstants.HEAD);
+                
+                // UndoLastCommitAction: >1 commits AND head != remote
+                if(headID != null) {
+                    try(RevWalk revWalk = new RevWalk(gitRepo)) {
+                        revWalk.markStart(revWalk.parseCommit(headID));
+                        int count = 0;
+                        for(@SuppressWarnings("unused") RevCommit c : revWalk) {
+                            count++;
+                            if(count > 1) {
+                                break;
+                            }
+                        }
+                        if(count > 1) {
+                            undoEnabled = !repo.isHeadAndRemoteSame();
+                        }
+                    }
+                }
+                
+                // ResetToRemoteCommitAction: remote branch exists AND head != remote
+                if(branchStatus != null && branchStatus.getCurrentRemoteBranch() != null) {
+                    resetEnabled = !repo.isHeadAndRemoteSame();
+                }
+            }
+            UIPerfLogger.log("[HistoryView]", "recomputeActionStates", tActions); //$NON-NLS-1$ //$NON-NLS-2$
+            
+            // Cache for updateActions() to reuse
+            fCachedHeadId = headID;
+            fCachedUndoEnabled = undoEnabled;
+            fCachedResetEnabled = resetEnabled;
+            
+            // Post updateActions to UI thread so action buttons reflect new state
+            Display display = fRepoLabel.getDisplay();
+            if(!display.isDisposed()) {
+                display.asyncExec(() -> {
+                    if(!fRepoLabel.isDisposed() && repo.equals(fSelectedRepository)) {
+                        updateActions();
+                    }
+                });
+            }
+        }
+        catch(IOException | GitAPIException ex) {
+            ex.printStackTrace();
+        }
     }
     
     private void fillContextMenu(IMenuManager manager) {
@@ -400,45 +463,8 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                     UIPerfLogger.log("[HistoryView]", "selectionChanged getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
                     
                     // Pre-compute expensive action enabled states on bg thread
-                    long tActions = System.nanoTime();
-                    boolean undoEnabled = false;
-                    boolean resetEnabled = false;
-                    ObjectId headID = null;
-                    try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
-                        Repository gitRepo = git.getRepository();
-                        headID = gitRepo.resolve(IGraficoConstants.HEAD);
-                        
-                        // UndoLastCommitAction: >1 commits AND head != remote
-                        if(headID != null) {
-                            try(RevWalk revWalk = new RevWalk(gitRepo)) {
-                                revWalk.markStart(revWalk.parseCommit(headID));
-                                int count = 0;
-                                for(@SuppressWarnings("unused") RevCommit c : revWalk) {
-                                    count++;
-                                    if(count > 1) {
-                                        break;
-                                    }
-                                }
-                                if(count > 1) {
-                                    undoEnabled = !repo.isHeadAndRemoteSame();
-                                }
-                            }
-                        }
-                        
-                        // ResetToRemoteCommitAction: remote branch exists AND head != remote
-                        if(branchStatus != null && branchStatus.getCurrentRemoteBranch() != null) {
-                            resetEnabled = !repo.isHeadAndRemoteSame();
-                        }
-                    }
-                    UIPerfLogger.log("[HistoryView]", "selectionChanged action enabled computation", tActions); //$NON-NLS-1$ //$NON-NLS-2$
+                    recomputeActionStates(repo, branchStatus);
                     
-                    // Cache for updateActions() to reuse
-                    fCachedHeadId = headID;
-                    fCachedUndoEnabled = undoEnabled;
-                    fCachedResetEnabled = resetEnabled;
-                    
-                    final boolean ue = undoEnabled;
-                    final boolean rre = resetEnabled;
                     Display display = fRepoLabel.getDisplay();
                     if(!display.isDisposed()) {
                         display.asyncExec(() -> {
@@ -455,9 +481,9 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                                 fActionRestoreCommit.setRepositoryQuiet(repo);
                                 fActionRestoreCommit.setEnabled(false); // no commit selected yet
                                 fActionUndoLastCommit.setRepositoryQuiet(repo);
-                                fActionUndoLastCommit.setEnabled(ue);
+                                fActionUndoLastCommit.setEnabled(fCachedUndoEnabled);
                                 fActionResetToRemoteCommit.setRepositoryQuiet(repo);
-                                fActionResetToRemoteCommit.setEnabled(rre);
+                                fActionResetToRemoteCommit.setEnabled(fCachedResetEnabled);
                                 UIPerfLogger.log("[HistoryView]", "selectionChanged UI update total", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                             }
                         });
@@ -494,6 +520,10 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                             long tBg = System.nanoTime();
                             BranchStatus branchStatus = repository.getBranchStatus();
                             UIPerfLogger.log("[HistoryView]", "HISTORY_CHANGED getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
+                            
+                            // Recompute action states (HEAD may have changed after commit/undo/merge)
+                            recomputeActionStates(repository, branchStatus);
+                            
                             Display display = fRepoLabel.getDisplay();
                             if(!display.isDisposed()) {
                                 display.asyncExec(() -> {
@@ -538,6 +568,10 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                             long tBg = System.nanoTime();
                             BranchStatus branchStatus = repository.getBranchStatus();
                             UIPerfLogger.log("[HistoryView]", "BRANCHES_CHANGED getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
+                            
+                            // Recompute action states (branch switch may change HEAD/remote relationship)
+                            recomputeActionStates(repository, branchStatus);
+                            
                             Display display = fRepoLabel.getDisplay();
                             if(!display.isDisposed()) {
                                 display.asyncExec(() -> {

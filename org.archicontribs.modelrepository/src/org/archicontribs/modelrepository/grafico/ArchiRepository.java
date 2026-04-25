@@ -205,7 +205,12 @@ public class ArchiRepository implements IArchiRepository {
             commitCommand.setAuthor(userDetails);
             commitCommand.setMessage(commitMessage);
             commitCommand.setAmend(amend);
-            return commitCommand.call();
+            RevCommit result = commitCommand.call();
+            
+            // HEAD has changed — invalidate cached branch status
+            invalidateBranchStatusCache();
+            
+            return result;
         }
     }
     
@@ -251,6 +256,9 @@ public class ArchiRepository implements IArchiRepository {
             // After a successful push, ensure we are tracking the current branch
             setTrackedBranch(git.getRepository(), git.getRepository().getBranch());
             
+            // Remote refs have changed — invalidate cached branch status
+            invalidateBranchStatusCache();
+            
             return result;
         }
     }
@@ -262,7 +270,12 @@ public class ArchiRepository implements IArchiRepository {
             pullCommand.setTransportConfigCallback(CredentialsAuthenticator.getTransportConfigCallback(getOnlineRepositoryURL(), npw));
             pullCommand.setRebase(false); // Merge, not rebase
             pullCommand.setProgressMonitor(monitor);
-            return pullCommand.call();
+            PullResult result = pullCommand.call();
+            
+            // HEAD/remote refs may have changed — invalidate cached branch status
+            invalidateBranchStatusCache();
+            
+            return result;
         }
     }
     
@@ -369,6 +382,9 @@ public class ArchiRepository implements IArchiRepository {
                 cleanCommand.call();
             }
         }
+        
+        // HEAD has changed — invalidate cached branch status
+        invalidateBranchStatusCache();
     }
     
     @Override
@@ -619,6 +635,15 @@ public class ArchiRepository implements IArchiRepository {
     private volatile BranchStatus fCachedBranchStatus;
     private volatile long fBranchStatusTimestamp;
     private static final long BRANCH_STATUS_TTL_NANOS = 2_000_000_000L; // 2 seconds
+    
+    /**
+     * Invalidate the BranchStatus cache so the next call to getBranchStatus()
+     * fetches fresh data. Must be called after any operation that changes HEAD,
+     * refs, or the remote tracking state (reset, commit, push, pull).
+     */
+    private void invalidateBranchStatusCache() {
+        fCachedBranchStatus = null;
+    }
     
     @Override
     public BranchStatus getBranchStatus() throws IOException, GitAPIException {
