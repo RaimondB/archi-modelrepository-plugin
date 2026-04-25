@@ -6,6 +6,7 @@
 package org.archicontribs.modelrepository.views.branches;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.actions.AddBranchAction;
 import org.archicontribs.modelrepository.actions.DeleteBranchAction;
 import org.archicontribs.modelrepository.actions.DeleteStaleBranchesAction;
@@ -60,6 +61,11 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     
     private Label fRepoLabel;
     private BranchesTableViewer fBranchesTableViewer;
+    
+    /**
+     * Tracks the current background loading thread so stale threads can be detected.
+     */
+    private volatile Thread fCurrentLoadThread;
     
     private AddBranchAction fActionAddBranch;
     private SwitchBranchAction fActionSwitchBranch;
@@ -259,15 +265,24 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
             // Set label text
             fRepoLabel.setText(Messages.BranchesView_0 + " " + selectedRepository.getName()); //$NON-NLS-1$
             
+            // Cancel any stale background thread
+            Thread oldThread = fCurrentLoadThread;
+            if(oldThread != null) {
+                oldThread.interrupt();
+            }
+            
             // Load branch data on background thread to keep UI responsive
             final IArchiRepository repo = selectedRepository;
-            new Thread(() -> {
+            Thread loadThread = Thread.ofVirtual().name("BranchesView-LoadBranches").start(() -> { //$NON-NLS-1$
                 try {
+                    long tBg = System.nanoTime();
                     BranchStatus branchStatus = repo.getBranchStatus();
+                    UIPerfLogger.log("[BranchesView]", "selectionChanged getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
                     Display display = fRepoLabel.getDisplay();
                     if(!display.isDisposed()) {
                         display.asyncExec(() -> {
                             if(!fRepoLabel.isDisposed() && repo.equals(fSelectedRepository)) {
+                                long tUi = System.nanoTime();
                                 getBranchesViewer().doSetInput(repo, branchStatus);
                                 
                                 fActionAddBranch.setRepository(repo);
@@ -275,14 +290,18 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                                 fActionMergeBranch.setRepository(repo);
                                 fActionDeleteBranch.setRepository(repo);
                                 fActionDeleteStaleBranches.setRepository(repo);
+                                UIPerfLogger.log("[BranchesView]", "selectionChanged UI update", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                             }
                         });
                     }
                 }
                 catch(Exception ex) {
-                    ex.printStackTrace();
+                    if(!(ex instanceof InterruptedException)) {
+                        ex.printStackTrace();
+                    }
                 }
-            }, "BranchesView-LoadBranches").start(); //$NON-NLS-1$
+            });
+            fCurrentLoadThread = loadThread;
         }
     }
     
@@ -292,23 +311,37 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
             switch(eventName) {
                 case IRepositoryListener.HISTORY_CHANGED:
                 case IRepositoryListener.BRANCHES_CHANGED:
+                    UIPerfLogger.log("[BranchesView]", "repositoryChanged(" + eventName + ") received"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    // Cancel any stale background thread
+                    Thread oldThread = fCurrentLoadThread;
+                    if(oldThread != null) {
+                        oldThread.interrupt();
+                    }
+                    
                     // Load branch data on background thread
-                    new Thread(() -> {
+                    Thread loadThread = Thread.ofVirtual().name("BranchesView-RefreshBranches").start(() -> { //$NON-NLS-1$
                         try {
+                            long tBg = System.nanoTime();
                             BranchStatus branchStatus = repository.getBranchStatus();
+                            UIPerfLogger.log("[BranchesView]", "repositoryChanged getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
                             Display display = fRepoLabel.getDisplay();
                             if(!display.isDisposed()) {
                                 display.asyncExec(() -> {
                                     if(!fRepoLabel.isDisposed() && repository.equals(fSelectedRepository)) {
+                                        long tUi = System.nanoTime();
                                         getBranchesViewer().doSetInput(repository, branchStatus);
+                                        UIPerfLogger.log("[BranchesView]", "repositoryChanged UI update", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                                     }
                                 });
                             }
                         }
                         catch(Exception ex) {
-                            ex.printStackTrace();
+                            if(!(ex instanceof InterruptedException)) {
+                                ex.printStackTrace();
+                            }
                         }
-                    }, "BranchesView-RefreshBranches").start(); //$NON-NLS-1$
+                    });
+                    fCurrentLoadThread = loadThread;
                     break;
                     
                 case IRepositoryListener.REPOSITORY_DELETED:

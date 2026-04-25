@@ -5,7 +5,10 @@
  */
 package org.archicontribs.modelrepository.views.history;
 
+import java.io.IOException;
+
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.actions.ExtractModelFromCommitAction;
 import org.archicontribs.modelrepository.actions.ResetToRemoteCommitAction;
 import org.archicontribs.modelrepository.actions.RestoreCommitAction;
@@ -15,6 +18,7 @@ import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
+import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.archicontribs.modelrepository.grafico.RepositoryListenerManager;
 import org.eclipse.help.HelpSystem;
@@ -30,7 +34,12 @@ import org.eclipse.jface.viewers.ISelection;
 import org.eclipse.jface.viewers.ISelectionChangedListener;
 import org.eclipse.jface.viewers.IStructuredSelection;
 import org.eclipse.jface.viewers.SelectionChangedEvent;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.custom.SashForm;
 import org.eclipse.swt.layout.GridData;
@@ -81,6 +90,13 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
      * Selected repository
      */
     private IArchiRepository fSelectedRepository;
+    
+    /**
+     * Tracks the current background loading thread so stale threads can be detected.
+     * When a new selection is made, this is updated; the stale thread's asyncExec callback
+     * checks repo.equals(fSelectedRepository) and discards stale results.
+     */
+    private volatile Thread fCurrentLoadThread;
 
     
     @Override
@@ -258,30 +274,105 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     }
     
     /**
-     * Update the Local Actions depending on the local selection 
-     * @param selection
+     * Update the Local Actions depending on the local selection.
+     * Expensive shouldBeEnabled() checks are computed on a background thread
+     * to avoid blocking the UI.
      */
     private void updateActions() {
         RevCommit commit = (RevCommit)getHistoryViewer().getStructuredSelection().getFirstElement();
         
-        // Set commit in these actions
+        // Store commit in actions (cheap - no shouldBeEnabled triggered)
         fActionExtractCommit.setCommit(commit);
         fActionRestoreCommit.setCommit(commit);
         
         // Also set the commit in the Comment Viewer
         fCommentViewer.setCommit(commit);
 
-        // Update these actions
-        fActionUndoLastCommit.update();
-        fActionResetToRemoteCommit.update();
-        
-        // Disable actions if our selected branch is not actually the current branch
+        // Check if selected branch is the current branch
         BranchInfo selectedBranch = (BranchInfo)getBranchesViewer().getStructuredSelection().getFirstElement();
         boolean isCurrentBranch = selectedBranch != null && selectedBranch.isCurrentBranch();
         
-        fActionRestoreCommit.setEnabled(isCurrentBranch && fActionRestoreCommit.isEnabled());
-        fActionUndoLastCommit.setEnabled(isCurrentBranch && fActionUndoLastCommit.isEnabled());
-        fActionResetToRemoteCommit.setEnabled(isCurrentBranch && fActionResetToRemoteCommit.isEnabled());
+        // ExtractModelFromCommitAction: cheap check
+        fActionExtractCommit.setEnabled(commit != null && fActionExtractCommit.getRepository() != null);
+        
+        if(!isCurrentBranch) {
+            // Quick disable - no git I/O needed
+            fActionRestoreCommit.setEnabled(false);
+            fActionUndoLastCommit.setEnabled(false);
+            fActionResetToRemoteCommit.setEnabled(false);
+            return;
+        }
+        
+        // Disable expensive actions while computing enabled state on bg thread
+        fActionRestoreCommit.setEnabled(false);
+        fActionUndoLastCommit.setEnabled(false);
+        fActionResetToRemoteCommit.setEnabled(false);
+        
+        // Compute expensive enabled states on background thread
+        final IArchiRepository repo = fSelectedRepository;
+        final RevCommit selectedCommit = commit;
+        Thread.ofVirtual().name("HistoryView-UpdateActions").start(() -> { //$NON-NLS-1$
+            try {
+                long t = System.nanoTime();
+                boolean restoreEnabled = false;
+                boolean undoEnabled = false;
+                boolean resetEnabled = false;
+                
+                if(repo != null && repo.getLocalRepositoryFolder().exists()) {
+                    try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+                        Repository gitRepo = git.getRepository();
+                        ObjectId headID = gitRepo.resolve(IGraficoConstants.HEAD);
+                        
+                        // RestoreCommitAction: enabled if commit is not HEAD
+                        if(selectedCommit != null && headID != null) {
+                            restoreEnabled = !selectedCommit.getId().equals(headID);
+                        }
+                        
+                        // UndoLastCommitAction: enabled if >1 commits on branch AND head != remote
+                        if(headID != null) {
+                            try(RevWalk revWalk = new RevWalk(gitRepo)) {
+                                revWalk.markStart(revWalk.parseCommit(headID));
+                                int count = 0;
+                                for(@SuppressWarnings("unused") RevCommit c : revWalk) {
+                                    count++;
+                                    if(count > 1) {
+                                        break;
+                                    }
+                                }
+                                if(count > 1) {
+                                    undoEnabled = !repo.isHeadAndRemoteSame();
+                                }
+                            }
+                        }
+                        
+                        // ResetToRemoteCommitAction: enabled if remote branch exists AND head != remote
+                        BranchStatus status = repo.getBranchStatus();
+                        if(status != null && status.getCurrentRemoteBranch() != null) {
+                            resetEnabled = !repo.isHeadAndRemoteSame();
+                        }
+                    }
+                }
+                
+                UIPerfLogger.log("[HistoryView]", "updateActions bg computation", t); //$NON-NLS-1$ //$NON-NLS-2$
+                
+                final boolean re = restoreEnabled;
+                final boolean ue = undoEnabled;
+                final boolean rre = resetEnabled;
+                Display display = fRepoLabel.getDisplay();
+                if(!display.isDisposed()) {
+                    display.asyncExec(() -> {
+                        if(!fRepoLabel.isDisposed()) {
+                            fActionRestoreCommit.setEnabled(re);
+                            fActionUndoLastCommit.setEnabled(ue);
+                            fActionResetToRemoteCommit.setEnabled(rre);
+                        }
+                    });
+                }
+            }
+            catch(IOException | GitAPIException ex) {
+                ex.printStackTrace();
+            }
+        });
     }
     
     private void fillContextMenu(IMenuManager manager) {
@@ -340,30 +431,85 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
             // Set label text
             fRepoLabel.setText(Messages.HistoryView_0 + " " + selectedRepository.getName()); //$NON-NLS-1$
             
+            // Cancel any stale background thread
+            Thread oldThread = fCurrentLoadThread;
+            if(oldThread != null) {
+                oldThread.interrupt();
+            }
+            
             // Load git data on background thread to keep UI responsive
             final IArchiRepository repo = selectedRepository;
-            new Thread(() -> {
+            Thread loadThread = Thread.ofVirtual().name("HistoryView-LoadBranches").start(() -> { //$NON-NLS-1$
                 try {
+                    long tBg = System.nanoTime();
                     BranchStatus branchStatus = repo.getBranchStatus();
+                    UIPerfLogger.log("[HistoryView]", "selectionChanged getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
+                    
+                    // Pre-compute expensive action enabled states on bg thread
+                    long tActions = System.nanoTime();
+                    boolean undoEnabled = false;
+                    boolean resetEnabled = false;
+                    try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+                        Repository gitRepo = git.getRepository();
+                        ObjectId headID = gitRepo.resolve(IGraficoConstants.HEAD);
+                        
+                        // UndoLastCommitAction: >1 commits AND head != remote
+                        if(headID != null) {
+                            try(RevWalk revWalk = new RevWalk(gitRepo)) {
+                                revWalk.markStart(revWalk.parseCommit(headID));
+                                int count = 0;
+                                for(@SuppressWarnings("unused") RevCommit c : revWalk) {
+                                    count++;
+                                    if(count > 1) {
+                                        break;
+                                    }
+                                }
+                                if(count > 1) {
+                                    undoEnabled = !repo.isHeadAndRemoteSame();
+                                }
+                            }
+                        }
+                        
+                        // ResetToRemoteCommitAction: remote branch exists AND head != remote
+                        if(branchStatus != null && branchStatus.getCurrentRemoteBranch() != null) {
+                            resetEnabled = !repo.isHeadAndRemoteSame();
+                        }
+                    }
+                    UIPerfLogger.log("[HistoryView]", "selectionChanged action enabled computation", tActions); //$NON-NLS-1$ //$NON-NLS-2$
+                    
+                    final boolean ue = undoEnabled;
+                    final boolean rre = resetEnabled;
                     Display display = fRepoLabel.getDisplay();
                     if(!display.isDisposed()) {
                         display.asyncExec(() -> {
                             if(!fRepoLabel.isDisposed() && repo.equals(fSelectedRepository)) {
+                                long tUi = System.nanoTime();
                                 getHistoryViewer().doSetInput(repo, branchStatus);
+                                UIPerfLogger.log("[HistoryView]", "  historyViewer.doSetInput", tUi); //$NON-NLS-1$ //$NON-NLS-2$
+                                long t2 = System.nanoTime();
                                 getBranchesViewer().doSetInput(branchStatus);
+                                UIPerfLogger.log("[HistoryView]", "  branchesViewer.doSetInput", t2); //$NON-NLS-1$ //$NON-NLS-2$
                                 
-                                fActionExtractCommit.setRepository(repo);
-                                fActionRestoreCommit.setRepository(repo);
-                                fActionUndoLastCommit.setRepository(repo);
-                                fActionResetToRemoteCommit.setRepository(repo);
+                                // Store repo in actions without expensive shouldBeEnabled
+                                fActionExtractCommit.setRepository(repo); // cheap shouldBeEnabled
+                                fActionRestoreCommit.setRepositoryQuiet(repo);
+                                fActionRestoreCommit.setEnabled(false); // no commit selected yet
+                                fActionUndoLastCommit.setRepositoryQuiet(repo);
+                                fActionUndoLastCommit.setEnabled(ue);
+                                fActionResetToRemoteCommit.setRepositoryQuiet(repo);
+                                fActionResetToRemoteCommit.setEnabled(rre);
+                                UIPerfLogger.log("[HistoryView]", "selectionChanged UI update total", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                             }
                         });
                     }
                 }
                 catch(Exception ex) {
-                    ex.printStackTrace();
+                    if(!(ex instanceof InterruptedException)) {
+                        ex.printStackTrace();
+                    }
                 }
-            }, "HistoryView-LoadBranches").start(); //$NON-NLS-1$
+            });
+            fCurrentLoadThread = loadThread;
         }
     }
     
@@ -372,25 +518,40 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
         if(repository.equals(fSelectedRepository)) {
             switch(eventName) {
                 case IRepositoryListener.HISTORY_CHANGED:
+                    UIPerfLogger.log("[HistoryView]", "repositoryChanged(HISTORY_CHANGED) received"); //$NON-NLS-1$ //$NON-NLS-2$
                     fRepoLabel.setText(Messages.HistoryView_0 + " " + repository.getName()); //$NON-NLS-1$
                     fCommentViewer.setCommit(null);
+                    
+                    // Cancel any stale background thread
+                    Thread oldHistoryThread = fCurrentLoadThread;
+                    if(oldHistoryThread != null) {
+                        oldHistoryThread.interrupt();
+                    }
+                    
                     // Load commit history on background thread
-                    new Thread(() -> {
+                    Thread historyThread = Thread.ofVirtual().name("HistoryView-RefreshHistory").start(() -> { //$NON-NLS-1$
                         try {
+                            long tBg = System.nanoTime();
                             BranchStatus branchStatus = repository.getBranchStatus();
+                            UIPerfLogger.log("[HistoryView]", "HISTORY_CHANGED getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
                             Display display = fRepoLabel.getDisplay();
                             if(!display.isDisposed()) {
                                 display.asyncExec(() -> {
                                     if(!fRepoLabel.isDisposed() && repository.equals(fSelectedRepository)) {
+                                        long tUi = System.nanoTime();
                                         getHistoryViewer().doSetInput(repository, branchStatus);
+                                        UIPerfLogger.log("[HistoryView]", "HISTORY_CHANGED UI update", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                                     }
                                 });
                             }
                         }
                         catch(Exception ex) {
-                            ex.printStackTrace();
+                            if(!(ex instanceof InterruptedException)) {
+                                ex.printStackTrace();
+                            }
                         }
-                    }, "HistoryView-RefreshHistory").start(); //$NON-NLS-1$
+                    });
+                    fCurrentLoadThread = historyThread;
                     break;
                     
                 case IRepositoryListener.REPOSITORY_DELETED:
@@ -404,23 +565,38 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                     break;
 
                 case IRepositoryListener.BRANCHES_CHANGED:
+                    UIPerfLogger.log("[HistoryView]", "repositoryChanged(BRANCHES_CHANGED) received"); //$NON-NLS-1$ //$NON-NLS-2$
+                    // Cancel any stale background thread
+                    Thread oldBranchThread = fCurrentLoadThread;
+                    if(oldBranchThread != null) {
+                        oldBranchThread.interrupt();
+                    }
+                    
                     // Load branch data on background thread
-                    new Thread(() -> {
+                    Thread branchThread = Thread.ofVirtual().name("HistoryView-RefreshBranches").start(() -> { //$NON-NLS-1$
                         try {
+                            long tBg = System.nanoTime();
                             BranchStatus branchStatus = repository.getBranchStatus();
+                            UIPerfLogger.log("[HistoryView]", "BRANCHES_CHANGED getBranchStatus", tBg); //$NON-NLS-1$ //$NON-NLS-2$
                             Display display = fRepoLabel.getDisplay();
                             if(!display.isDisposed()) {
                                 display.asyncExec(() -> {
                                     if(!fRepoLabel.isDisposed() && repository.equals(fSelectedRepository)) {
+                                        long tUi = System.nanoTime();
+                                        getHistoryViewer().doSetInput(repository, branchStatus);
                                         getBranchesViewer().doSetInput(branchStatus);
+                                        UIPerfLogger.log("[HistoryView]", "BRANCHES_CHANGED UI update", tUi); //$NON-NLS-1$ //$NON-NLS-2$
                                     }
                                 });
                             }
                         }
                         catch(Exception ex) {
-                            ex.printStackTrace();
+                            if(!(ex instanceof InterruptedException)) {
+                                ex.printStackTrace();
+                            }
                         }
-                    }, "HistoryView-RefreshBranches").start(); //$NON-NLS-1$
+                    });
+                    fCurrentLoadThread = branchThread;
                     break;
                     
                 default:

@@ -48,6 +48,15 @@ public abstract class AbstractModelAction extends Action implements IGraficoMode
 	    setEnabled(shouldBeEnabled());
 	}
 	
+	/**
+	 * Store the repository reference without triggering shouldBeEnabled().
+	 * Use when the caller will manage the enabled state separately
+	 * (e.g., computing it on a background thread).
+	 */
+	public void setRepositoryQuiet(IArchiRepository repository) {
+	    fRepository = repository;
+	}
+	
 	@Override
 	public IArchiRepository getRepository() {
 	    return fRepository;

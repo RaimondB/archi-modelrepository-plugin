@@ -40,9 +40,11 @@ public class RestoreCommitAction extends AbstractModelAction {
         setToolTipText(Messages.RestoreCommitAction_0);
     }
 
+    /**
+     * Store the commit. Caller manages enabled state.
+     */
     public void setCommit(RevCommit commit) {
         fCommit = commit;
-        setEnabled(shouldBeEnabled());
     }
     
     @Override

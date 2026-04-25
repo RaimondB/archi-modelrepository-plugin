@@ -11,6 +11,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.text.MessageFormat;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
@@ -35,6 +36,8 @@ import com.archimatetool.model.IArchimateModel;
  */
 public class SwitchBranchAction extends AbstractModelAction {
     
+    private static final String TAG = "[SwitchBranch]"; //$NON-NLS-1$
+    
     private BranchInfo fBranchInfo;
     
     public SwitchBranchAction(IWorkbenchWindow window) {
@@ -49,6 +52,9 @@ public class SwitchBranchAction extends AbstractModelAction {
         if(!shouldBeEnabled()) {
             return;
         }
+
+        long t0 = System.nanoTime();
+        UIPerfLogger.log(TAG, "run() START"); //$NON-NLS-1$
 
         // Keep a local reference in case of a notification event changing the current branch selection in the UI
         BranchInfo branchInfo = fBranchInfo;
@@ -197,17 +203,21 @@ public class SwitchBranchAction extends AbstractModelAction {
             }
             
             // Phase 2 & 3: Switch branch and load model with combined progress
+            UIPerfLogger.log(TAG, "switchBranchWithProgress() START", t0); //$NON-NLS-1$
             switchBranchWithProgress(branchInfo, !isBranchRefSameAsCurrentBranchRef(branchInfo));
+            UIPerfLogger.log(TAG, "switchBranchWithProgress() END", t0); //$NON-NLS-1$
         }
         catch(Exception ex) {
             displayErrorDialog(Messages.SwitchBranchAction_0, ex);
         }
 
         // Notify listeners last because a new UI selection will trigger an updated BranchInfo here
+        UIPerfLogger.log(TAG, "notifyChangeListeners START", t0); //$NON-NLS-1$
         if(notifyHistoryChanged) {
             notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
         }
         notifyChangeListeners(IRepositoryListener.BRANCHES_CHANGED);
+        UIPerfLogger.log(TAG, "run() END total", t0); //$NON-NLS-1$
     }
     
     /**
@@ -229,6 +239,7 @@ public class SwitchBranchAction extends AbstractModelAction {
         IArchimateModel[] importedModel = new IArchimateModel[1];
         GraficoModelImporter[] importerRef = new GraficoModelImporter[1];
         boolean[] checkoutCompleted = new boolean[1];
+        long tSwitch = System.nanoTime();
         
         // Use ProgressMonitorDialog directly so we can control the cancel button
         ProgressMonitorDialog dialog = new ProgressMonitorDialog(fWindow.getShell());
@@ -249,12 +260,15 @@ public class SwitchBranchAction extends AbstractModelAction {
                             throw new InterruptedException("Cancelled before checkout");
                         }
                         
+                        long tCheckout = System.nanoTime();
                         performGitCheckoutWithMonitor(branchInfo, progress.split(30));
                         checkoutCompleted[0] = true;
+                        UIPerfLogger.log(TAG, "git checkout", tCheckout); //$NON-NLS-1$
                         
                         // Phase 2: Import model files (70%) - NOT CANCELLABLE
                         // After checkout, we MUST complete import to keep model consistent
                         if(doReloadGrafico) {
+                            long tImport = System.nanoTime();
                             // Disable cancellation for import phase
                             // Note: SubMonitor doesn't directly support this, but we ignore cancel
                             progress.subTask(MessageFormat.format(Messages.SwitchBranchAction_20, branchInfo.getShortName()));
@@ -263,6 +277,7 @@ public class SwitchBranchAction extends AbstractModelAction {
                             // Create a non-cancellable wrapper for the import
                             IProgressMonitor nonCancellableMonitor = new NonCancellableProgressMonitor(progress.split(70));
                             importedModel[0] = importerRef[0].importAsModel(nonCancellableMonitor);
+                            UIPerfLogger.log(TAG, "grafico import", tImport); //$NON-NLS-1$
                         }
                     }
                     catch(IOException | GitAPIException ex) {
@@ -285,6 +300,8 @@ public class SwitchBranchAction extends AbstractModelAction {
             }
             // Should not happen - import phase ignores cancellation
         }
+        
+        UIPerfLogger.log(TAG, "dialog.run() returned", tSwitch); //$NON-NLS-1$
         
         // Re-throw any exception from the background phase
         if(exception[0] != null) {
@@ -309,17 +326,22 @@ public class SwitchBranchAction extends AbstractModelAction {
         
         // Phase 3: UI operations on UI thread (required because they trigger UI property changes)
         if(doReloadGrafico && importedModel[0] != null) {
+            long tOpen = System.nanoTime();
             new GraficoModelLoader(getRepository()).openModel(importedModel[0], importerRef[0]);
             getRepository().saveChecksum();
+            UIPerfLogger.log(TAG, "openModel + saveChecksum", tOpen); //$NON-NLS-1$
         } else if(doReloadGrafico && checkoutCompleted[0]) {
             // Checkout completed but import returned null - try to recover
             try {
+                long tLoad = System.nanoTime();
                 new GraficoModelLoader(getRepository()).loadModel();
                 getRepository().saveChecksum();
+                UIPerfLogger.log(TAG, "loadModel (recovery) + saveChecksum", tLoad); //$NON-NLS-1$
             } catch(IOException loadEx) {
                 throw loadEx;
             }
         }
+        UIPerfLogger.log(TAG, "switchBranchWithProgress total", tSwitch); //$NON-NLS-1$
     }
     
     /**

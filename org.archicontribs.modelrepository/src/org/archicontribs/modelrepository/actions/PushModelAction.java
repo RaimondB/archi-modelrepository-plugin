@@ -68,83 +68,80 @@ public class PushModelAction extends RefreshModelAction {
                 return;
             }
 
-            // Do main action with PM dialog
-            Display.getCurrent().asyncExec(new Runnable() {
+            // Do main action with PM dialog — run on background thread (true)
+            ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+            
+            pmDialog.run(true, true, new IRunnableWithProgress() {
                 @Override
-                public void run() {
-                    ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
-                    
+                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
                     try {
-                        pmDialog.run(false, true, new IRunnableWithProgress() {
-                            @Override
-                            public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                                try {
-                                    monitor.beginTask(Messages.PushModelAction_1, -1);
-                                    
-                                    // Update Proxy
-                                    ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
-                                    
-                                    // Pull
-                                    int status = pull(npw, pmDialog);
-                                    
-                                    // Push
-                                    if(status == PULL_STATUS_OK || status == PULL_STATUS_UP_TO_DATE) {
-                                        Iterable<PushResult> pushResult = push(npw, pmDialog);
-                                        
-                                        // Get any errors in Push Results
-                                        StringBuilder sb = new StringBuilder();
-                                        
-                                        pushResult.forEach(result -> {
-                                            result.getRemoteUpdates().stream()
-                                                    .filter(update -> update.getStatus() != RemoteRefUpdate.Status.OK)
-                                                    .filter(update -> update.getStatus() != RemoteRefUpdate.Status.UP_TO_DATE)
-                                                    .forEach(update -> {
-                                                        sb.append(update.getStatus().name() + "\n"); // Status enum name //$NON-NLS-1$
-                                                        sb.append(update.getRemoteName() + "\n"); //$NON-NLS-1$
-                                                        
-                                                        String msgs = result.getMessages();
-                                                        if(StringUtils.isSet(msgs)) {
-                                                            // First char can be zero byte and message will not show on Windows
-                                                            if(msgs.charAt(0) == 0) {
-                                                                msgs = msgs.substring(1);
-                                                            }
-                                                            
-                                                            sb.append(msgs + "\n"); //$NON-NLS-1$
-                                                        }
-                                                    });
+                        monitor.beginTask(Messages.PushModelAction_1, -1);
+                        
+                        // Update Proxy
+                        ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
+                        
+                        // Pull
+                        int status = pull(npw, monitor);
+                        
+                        // Push
+                        if(status == PULL_STATUS_OK || status == PULL_STATUS_UP_TO_DATE) {
+                            Iterable<PushResult> pushResult = push(npw, monitor);
+                            
+                            // Get any errors in Push Results
+                            StringBuilder sb = new StringBuilder();
+                            
+                            pushResult.forEach(result -> {
+                                result.getRemoteUpdates().stream()
+                                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.OK)
+                                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.UP_TO_DATE)
+                                        .forEach(update -> {
+                                            sb.append(update.getStatus().name() + "\n"); // Status enum name //$NON-NLS-1$
+                                            sb.append(update.getRemoteName() + "\n"); //$NON-NLS-1$
+                                            
+                                            String msgs = result.getMessages();
+                                            if(StringUtils.isSet(msgs)) {
+                                                // First char can be zero byte and message will not show on Windows
+                                                if(msgs.charAt(0) == 0) {
+                                                    msgs = msgs.substring(1);
+                                                }
+                                                
+                                                sb.append(msgs + "\n"); //$NON-NLS-1$
+                                            }
                                         });
-                                        
-                                        if(sb.length() != 0) {
-                                            pmDialog.getShell().setVisible(false);
-                                            displayErrorDialog(Messages.PushModelAction_0, sb.toString());
-                                        }
-                                    }
-                                }
-                                catch(Exception ex) {
-                                    pmDialog.getShell().setVisible(false);
-                                    displayErrorDialog(Messages.PushModelAction_0, ex);
-                                }
-                                finally {
-                                    try {
-                                        saveChecksumAndNotifyListeners();
-                                    }
-                                    catch(IOException ex) {
-                                        ex.printStackTrace();
-                                    }
-                                    
-                                    // Clear credentials
-                                    if(npw != null) {
-                                        npw.clear();
-                                    }
-                                    
-                                    // Clear Proxy
-                                    ProxyAuthenticator.clear();
-                                }
+                            });
+                            
+                            if(sb.length() != 0) {
+                                Display.getDefault().syncExec(() -> {
+                                    displayErrorDialog(Messages.PushModelAction_0, sb.toString());
+                                });
                             }
+                        }
+                    }
+                    catch(Exception ex) {
+                        Display.getDefault().syncExec(() -> {
+                            displayErrorDialog(Messages.PushModelAction_0, ex);
                         });
                     }
-                    catch(InvocationTargetException | InterruptedException ex) {
-                        ex.printStackTrace();
+                    finally {
+                        try {
+                            Display.getDefault().syncExec(() -> {
+                                try {
+                                    saveChecksumAndNotifyListeners();
+                                }
+                                catch(IOException ex) {
+                                    ex.printStackTrace();
+                                }
+                            });
+                        }
+                        finally {
+                            // Clear credentials
+                            if(npw != null) {
+                                npw.clear();
+                            }
+                            
+                            // Clear Proxy
+                            ProxyAuthenticator.clear();
+                        }
                     }
                 }
             });
@@ -157,9 +154,8 @@ public class PushModelAction extends RefreshModelAction {
         }
     }
     
-    Iterable<PushResult> push(UsernamePassword npw, ProgressMonitorDialog pmDialog) throws IOException, GitAPIException {
-        pmDialog.getProgressMonitor().subTask(Messages.PushModelAction_2);
-        Display.getCurrent().readAndDispatch();  // update dialog
-        return getRepository().pushToRemote(npw, new ProgressMonitorWrapper(pmDialog.getProgressMonitor()));
+    Iterable<PushResult> push(UsernamePassword npw, IProgressMonitor monitor) throws IOException, GitAPIException {
+        monitor.subTask(Messages.PushModelAction_2);
+        return getRepository().pushToRemote(npw, new ProgressMonitorWrapper(monitor));
     }
 }

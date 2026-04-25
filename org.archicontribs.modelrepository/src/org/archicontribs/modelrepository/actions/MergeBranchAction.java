@@ -118,42 +118,40 @@ public class MergeBranchAction extends AbstractModelAction {
             }
         }
 
-        // Do main action with PM dialog
-        Display.getCurrent().asyncExec(new Runnable() {
-            @Override
-            public void run() {
-                ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
-                try {
-                    pmDialog.run(false, true, new IRunnableWithProgress() {
-                        @Override
-                        public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+        // Do main action with PM dialog — run on background thread (true)
+        ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+        try {
+            pmDialog.run(true, true, new IRunnableWithProgress() {
+                @Override
+                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                    try {
+                        monitor.beginTask(Messages.MergeBranchAction_11, -1);
+                        
+                        // Store currentBranch first
+                        BranchInfo currentBranch = getRepository().getBranchStatus().getCurrentLocalBranch();
+                        merge(currentBranch, branchToMerge, monitor);
+                    }
+                    catch(Exception ex) {
+                        Display.getDefault().syncExec(() -> {
+                            displayErrorDialog(Messages.MergeBranchAction_1, ex);
+                        });
+                    }
+                    finally {
+                        Display.getDefault().syncExec(() -> {
                             try {
-                                monitor.beginTask(Messages.MergeBranchAction_11, -1);
-                                
-                                // Store currentBranch first
-                                BranchInfo currentBranch = getRepository().getBranchStatus().getCurrentLocalBranch();
-                                merge(currentBranch, branchToMerge, pmDialog);
+                                saveChecksumAndNotifyListeners();
                             }
-                            catch(Exception ex) {
-                                pmDialog.getShell().setVisible(false);
-                                displayErrorDialog(Messages.MergeBranchAction_1, ex);
+                            catch(IOException ex) {
+                                ex.printStackTrace();
                             }
-                            finally {
-                                try {
-                                    saveChecksumAndNotifyListeners();
-                                }
-                                catch(IOException ex) {
-                                    ex.printStackTrace();
-                                }
-                            }
-                        }
-                    });
+                        });
+                    }
                 }
-                catch(InvocationTargetException | InterruptedException ex) {
-                    ex.printStackTrace();
-                }
-            }
-        });
+            });
+        }
+        catch(InvocationTargetException | InterruptedException ex) {
+            ex.printStackTrace();
+        }
     }
     
     private void doOnlineMerge(BranchInfo branchToMerge) throws IOException, GitAPIException, GeneralSecurityException {
@@ -181,113 +179,113 @@ public class MergeBranchAction extends AbstractModelAction {
             return;
         }
         
-        // Do main action with PM dialog
-        Display.getCurrent().asyncExec(new Runnable() {
-            @Override
-            public void run() {
-                ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
-                
-                try {
-                    pmDialog.run(false, true, new IRunnableWithProgress() {
-                        @Override
-                        public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                            try {
-                                // Update Proxy
-                                ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
-                                
-                                monitor.beginTask(Messages.MergeBranchAction_11, -1);
-                                
-                                // Pull
-                                int pullStatus = pushAction.pull(npw, pmDialog);
-                                
-                                // Push
-                                if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
-                                    pushAction.push(npw, pmDialog);
-                                }
-                                else {
-                                    return;
-                                }
-                                
-                                // Switch to other branch
-                                pmDialog.getProgressMonitor().subTask(Messages.MergeBranchAction_14);
-                                SwitchBranchAction switchBranchAction = new SwitchBranchAction(fWindow);
-                                switchBranchAction.setRepository(getRepository());
-                                switchBranchAction.switchBranch(branchToMerge, true);
-                                
-                                // Pull again
-                                pullStatus = pushAction.pull(npw, pmDialog);
-                                
-                                // Push
-                                if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
-                                    pushAction.push(npw, pmDialog);
-                                }
-                                else {
-                                    return;
-                                }
-                                
-                                // Switch back
-                                pmDialog.getProgressMonitor().subTask(Messages.MergeBranchAction_14);
-                                switchBranchAction.switchBranch(currentBranch, true);
-                                
-                                // Merge
-                                merge(currentBranch, branchToMerge, pmDialog);
-                                
-                                // Final Push on this branch
-                                pushAction.push(npw, pmDialog);
-                                
-                                // Ask user to delete branch (if not master)
-                                DeleteBranchAction deleteBranchAction = new DeleteBranchAction(fWindow);
-                                deleteBranchAction.setRepository(getRepository());
-                                deleteBranchAction.setBranch(branchToMerge);
-                                
-                                if(deleteBranchAction.shouldBeEnabled()) {
-                                    pmDialog.getShell().setVisible(false);
-                                    boolean doDeleteBranch = MessageDialog.openQuestion(fWindow.getShell(),
-                                            Messages.MergeBranchAction_1,
-                                            NLS.bind(Messages.MergeBranchAction_9, branchToMerge.getShortName()));
+        // Do main action with PM dialog — run on background thread (true)
+        ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+        
+        try {
+            pmDialog.run(true, true, new IRunnableWithProgress() {
+                @Override
+                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
+                    try {
+                        // Update Proxy
+                        ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
+                        
+                        monitor.beginTask(Messages.MergeBranchAction_11, -1);
+                        
+                        // Pull
+                        int pullStatus = pushAction.pull(npw, monitor);
+                        
+                        // Push
+                        if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
+                            pushAction.push(npw, monitor);
+                        }
+                        else {
+                            return;
+                        }
+                        
+                        // Switch to other branch
+                        monitor.subTask(Messages.MergeBranchAction_14);
+                        SwitchBranchAction switchBranchAction = new SwitchBranchAction(fWindow);
+                        switchBranchAction.setRepository(getRepository());
+                        switchBranchAction.switchBranch(branchToMerge, true);
+                        
+                        // Pull again
+                        pullStatus = pushAction.pull(npw, monitor);
+                        
+                        // Push
+                        if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
+                            pushAction.push(npw, monitor);
+                        }
+                        else {
+                            return;
+                        }
+                        
+                        // Switch back
+                        monitor.subTask(Messages.MergeBranchAction_14);
+                        switchBranchAction.switchBranch(currentBranch, true);
+                        
+                        // Merge
+                        merge(currentBranch, branchToMerge, monitor);
+                        
+                        // Final Push on this branch
+                        pushAction.push(npw, monitor);
+                        
+                        // Ask user to delete branch (if not master)
+                        DeleteBranchAction deleteBranchAction = new DeleteBranchAction(fWindow);
+                        deleteBranchAction.setRepository(getRepository());
+                        deleteBranchAction.setBranch(branchToMerge);
+                        
+                        if(deleteBranchAction.shouldBeEnabled()) {
+                            final boolean[] doDeleteBranch = new boolean[1];
+                            Display.getDefault().syncExec(() -> {
+                                doDeleteBranch[0] = MessageDialog.openQuestion(fWindow.getShell(),
+                                        Messages.MergeBranchAction_1,
+                                        NLS.bind(Messages.MergeBranchAction_9, branchToMerge.getShortName()));
+                            });
 
-                                    if(doDeleteBranch) {
-                                        pmDialog.getShell().setVisible(true);
-                                        pmDialog.getProgressMonitor().subTask(Messages.MergeBranchAction_12);
-                                        // Branch will have been pushed at this point so BranchInfo is no longer valid to determine if it's just a local branch
-                                        deleteBranchAction.deleteBranchAndPush(branchToMerge, npw);
-                                    }
-                                }
+                            if(doDeleteBranch[0]) {
+                                monitor.subTask(Messages.MergeBranchAction_12);
+                                // Branch will have been pushed at this point so BranchInfo is no longer valid to determine if it's just a local branch
+                                deleteBranchAction.deleteBranchAndPush(branchToMerge, npw);
                             }
-                            catch(Exception ex) {
-                                pmDialog.getShell().setVisible(false);
-                                displayErrorDialog(Messages.MergeBranchAction_1, ex);
-                            }
-                            finally {
+                        }
+                    }
+                    catch(Exception ex) {
+                        Display.getDefault().syncExec(() -> {
+                            displayErrorDialog(Messages.MergeBranchAction_1, ex);
+                        });
+                    }
+                    finally {
+                        try {
+                            Display.getDefault().syncExec(() -> {
                                 try {
                                     saveChecksumAndNotifyListeners();
                                 }
                                 catch(IOException ex) {
                                     ex.printStackTrace();
                                 }
-                                
-                                // Clear Proxy
-                                ProxyAuthenticator.clear();
-                                
-                                // Clear credentials
-                                if(npw != null) {
-                                    npw.clear();
-                                }
+                            });
+                        }
+                        finally {
+                            // Clear Proxy
+                            ProxyAuthenticator.clear();
+                            
+                            // Clear credentials
+                            if(npw != null) {
+                                npw.clear();
                             }
                         }
-                    });
+                    }
                 }
-                catch(InvocationTargetException | InterruptedException ex) {
-                    ex.printStackTrace();
-                }
-            }
-        });
-
+            });
+        }
+        catch(InvocationTargetException | InterruptedException ex) {
+            ex.printStackTrace();
+        }
     }
     
-    private int merge(BranchInfo currentBranch, BranchInfo branchToMerge, ProgressMonitorDialog pmDialog) throws GitAPIException, IOException {
-        pmDialog.getProgressMonitor().subTask(Messages.MergeBranchAction_13);
-        Display.getCurrent().readAndDispatch();  // update dialog
+    private int merge(BranchInfo currentBranch, BranchInfo branchToMerge, IProgressMonitor monitor) throws GitAPIException, IOException {
+        monitor.subTask(Messages.MergeBranchAction_13);
 
         try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
             ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
@@ -313,7 +311,7 @@ public class MergeBranchAction extends AbstractModelAction {
                         getRepository(), fWindow.getShell());
                 
                 try {
-                    handler.init(pmDialog.getProgressMonitor());
+                    handler.init(monitor);
                 }
                 catch(IOException | GitAPIException ex) {
                     handler.resetToLocalState(); // Clean up
@@ -328,13 +326,13 @@ public class MergeBranchAction extends AbstractModelAction {
                 String dialogMessage = NLS.bind(Messages.MergeBranchAction_10,
                         branchToMerge.getShortName(), currentBranch.getShortName());
                 
-                pmDialog.getShell().setVisible(false);
+                // Show conflicts dialog on UI thread
+                final boolean[] dialogResult = new boolean[1];
+                Display.getDefault().syncExec(() -> {
+                    dialogResult[0] = handler.openConflictsDialog(dialogMessage);
+                });
                 
-                boolean result = handler.openConflictsDialog(dialogMessage);
-                
-                pmDialog.getShell().setVisible(true);
-                
-                if(result) {
+                if(dialogResult[0]) {
                     handler.merge();
                     ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] handler.merge() completed", null); //$NON-NLS-1$
                 }
@@ -367,8 +365,21 @@ public class MergeBranchAction extends AbstractModelAction {
             ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] applyFolderMoveResolutions: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
             
             t = System.nanoTime();
-            loader.loadModel();
-            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] loadModel: " + (System.nanoTime() - t) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
+            // Reload the model from the Grafico XML files (must be on UI thread)
+            final IOException[] loadEx = new IOException[1];
+            final long loadStart = t;
+            Display.getDefault().syncExec(() -> {
+                try {
+                    loader.loadModel();
+                }
+                catch(IOException ex) {
+                    loadEx[0] = ex;
+                }
+            });
+            if(loadEx[0] != null) {
+                throw loadEx[0];
+            }
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] loadModel: " + (System.nanoTime() - loadStart) / 1_000_000 + "ms", null); //$NON-NLS-1$ //$NON-NLS-2$
             
             // Do a commit if needed
             t = System.nanoTime();

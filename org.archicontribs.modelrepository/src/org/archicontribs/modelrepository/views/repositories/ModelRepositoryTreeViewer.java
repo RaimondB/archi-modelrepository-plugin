@@ -12,9 +12,12 @@ import java.util.ArrayList;
 import java.util.Hashtable;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
@@ -59,7 +62,12 @@ public class ModelRepositoryTreeViewer extends TreeViewer implements IRepository
         }
     }
     
-    private Map<IArchiRepository, StatusCache> cache;
+    private volatile Map<IArchiRepository, StatusCache> cache = new Hashtable<>();
+    
+    /**
+     * Background thread for status cache refresh
+     */
+    private volatile Thread fCacheRefreshThread;
 
     /**
      * Constructor
@@ -105,12 +113,9 @@ public class ModelRepositoryTreeViewer extends TreeViewer implements IRepository
 
     protected void refreshInBackground() {
         if(!getControl().isDisposed()) {
-            getControl().getDisplay().asyncExec(new Runnable() {
-                @Override
-                public void run() {
-                    if(!getControl().isDisposed()) {
-                        refresh();
-                    }
+            refreshStatusCacheInBackground(() -> {
+                if(!getControl().isDisposed()) {
+                    refresh();
                 }
             });
         }
@@ -118,18 +123,31 @@ public class ModelRepositoryTreeViewer extends TreeViewer implements IRepository
 
     @Override
     public void repositoryChanged(String eventName, IArchiRepository repository) {
+        UIPerfLogger.log("[RepoTreeViewer]", "repositoryChanged(" + eventName + ") received"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         switch(eventName) {
             case IRepositoryListener.REPOSITORY_ADDED:
-                refresh();
-                setSelection(new StructuredSelection(repository));
+                refreshStatusCacheInBackground(() -> {
+                    if(!getControl().isDisposed()) {
+                        refresh();
+                        setSelection(new StructuredSelection(repository));
+                    }
+                });
                 break;
                 
             case IRepositoryListener.REPOSITORY_DELETED:
-                refresh();
+                refreshStatusCacheInBackground(() -> {
+                    if(!getControl().isDisposed()) {
+                        refresh();
+                    }
+                });
                 break;
 
             default:
-                refresh();
+                refreshStatusCacheInBackground(() -> {
+                    if(!getControl().isDisposed()) {
+                        refresh();
+                    }
+                });
                 break;
         }
     }
@@ -163,24 +181,77 @@ public class ModelRepositoryTreeViewer extends TreeViewer implements IRepository
     }
     
     /**
-     * Update the status cache
+     * Update the status cache (can be called from any thread)
      */
     private void updateStatusCache(List<IArchiRepository> repos) {
-        cache = new Hashtable<IArchiRepository, StatusCache>();
+        Map<IArchiRepository, StatusCache> newCache = new ConcurrentHashMap<>();
+        
+        // Process repos in parallel using virtual threads
+        CountDownLatch latch = new CountDownLatch(repos.size());
         
         for(IArchiRepository repo : repos) {
+            Thread.ofVirtual().name("StatusCache-" + repo.getName()).start(() -> { //$NON-NLS-1$
+                try {
+                    BranchInfo branchInfo = repo.getBranchStatus().getCurrentLocalBranch();
+                    if(branchInfo != null) { // This can be null!!
+                        StatusCache sc = new StatusCache(branchInfo, repo.hasLocalChanges());
+                        newCache.put(repo, sc);
+                    }
+                }
+                catch(IOException | GitAPIException ex) {
+                    ex.printStackTrace();
+                    ModelRepositoryPlugin.getInstance().log(IStatus.ERROR, "Error getting Model Repository Status", ex); //$NON-NLS-1$
+                }
+                finally {
+                    latch.countDown();
+                }
+            });
+        }
+        
+        try {
+            latch.await();
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+        }
+        
+        cache = newCache;
+    }
+    
+    /**
+     * Refresh the status cache on a background thread, then run the UI callback on the display thread.
+     */
+    private void refreshStatusCacheInBackground(Runnable uiCallback) {
+        // Cancel any stale refresh thread
+        Thread oldThread = fCacheRefreshThread;
+        if(oldThread != null) {
+            oldThread.interrupt();
+        }
+        
+        Thread refreshThread = Thread.ofVirtual().name("ModelRepositoryTreeViewer-CacheRefresh").start(() -> { //$NON-NLS-1$
             try {
-                BranchInfo branchInfo = repo.getBranchStatus().getCurrentLocalBranch();
-                if(branchInfo != null) { // This can be null!!
-                    StatusCache sc = new StatusCache(branchInfo, repo.hasLocalChanges());
-                    cache.put(repo, sc);
+                long tBg = System.nanoTime();
+                List<IArchiRepository> repos = getRepositories(getRootFolder());
+                updateStatusCache(repos);
+                UIPerfLogger.log("[RepoTreeViewer]", "refreshStatusCacheInBackground updateStatusCache", tBg); //$NON-NLS-1$ //$NON-NLS-2$
+                
+                if(!getControl().isDisposed()) {
+                    getControl().getDisplay().asyncExec(() -> {
+                        if(!getControl().isDisposed()) {
+                            long tUi = System.nanoTime();
+                            uiCallback.run();
+                            UIPerfLogger.log("[RepoTreeViewer]", "refreshStatusCacheInBackground UI callback", tUi); //$NON-NLS-1$ //$NON-NLS-2$
+                        }
+                    });
                 }
             }
-            catch(IOException | GitAPIException ex) {
-                ex.printStackTrace();
-                ModelRepositoryPlugin.getInstance().log(IStatus.ERROR, "Error getting Model Repository Status", ex); //$NON-NLS-1$
+            catch(Exception ex) {
+                if(!(ex instanceof InterruptedException)) {
+                    ex.printStackTrace();
+                }
             }
-        }
+        });
+        fCacheRefreshThread = refreshThread;
     }
     
     // ===============================================================================================
@@ -220,7 +291,10 @@ public class ModelRepositoryTreeViewer extends TreeViewer implements IRepository
         public Object[] getChildren(Object parent) {
             if(parent instanceof File) {
                 List<IArchiRepository> repos = getRepositories((File)parent);
-                updateStatusCache(repos); // update status cache
+                // If cache is empty (first load), populate synchronously for initial display
+                if(cache.isEmpty() && !repos.isEmpty()) {
+                    updateStatusCache(repos);
+                }
                 return repos.toArray();
             }
             

@@ -101,57 +101,52 @@ public class RefreshModelAction extends AbstractModelAction {
                 return;
             }
 
-            // Do main action with PM dialog
-            Display.getCurrent().asyncExec(new Runnable() {
+            // Do main action with PM dialog — run on background thread (true)
+            ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+            
+            pmDialog.run(true, true, new IRunnableWithProgress() {
                 @Override
-                public void run() {
+                public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
                     try {
-                        ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+                        // Update Proxy
+                        ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
                         
-                        pmDialog.run(false, true, new IRunnableWithProgress() {
-                            @Override
-                            public void run(IProgressMonitor monitor) throws InvocationTargetException, InterruptedException {
-                                try {
-                                    // Update Proxy
-                                    ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
-                                    
-                                    monitor.beginTask(Messages.RefreshModelAction_5, -1);
-                                    int status = pull(npw, pmDialog);
-                                    if(status == PULL_STATUS_UP_TO_DATE) {
-                                        pmDialog.getShell().setVisible(false);
-                                        MessageDialog.openInformation(fWindow.getShell(), Messages.RefreshModelAction_0, Messages.RefreshModelAction_2);
-                                    }
-                                }
-                                catch(Exception ex) {
-                                    pmDialog.getShell().setVisible(false);
-                                    displayErrorDialog(Messages.RefreshModelAction_0, ex);
-                                }
-                                finally {
-                                    try {
-                                        saveChecksumAndNotifyListeners();
-                                    }
-                                    catch(IOException ex) {
-                                        ex.printStackTrace();
-                                    }
-                                    
-                                    // Clear Proxy
-                                    ProxyAuthenticator.clear();
-                                }
-                            }
+                        monitor.beginTask(Messages.RefreshModelAction_5, -1);
+                        int status = pull(npw, monitor);
+                        if(status == PULL_STATUS_UP_TO_DATE) {
+                            Display.getDefault().syncExec(() -> {
+                                MessageDialog.openInformation(fWindow.getShell(), Messages.RefreshModelAction_0, Messages.RefreshModelAction_2);
+                            });
+                        }
+                    }
+                    catch(Exception ex) {
+                        Display.getDefault().syncExec(() -> {
+                            displayErrorDialog(Messages.RefreshModelAction_0, ex);
                         });
                     }
-                    catch(InvocationTargetException | InterruptedException ex) {
-                        ex.printStackTrace();
-                    }
                     finally {
-                        // Clear credentials
-                        if(npw != null) {
-                            npw.clear();
+                        try {
+                            Display.getDefault().syncExec(() -> {
+                                try {
+                                    saveChecksumAndNotifyListeners();
+                                }
+                                catch(IOException ex) {
+                                    ex.printStackTrace();
+                                }
+                            });
+                        }
+                        finally {
+                            // Clear Proxy
+                            ProxyAuthenticator.clear();
+                            
+                            // Clear credentials
+                            if(npw != null) {
+                                npw.clear();
+                            }
                         }
                     }
                 }
             });
-            
         }
         catch(GeneralSecurityException ex) {
             displayCredentialsErrorDialog(ex);
@@ -187,7 +182,7 @@ public class RefreshModelAction extends AbstractModelAction {
         return USER_OK;
     }
     
-    protected int pull(UsernamePassword npw, ProgressMonitorDialog pmDialog) throws IOException, GitAPIException  {
+    protected int pull(UsernamePassword npw, IProgressMonitor monitor) throws IOException, GitAPIException  {
         PullResult pullResult = null;
         
         // Capture HEAD before pull for cross-path deletion detection
@@ -196,11 +191,10 @@ public class RefreshModelAction extends AbstractModelAction {
             oursIdBeforePull = git.getRepository().resolve(IGraficoConstants.HEAD);
         }
         
-        pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_6);
-        Display.getCurrent().readAndDispatch(); // update dialog
+        monitor.subTask(Messages.RefreshModelAction_6);
         
         try {
-            pullResult = getRepository().pullFromRemote(npw, new ProgressMonitorWrapper(pmDialog.getProgressMonitor()));
+            pullResult = getRepository().pullFromRemote(npw, new ProgressMonitorWrapper(monitor));
         }
         catch(Exception ex) {
             // If this exception is thrown then the remote doesn't have the ref which can happen when pulling on a branch,
@@ -226,7 +220,7 @@ public class RefreshModelAction extends AbstractModelAction {
             return PULL_STATUS_UP_TO_DATE;
         }
         
-        pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_7);
+        monitor.subTask(Messages.RefreshModelAction_7);
         
         BranchStatus branchStatus = getRepository().getBranchStatus();
         
@@ -243,7 +237,7 @@ public class RefreshModelAction extends AbstractModelAction {
                     getRepository(), fWindow.getShell());
             
             try {
-                handler.init(pmDialog.getProgressMonitor());
+                handler.init(monitor);
             }
             catch(IOException | GitAPIException ex) {
                 handler.resetToLocalState(); // Clean up
@@ -257,13 +251,13 @@ public class RefreshModelAction extends AbstractModelAction {
             
             String dialogMessage = NLS.bind(Messages.RefreshModelAction_4, branchStatus.getCurrentLocalBranch().getShortName());
             
-            pmDialog.getShell().setVisible(false);
-            
-            boolean result = handler.openConflictsDialog(dialogMessage);
-            
-            pmDialog.getShell().setVisible(true);
+            // Show conflicts dialog on UI thread
+            final boolean[] dialogResult = new boolean[1];
+            Display.getDefault().syncExec(() -> {
+                dialogResult[0] = handler.openConflictsDialog(dialogMessage);
+            });
 
-            if(result) {
+            if(dialogResult[0]) {
                 handler.merge();
                 ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] handler.merge() completed (pull)", null); //$NON-NLS-1$
             }
@@ -274,7 +268,7 @@ public class RefreshModelAction extends AbstractModelAction {
             }
             
             // We now have to check if model can be reloaded
-            pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
+            monitor.subTask(Messages.RefreshModelAction_8);
             
             // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
             if(oursIdBeforePull != null) {
@@ -292,9 +286,20 @@ public class RefreshModelAction extends AbstractModelAction {
             loader.repairMissingFolderXml();
             loader.applyFolderMoveResolutions();
             
-            // Reload the model from the Grafico XML files
+            // Reload the model from the Grafico XML files (must be on UI thread)
             try {
-            	loader.loadModel();
+                final IOException[] loadEx = new IOException[1];
+                Display.getDefault().syncExec(() -> {
+                    try {
+                        loader.loadModel();
+                    }
+                    catch(IOException ex) {
+                        loadEx[0] = ex;
+                    }
+                });
+                if(loadEx[0] != null) {
+                    throw loadEx[0];
+                }
             }
             catch(IOException ex) {
             	handler.resetToLocalState(); // Clean up
@@ -302,7 +307,7 @@ public class RefreshModelAction extends AbstractModelAction {
             }
         } else { 
 		    // Reload the model from the Grafico XML files
-		    pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_8);
+		    monitor.subTask(Messages.RefreshModelAction_8);
 		    
 		    // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
 		    if(oursIdBeforePull != null) {
@@ -321,19 +326,29 @@ public class RefreshModelAction extends AbstractModelAction {
 		    
 		    // Show folder move resolution dialog if moves were detected
 		    if(loader.hasPendingFolderMoves()) {
-		        pmDialog.getShell().setVisible(false);
-		        
-		        FolderMoveResolutionDialog moveDialog = new FolderMoveResolutionDialog(
-		                fWindow.getShell(), loader.getFolderMoves());
-		        moveDialog.open();
-		        
-		        pmDialog.getShell().setVisible(true);
+		        Display.getDefault().syncExec(() -> {
+		            FolderMoveResolutionDialog moveDialog = new FolderMoveResolutionDialog(
+		                    fWindow.getShell(), loader.getFolderMoves());
+		            moveDialog.open();
+		        });
 		    }
 		    
 		    // Apply the user's choices (or defaults if no dialog was needed)
 		    loader.applyFolderMoveResolutions();
 		    
-			loader.loadModel();
+		    // Reload the model from the Grafico XML files (must be on UI thread)
+		    final IOException[] loadEx = new IOException[1];
+		    Display.getDefault().syncExec(() -> {
+		        try {
+		            loader.loadModel();
+		        }
+		        catch(IOException ex) {
+		            loadEx[0] = ex;
+		        }
+		    });
+		    if(loadEx[0] != null) {
+		        throw loadEx[0];
+		    }
         }
         
         // Do a commit if needed
@@ -342,7 +357,7 @@ public class RefreshModelAction extends AbstractModelAction {
         java.io.File mergeHead = new java.io.File(getRepository().getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[RefreshModelAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
         if(hasChanges || mergeHead.exists()) {
-            pmDialog.getProgressMonitor().subTask(Messages.RefreshModelAction_9);
+            monitor.subTask(Messages.RefreshModelAction_9);
             
             String commitMessage = NLS.bind(Messages.RefreshModelAction_1, branchStatus.getCurrentLocalBranch().getShortName());
             

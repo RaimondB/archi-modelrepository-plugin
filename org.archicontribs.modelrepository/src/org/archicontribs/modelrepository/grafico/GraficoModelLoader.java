@@ -15,6 +15,7 @@ import java.util.Iterator;
 import java.util.List;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter.UnresolvedObject;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
@@ -260,6 +261,7 @@ public class GraficoModelLoader {
             return;
         }
         
+        long tOpen = System.nanoTime();
         fRestoredObjects = null;
         
         // Set file name on the grafico model so we can locate it
@@ -272,7 +274,9 @@ public class GraficoModelLoader {
         }
         
         // Save the model
+        long t = System.nanoTime();
         IEditorModelManager.INSTANCE.saveModel(graficoModel);
+        UIPerfLogger.log("[ModelLoader]", "saveModel", t); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Close and re-open the corresponding model if it is already open
         IArchimateModel model = fRepository.locateModel();
@@ -289,9 +293,17 @@ public class GraficoModelLoader {
             
             shell.setRedraw(false);
             try {
+                t = System.nanoTime();
                 IEditorModelManager.INSTANCE.closeModel(model);
+                UIPerfLogger.log("[ModelLoader]", "closeModel", t); //$NON-NLS-1$ //$NON-NLS-2$
+                
+                t = System.nanoTime();
                 IEditorModelManager.INSTANCE.openModel(graficoModel);
+                UIPerfLogger.log("[ModelLoader]", "openModel", t); //$NON-NLS-1$ //$NON-NLS-2$
+                
+                t = System.nanoTime();
                 reopenEditors(graficoModel, openModelIDs);
+                UIPerfLogger.log("[ModelLoader]", "reopenEditors (" + openModelIDs.size() + " diagrams)", t); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             } finally {
                 shell.setRedraw(true);
                 
@@ -309,6 +321,7 @@ public class GraficoModelLoader {
                 });
             }
         }
+        UIPerfLogger.log("[ModelLoader]", "openModel() total", tOpen); //$NON-NLS-1$ //$NON-NLS-2$
     }
     
     /**

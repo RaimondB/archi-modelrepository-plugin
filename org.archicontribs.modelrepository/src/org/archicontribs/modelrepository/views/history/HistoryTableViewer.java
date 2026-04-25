@@ -8,10 +8,13 @@ package org.archicontribs.modelrepository.views.history;
 import java.io.IOException;
 import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
@@ -44,9 +47,21 @@ import com.archimatetool.editor.ui.UIUtils;
  */
 public class HistoryTableViewer extends TableViewer {
     
+    /**
+     * Maximum number of commits to load from the RevWalk.
+     * Limits UI blocking and memory consumption for long-lived repos.
+     */
+    private static final int MAX_COMMITS = 500;
+    
     private RevCommit fLocalCommit, fOriginCommit;
     
     private BranchInfo fSelectedBranch;
+    
+    /**
+     * Guards against stale background loads delivering results after a new load started.
+     * Each load increments this; the callback checks if it's still current.
+     */
+    private final AtomicReference<Thread> fCurrentLoadThread = new AtomicReference<>();
     
     /**
      * Constructor
@@ -109,27 +124,17 @@ public class HistoryTableViewer extends TableViewer {
     
     /**
      * Set input with a pre-computed BranchStatus to avoid redundant git operations.
+     * Loads commit history on a background thread, then updates the table via asyncExec.
      */
     public void doSetInput(IArchiRepository archiRepo, BranchStatus branchStatus) {
         if(branchStatus != null) {
             fSelectedBranch = branchStatus.getCurrentLocalBranch();
         }
         
-        setInput(archiRepo);
+        // Show empty table immediately while loading
+        setInput(null);
         
-        Display.getCurrent().asyncExec(() -> {
-            if(!getTable().isDisposed()) {
-                // Avoid bogus horizontal scrollbar cheese
-                getTable().getParent().layout();
-                
-                // Select first row
-                // This will ensure we don't select the current row index from the previously selected repo
-                Object element = getElementAt(0);
-                if(element != null) {
-                    setSelection(new StructuredSelection(element), true);
-                }
-            }
-        });
+        loadCommitsInBackground(archiRepo);
     }
     
     public void setSelectedBranch(BranchInfo branchInfo) {
@@ -139,7 +144,71 @@ public class HistoryTableViewer extends TableViewer {
 
         fSelectedBranch = branchInfo;
         
-        setInput(getInput());
+        // Reload commits in background for new branch
+        Object input = getInput();
+        if(input instanceof IArchiRepository) {
+            loadCommitsInBackground((IArchiRepository)input);
+        }
+        else {
+            // Fallback: re-trigger from scratch (doSetInput stored nothing yet)
+            setInput(null);
+        }
+    }
+    
+    /**
+     * Load commits on a background thread and deliver results to the UI thread.
+     * If a new load starts before the previous one finishes, the stale result is discarded.
+     */
+    private void loadCommitsInBackground(IArchiRepository archiRepo) {
+        Thread loadThread = Thread.ofVirtual().name("HistoryTableViewer-LoadCommits").start(() -> { //$NON-NLS-1$
+            // Capture this thread reference for staleness check in asyncExec
+            Thread thisThread = Thread.currentThread();
+            
+            // Compute commits off the UI thread
+            long tBg = System.nanoTime();
+            List<RevCommit> commits = getCommits(archiRepo);
+            UIPerfLogger.log("[HistoryTable]", "getCommits(" + commits.size() + ")", tBg); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            
+            Display display = getTable().getDisplay();
+            if(!display.isDisposed()) {
+                display.asyncExec(() -> {
+                    // Discard result if a newer load was started
+                    if(fCurrentLoadThread.get() != thisThread) {
+                        UIPerfLogger.log("[HistoryTable]", "asyncExec DISCARDED (stale)"); //$NON-NLS-1$ //$NON-NLS-2$
+                        return;
+                    }
+                    if(getTable().isDisposed()) {
+                        return;
+                    }
+                    
+                    long tUi = System.nanoTime();
+                    // Suppress redraws during bulk update
+                    getTable().setRedraw(false);
+                    try {
+                        // Deliver commits to the content provider and set input
+                        HistoryContentProvider provider = (HistoryContentProvider)getContentProvider();
+                        provider.setCommits(commits);
+                        setInput(archiRepo);
+                        setItemCount(commits.size());
+                    }
+                    finally {
+                        getTable().setRedraw(true);
+                    }
+                    
+                    // Layout and select outside setRedraw block
+                    getTable().getParent().layout();
+                    
+                    // Select first row
+                    Object element = getElementAt(0);
+                    if(element != null) {
+                        setSelection(new StructuredSelection(element), true);
+                    }
+                    UIPerfLogger.log("[HistoryTable]", "asyncExec UI delivery (" + commits.size() + " commits)", tUi); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                });
+            }
+        });
+        
+        fCurrentLoadThread.set(loadThread);
     }
     
     // ===============================================================================================
@@ -148,74 +217,84 @@ public class HistoryTableViewer extends TableViewer {
     
     /**
      * The Model for the Table.
+     * Commits are loaded externally (on a background thread) and delivered via setCommits().
      */
     class HistoryContentProvider implements ILazyContentProvider {
-        List<RevCommit> commits;
+        private List<RevCommit> commits = Collections.emptyList();
         
         @Override
         public void inputChanged(Viewer v, Object oldInput, Object newInput) {
-            commits = getCommits(newInput);
-            setItemCount(commits.size());
+            // Don't reload commits here — they are loaded on a background thread
+            // and delivered via setCommits() before setInput() is called.
+        }
+        
+        void setCommits(List<RevCommit> newCommits) {
+            this.commits = newCommits != null ? newCommits : Collections.emptyList();
         }
 
         @Override
         public void dispose() {
         }
-        
-        List<RevCommit> getCommits(Object parent) {
-            List<RevCommit> commits = new ArrayList<RevCommit>();
-            fLocalCommit = null;
-            fOriginCommit = null;
-            
-            if(!(parent instanceof IArchiRepository) || fSelectedBranch == null) {
-                return commits;
-            }
-            
-            IArchiRepository repo = (IArchiRepository)parent;
-            
-            // Local Repo was deleted
-            if(!repo.getLocalRepositoryFolder().exists()) {
-                return commits;
-            }
-
-            try(Repository repository = Git.open(repo.getLocalRepositoryFolder()).getRepository()) {
-                // a RevWalk allows to walk over commits based on some filtering that is defined
-                try(RevWalk revWalk = new RevWalk(repository)) {
-                    // Find the local branch
-                    ObjectId objectID = repository.resolve(fSelectedBranch.getLocalBranchNameFor());
-                    if(objectID != null) {
-                        fLocalCommit = revWalk.parseCommit(objectID);
-                        revWalk.markStart(fLocalCommit); 
-                    }
-                    
-                    // Find the remote branch
-                    objectID = repository.resolve(fSelectedBranch.getRemoteBranchNameFor());
-                    if(objectID != null) {
-                        fOriginCommit = revWalk.parseCommit(objectID);
-                        revWalk.markStart(fOriginCommit);
-                    }
-                    
-                    // Collect the commits
-                    for(RevCommit commit : revWalk ) {
-                        commits.add(commit);
-                    }
-                    
-                    revWalk.dispose();
-                }
-            }
-            catch(IOException ex) {
-                ex.printStackTrace();
-            }
-            
-            return commits;
-        }
 
         @Override
         public void updateElement(int index) {
-            if(commits != null) {
+            if(index < commits.size()) {
                 replace(commits.get(index), index);
             }
         }
+    }
+    
+    /**
+     * Load commits from git. Called on a background thread.
+     * Limits to MAX_COMMITS to avoid unbounded memory and time.
+     */
+    private List<RevCommit> getCommits(Object parent) {
+        List<RevCommit> commits = new ArrayList<>();
+        fLocalCommit = null;
+        fOriginCommit = null;
+        
+        if(!(parent instanceof IArchiRepository) || fSelectedBranch == null) {
+            return commits;
+        }
+        
+        IArchiRepository repo = (IArchiRepository)parent;
+        
+        // Local Repo was deleted
+        if(!repo.getLocalRepositoryFolder().exists()) {
+            return commits;
+        }
+
+        try(Repository repository = Git.open(repo.getLocalRepositoryFolder()).getRepository()) {
+            try(RevWalk revWalk = new RevWalk(repository)) {
+                ObjectId objectID = repository.resolve(fSelectedBranch.getLocalBranchNameFor());
+                if(objectID != null) {
+                    fLocalCommit = revWalk.parseCommit(objectID);
+                    revWalk.markStart(fLocalCommit); 
+                }
+                
+                objectID = repository.resolve(fSelectedBranch.getRemoteBranchNameFor());
+                if(objectID != null) {
+                    fOriginCommit = revWalk.parseCommit(objectID);
+                    revWalk.markStart(fOriginCommit);
+                }
+                
+                // Collect commits with limit
+                int count = 0;
+                for(RevCommit commit : revWalk) {
+                    commits.add(commit);
+                    if(++count >= MAX_COMMITS) {
+                        break;
+                    }
+                }
+                
+                revWalk.dispose();
+            }
+        }
+        catch(IOException ex) {
+            ex.printStackTrace();
+        }
+        
+        return commits;
     }
     
     // ===============================================================================================
