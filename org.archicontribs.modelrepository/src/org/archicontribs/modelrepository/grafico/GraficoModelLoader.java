@@ -49,6 +49,7 @@ import com.archimatetool.model.IConnectable;
 import com.archimatetool.model.IDiagramModel;
 import com.archimatetool.model.IDiagramModelArchimateComponent;
 import com.archimatetool.model.IDiagramModelArchimateConnection;
+import com.archimatetool.model.IDiagramModelArchimateObject;
 import com.archimatetool.model.IIdentifier;
 import com.archimatetool.model.INameable;
 import com.archimatetool.model.util.ArchimateModelUtils;
@@ -207,6 +208,23 @@ public class GraficoModelLoader {
             graficoModel[0] = restoreProblemObjects(unresolvedObjects);
         }
         
+        // Repair connection endpoint mismatches.
+        // After GRAFICO import, some diagram connections may reference elements
+        // that don't match their underlying relationship's source/target
+        // (e.g. from merge conflicts or manual diagram edits).
+        int repaired = repairConnectionEndpoints(graficoModel[0]);
+        if(repaired > 0) {
+            log(IStatus.INFO, "[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
+        // Remove orphaned elements that couldn't be restored.
+        // This cleans up relationships, diagram connections, and diagram elements
+        // whose referenced ArchiMate concepts are not in the model tree.
+        int removed = removeOrphanedElements(graficoModel[0]);
+        if(removed > 0) {
+            log(IStatus.INFO, "[GraficoModelLoader] Removed " + removed + " orphaned element(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
         if(!bHeadless)
         {
 	        // Save it
@@ -222,15 +240,6 @@ public class GraficoModelLoader {
 	            reopenEditors(graficoModel[0], openModelIDs);
 	        }
         } else {
-        	// Repair connection endpoint mismatches before validation.
-        	// After GRAFICO import, some diagram connections may reference elements
-        	// that don't match their underlying relationship's source/target
-        	// (e.g. from merge conflicts or manual diagram edits).
-        	int repaired = repairConnectionEndpoints(graficoModel[0]);
-        	if(repaired > 0) {
-        	    log(IStatus.INFO, "[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
-        	}
-
         	// Validate that the model is correct after fixes so it can be exported again
             ModelChecker checker = new ModelChecker(graficoModel[0]);
             if(!checker.checkAll()) {
@@ -271,6 +280,18 @@ public class GraficoModelLoader {
         List<UnresolvedObject> unresolvedObjects = importer != null ? importer.getUnresolvedObjects() : null;
         if(unresolvedObjects != null) {
             graficoModel = restoreProblemObjects(unresolvedObjects);
+        }
+        
+        // Repair connection endpoint mismatches
+        int repaired = repairConnectionEndpoints(graficoModel);
+        if(repaired > 0) {
+            log(IStatus.INFO, "[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        
+        // Remove orphaned elements that couldn't be restored
+        int removed = removeOrphanedElements(graficoModel);
+        if(removed > 0) {
+            log(IStatus.INFO, "[GraficoModelLoader] Removed " + removed + " orphaned element(s)"); //$NON-NLS-1$ //$NON-NLS-2$
         }
         
         // Save the model
@@ -759,6 +780,116 @@ public class GraficoModelLoader {
         }
         
         return null;
+    }
+
+    /**
+     * Remove orphaned elements from the model that could not be restored.
+     * 
+     * <p>After GRAFICO import and restoreProblemObjects(), some model elements may still
+     * reference ArchiMate concepts that are not in the model tree (e.g. elements deleted
+     * on remote but still referenced by relationships/diagrams on an old branch).</p>
+     * 
+     * <p>This method removes:</p>
+     * <ul>
+     *   <li>Relationships whose source or target concept is not in the model</li>
+     *   <li>Diagram connections whose underlying relationship is orphaned or missing</li>
+     *   <li>Diagram elements whose underlying ArchiMate element is orphaned or missing</li>
+     * </ul>
+     * 
+     * @param model The model to clean up
+     * @return The number of orphaned elements removed
+     */
+    int removeOrphanedElements(IArchimateModel model) {
+        int removed = 0;
+        
+        // Pass 1: Find and remove orphaned relationships
+        // (source or target concept not in the model tree)
+        List<IArchimateRelationship> orphanedRelations = new ArrayList<>();
+        for(Iterator<EObject> iter = model.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IArchimateRelationship relation) {
+                IArchimateConcept source = relation.getSource();
+                IArchimateConcept target = relation.getTarget();
+                if(source != null && source.getArchimateModel() == null) {
+                    orphanedRelations.add(relation);
+                }
+                else if(target != null && target.getArchimateModel() == null) {
+                    orphanedRelations.add(relation);
+                }
+            }
+        }
+        
+        for(IArchimateRelationship relation : orphanedRelations) {
+            EcoreUtil.delete(relation, true);
+            removed++;
+        }
+        
+        // Pass 2: Find and remove orphaned diagram connections
+        // (relationship is null, orphaned, or has orphaned source/target)
+        List<IDiagramModelArchimateConnection> orphanedConnections = new ArrayList<>();
+        for(Iterator<EObject> iter = model.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IDiagramModelArchimateConnection connection) {
+                IArchimateRelationship relation = connection.getArchimateRelationship();
+                if(relation == null || relation.getArchimateModel() == null) {
+                    orphanedConnections.add(connection);
+                }
+                else {
+                    IArchimateConcept source = relation.getSource();
+                    IArchimateConcept target = relation.getTarget();
+                    if((source != null && source.getArchimateModel() == null)
+                            || (target != null && target.getArchimateModel() == null)) {
+                        orphanedConnections.add(connection);
+                    }
+                }
+            }
+        }
+        
+        for(IDiagramModelArchimateConnection connection : orphanedConnections) {
+            // Disconnect before delete to clean up source/target connection lists
+            connection.disconnect();
+            EcoreUtil.delete(connection, true);
+            removed++;
+        }
+        
+        // Pass 3: Find and remove orphaned diagram elements
+        // (archimateElement not in model tree)
+        List<IDiagramModelArchimateObject> orphanedDiagramElements = new ArrayList<>();
+        for(Iterator<EObject> iter = model.eAllContents(); iter.hasNext();) {
+            EObject eObject = iter.next();
+            if(eObject instanceof IDiagramModelArchimateObject diagramObj) {
+                IArchimateConcept concept = diagramObj.getArchimateConcept();
+                if(concept != null && concept.getArchimateModel() == null) {
+                    orphanedDiagramElements.add(diagramObj);
+                }
+            }
+        }
+        
+        for(IDiagramModelArchimateObject diagramObj : orphanedDiagramElements) {
+            // Disconnect any remaining connections to/from this element.
+            // Most were already removed in Pass 2 but some may remain if
+            // their relationship was valid but connected to this orphaned element.
+            List<IConnectable> sources = new ArrayList<>(diagramObj.getSourceConnections());
+            for(IConnectable conn : sources) {
+                if(conn instanceof IDiagramModelArchimateConnection archiConn) {
+                    archiConn.disconnect();
+                    EcoreUtil.delete(archiConn, true);
+                    removed++;
+                }
+            }
+            List<IConnectable> targets = new ArrayList<>(diagramObj.getTargetConnections());
+            for(IConnectable conn : targets) {
+                if(conn instanceof IDiagramModelArchimateConnection archiConn) {
+                    archiConn.disconnect();
+                    EcoreUtil.delete(archiConn, true);
+                    removed++;
+                }
+            }
+            EcoreUtil.delete(diagramObj, true);
+            removed++;
+        }
+        
+        return removed;
     }
 
     /**
