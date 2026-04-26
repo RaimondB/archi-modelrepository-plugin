@@ -248,10 +248,9 @@ public class RefreshModelAction extends AbstractModelAction {
         }
         
         // Merge — ArchiRepository handles native git / JGit switching internally
-        mergeResult = ((ArchiRepository) getRepository()).merge(remoteBranch);
-        logPerf("merge", phaseStart); //$NON-NLS-1$
-        
         monitor.subTask(Messages.RefreshModelAction_7);
+        mergeResult = ((ArchiRepository) getRepository()).merge(remoteBranch, monitor);
+        logPerf("merge", phaseStart); //$NON-NLS-1$
         
         phaseStart = System.nanoTime();
         BranchStatus branchStatus = getRepository().getBranchStatus();
@@ -259,9 +258,14 @@ public class RefreshModelAction extends AbstractModelAction {
         
         // Setup the Graphico Model Loader
         GraficoModelLoader loader = new GraficoModelLoader(getRepository());
+        
+        // Track conflict count for commit message
+        int conflictCount = 0;
 
         // Merge failure — only possible if JGit merge was used (native merge was either clean or aborted+retried)
         if(mergeResult != null && mergeResult.getMergeStatus() == MergeStatus.CONFLICTING) {
+            conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+            monitor.subTask(NLS.bind(Messages.RefreshModelAction_11, conflictCount));
             // Get the remote ref name
             String remoteRef = branchStatus.getCurrentRemoteBranch().getFullName();
             
@@ -301,7 +305,7 @@ public class RefreshModelAction extends AbstractModelAction {
             }
             
             // We now have to check if model can be reloaded
-            monitor.subTask(Messages.RefreshModelAction_8);
+            monitor.subTask(Messages.RefreshModelAction_12);
             
             // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
             if(oursIdBeforePull != null) {
@@ -320,6 +324,7 @@ public class RefreshModelAction extends AbstractModelAction {
             loader.applyFolderMoveResolutions();
             
             // Reload the model from the Grafico XML files (must be on UI thread)
+            monitor.subTask(Messages.RefreshModelAction_8);
             try {
                 final IOException[] loadEx = new IOException[1];
                 Display.getDefault().syncExec(() -> {
@@ -339,10 +344,10 @@ public class RefreshModelAction extends AbstractModelAction {
             	throw ex;
             }
         } else { 
-		    // Reload the model from the Grafico XML files
-		    monitor.subTask(Messages.RefreshModelAction_8);
+		    monitor.subTask(Messages.RefreshModelAction_10);
 		    
 		    // Phase 1.5: detect and remove elements deleted by one parent but leaked via move
+		    monitor.subTask(Messages.RefreshModelAction_12);
 		    if(oursIdBeforePull != null) {
 		        phaseStart = System.nanoTime();
 		        try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
@@ -376,6 +381,7 @@ public class RefreshModelAction extends AbstractModelAction {
 		    logPerf("applyFolderMoveResolutions", phaseStart); //$NON-NLS-1$
 		    
 		    // Reload the model from the Grafico XML files (must be on UI thread)
+		    monitor.subTask(Messages.RefreshModelAction_8);
 		    phaseStart = System.nanoTime();
 		    final IOException[] loadEx = new IOException[1];
 		    Display.getDefault().syncExec(() -> {
@@ -402,7 +408,13 @@ public class RefreshModelAction extends AbstractModelAction {
         if(hasChanges || mergeHead.exists()) {
             monitor.subTask(Messages.RefreshModelAction_9);
             
-            String commitMessage = NLS.bind(Messages.RefreshModelAction_1, branchStatus.getCurrentLocalBranch().getShortName());
+            String commitMessage;
+            if(conflictCount > 0) {
+                commitMessage = NLS.bind(Messages.RefreshModelAction_1, branchStatus.getCurrentLocalBranch().getShortName(), conflictCount);
+            }
+            else {
+                commitMessage = NLS.bind(Messages.RefreshModelAction_13, branchStatus.getCurrentLocalBranch().getShortName());
+            }
             
             // Did we restore any missing objects?
             String restoredObjects = loader.getRestoredObjectsAsString();

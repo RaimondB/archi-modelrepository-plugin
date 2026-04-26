@@ -102,6 +102,14 @@ public class Messages extends NLS {
 
     public static String MergeBranchAction_14;
 
+    public static String MergeBranchAction_15;
+
+    public static String MergeBranchAction_16;
+
+    public static String MergeBranchAction_17;
+
+    public static String MergeBranchAction_18;
+
     public static String MergeBranchAction_2;
 
     public static String MergeBranchAction_3;
@@ -128,6 +136,10 @@ public class Messages extends NLS {
 
     public static String PushModelAction_2;
 
+    public static String PushModelAction_3;
+
+    public static String PushModelAction_4;
+
     public static String RefreshModelAction_0;
 
     public static String RefreshModelAction_1;
@@ -147,6 +159,14 @@ public class Messages extends NLS {
     public static String RefreshModelAction_8;
 
     public static String RefreshModelAction_9;
+
+    public static String RefreshModelAction_10;
+
+    public static String RefreshModelAction_11;
+
+    public static String RefreshModelAction_12;
+
+    public static String RefreshModelAction_13;
 
     public static String ResetToRemoteCommitAction_0;
 

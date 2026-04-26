@@ -26,6 +26,7 @@ import java.util.Set;
 import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.actions.ProgressMonitorWrapper;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
@@ -40,6 +41,7 @@ import org.eclipse.jgit.api.FetchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.InitCommand;
 import org.eclipse.jgit.api.MergeCommand;
+import org.eclipse.jgit.api.MergeCommand.FastForwardMode;
 import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.PullCommand;
 import org.eclipse.jgit.api.PullResult;
@@ -58,6 +60,7 @@ import org.eclipse.jgit.lib.ProgressMonitor;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.lib.StoredConfig;
+import org.eclipse.jgit.merge.MergeStrategy;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -296,10 +299,14 @@ public class ArchiRepository implements IArchiRepository {
 
     @Override
     public Iterable<PushResult> pushToRemote(UsernamePassword npw, ProgressMonitor monitor) throws IOException, GitAPIException {
+        // Extract Eclipse monitor for native git progress reporting
+        IProgressMonitor eclipseMonitor = (monitor instanceof ProgressMonitorWrapper) 
+                ? ((ProgressMonitorWrapper) monitor).getWrappedMonitor() : null;
+        
         // Try native git for SSH or GCM-authenticated HTTPS repos
         if(shouldUseNativeGitForRemote(getOnlineRepositoryURL())) {
             try {
-                boolean success = tryNativeGitPush();
+                boolean success = tryNativeGitPush(eclipseMonitor);
                 if(success) {
                     // After a successful push, ensure we are tracking the current branch
                     try(Git git = Git.open(getLocalRepositoryFolder())) {
@@ -355,15 +362,16 @@ public class ArchiRepository implements IArchiRepository {
      * to know which implementation is used.
      * 
      * @param remoteBranch the remote tracking branch (e.g. "origin/master")
+     * @param monitor optional progress monitor for reporting merge status (can be null)
      * @return MergeResult from JGit if JGit performed the merge (may be clean or conflicting),
      *         or null if native git performed a clean merge
      * @throws IOException if the merge command failed
      * @throws GitAPIException if a JGit operation fails
      */
-    public MergeResult merge(String remoteBranch) throws IOException, GitAPIException {
+    public MergeResult merge(String remoteBranch, IProgressMonitor monitor) throws IOException, GitAPIException {
         // Phase 1: Try native git merge (dramatically faster for large repos)
         if(isNativeGitEnabled()) {
-            Boolean nativeResult = tryNativeGitMerge(remoteBranch);
+            Boolean nativeResult = tryNativeGitMerge(remoteBranch, monitor);
             
             if(Boolean.TRUE.equals(nativeResult)) {
                 // Native merge succeeded cleanly — already invalidated cache
@@ -387,12 +395,58 @@ public class ArchiRepository implements IArchiRepository {
         }
     }
     
+    /**
+     * Merge a local branch into the current branch with a custom commit message.
+     * Tries native git first for progress streaming, falls back to JGit for
+     * conflict handling.
+     * 
+     * @param branchName the local branch name to merge (e.g. "feature")
+     * @param commitMessage the commit message for the merge
+     * @param monitor optional progress monitor for reporting merge status (can be null)
+     * @return MergeResult from JGit if JGit performed the merge (may be clean or conflicting),
+     *         or null if native git performed a clean merge
+     * @throws IOException if the merge command failed
+     * @throws GitAPIException if a JGit operation fails
+     */
+    public MergeResult mergeBranch(String branchName, String commitMessage, IProgressMonitor monitor) throws IOException, GitAPIException {
+        // Phase 1: Try native git merge (dramatically faster for large repos)
+        if(isNativeGitEnabled()) {
+            Boolean nativeResult = tryNativeGitMerge(branchName, commitMessage, monitor);
+            
+            if(Boolean.TRUE.equals(nativeResult)) {
+                return null;
+            }
+            else if(Boolean.FALSE.equals(nativeResult)) {
+                abortNativeMerge();
+            }
+        }
+        
+        // Phase 2: JGit merge fallback
+        try(Git git = Git.open(getLocalRepositoryFolder())) {
+            ObjectId branchId = git.getRepository().resolve(branchName);
+            MergeCommand mergeCommand = git.merge();
+            mergeCommand.include(branchId);
+            mergeCommand.setCommit(true);
+            mergeCommand.setFastForward(FastForwardMode.FF);
+            mergeCommand.setStrategy(MergeStrategy.RECURSIVE);
+            mergeCommand.setSquash(false);
+            mergeCommand.setMessage(commitMessage);
+            MergeResult result = mergeCommand.call();
+            invalidateBranchStatusCache();
+            return result;
+        }
+    }
+    
     @Override
     public FetchResult fetchFromRemote(UsernamePassword npw, ProgressMonitor monitor, boolean isDryrun) throws IOException, GitAPIException {
+        // Extract Eclipse monitor for native git progress reporting
+        IProgressMonitor eclipseMonitor = (monitor instanceof ProgressMonitorWrapper) 
+                ? ((ProgressMonitorWrapper) monitor).getWrappedMonitor() : null;
+        
         // Try native git for SSH or GCM-authenticated HTTPS repos (faster, no JGit credential setup)
         if(!isDryrun && shouldUseNativeGitForRemote(getOnlineRepositoryURL())) {
             try {
-                boolean success = tryNativeGitFetch();
+                boolean success = tryNativeGitFetch(eclipseMonitor);
                 if(success) {
                     invalidateBranchStatusCache();
                     // Return null to indicate native git handled it — callers must handle null
@@ -1164,36 +1218,62 @@ public class ArchiRepository implements IArchiRepository {
     }
     
     /**
+     * Run a native git command, streaming output lines to the progress monitor as subtask updates.
+     * 
+     * @param monitor optional progress monitor — output lines are reported as subtask (can be null)
+     * @param command the git command and arguments
+     * @return a {@link NativeGitResult} with exit code and collected output
+     * @throws IOException if the process cannot be started (including "git not found")
+     * @throws InterruptedException if the process was interrupted
+     */
+    private NativeGitResult runNativeGit(IProgressMonitor monitor, String... command) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.directory(getLocalRepositoryFolder());
+        pb.redirectErrorStream(true);
+        
+        Process process = pb.start();
+        
+        StringBuilder output = new StringBuilder();
+        try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while((line = reader.readLine()) != null) {
+                output.append(line).append("\n"); //$NON-NLS-1$
+                // Stream meaningful progress lines to the monitor
+                if(monitor != null && !line.isBlank()) {
+                    monitor.subTask(line.trim());
+                }
+            }
+        }
+        
+        int exitCode = process.waitFor();
+        return new NativeGitResult(exitCode, output.toString());
+    }
+    
+    /**
+     * Result of a native git command execution.
+     */
+    private record NativeGitResult(int exitCode, String output) {
+        boolean isSuccess() { return exitCode == 0; }
+    }
+    
+    /**
      * Try to merge a remote branch using native Git. Native git merge is
      * dramatically faster than JGit's recursive merger for large repositories
      * (e.g. 71s JGit vs ~2s native for 48k files).
      * 
      * @param remoteBranch the remote branch ref (e.g. "origin/master")
+     * @param monitor optional progress monitor for reporting merge progress
      * @return {@code Boolean.TRUE} if merge succeeded (clean merge or FF),
      *         {@code Boolean.FALSE} if conflicts detected (caller should abort and use JGit),
      *         {@code null} if native git is not available
      * @throws IOException if the merge command failed for a reason other than conflicts
      */
-    private Boolean tryNativeGitMerge(String remoteBranch) throws IOException {
+    private Boolean tryNativeGitMerge(String remoteBranch, IProgressMonitor monitor) throws IOException {
         try {
-            ProcessBuilder pb = new ProcessBuilder(
+            NativeGitResult result = runNativeGit(monitor,
                     "git", "merge", remoteBranch); //$NON-NLS-1$ //$NON-NLS-2$
-            pb.directory(getLocalRepositoryFolder());
-            pb.redirectErrorStream(true);
             
-            Process process = pb.start();
-            
-            StringBuilder output = new StringBuilder();
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while((line = reader.readLine()) != null) {
-                    output.append(line).append("\n"); //$NON-NLS-1$
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            
-            if(exitCode == 0) {
+            if(result.isSuccess()) {
                 // Sync JGit state after native merge
                 Git.open(getLocalRepositoryFolder()).close();
                 invalidateBranchStatusCache();
@@ -1201,19 +1281,58 @@ public class ArchiRepository implements IArchiRepository {
             }
             
             // Exit code 1 = merge conflicts, exit code 128 = fatal error
-            // For conflicts, return false so caller can abort and use JGit
-            String result = output.toString();
-            if(result.contains("CONFLICT") || result.contains("Automatic merge failed")) { //$NON-NLS-1$ //$NON-NLS-2$
+            if(result.output().contains("CONFLICT") || result.output().contains("Automatic merge failed")) { //$NON-NLS-1$ //$NON-NLS-2$
                 return Boolean.FALSE;
             }
             
             // Some other failure
-            throw new IOException("Git merge failed (exit " + exitCode + "): " + result); //$NON-NLS-1$ //$NON-NLS-2$
+            throw new IOException("Git merge failed (exit " + result.exitCode() + "): " + result.output()); //$NON-NLS-1$ //$NON-NLS-2$
         }
         catch(IOException ex) {
             String message = ex.getMessage();
             if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
                 return null; // Native git not available
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git merge interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Try to merge a branch using native Git with a custom commit message.
+     * 
+     * @param branchName the branch to merge (e.g. "feature")
+     * @param commitMessage the commit message for the merge
+     * @param monitor optional progress monitor for reporting merge progress
+     * @return {@code Boolean.TRUE} if merge succeeded,
+     *         {@code Boolean.FALSE} if conflicts detected,
+     *         {@code null} if native git is not available
+     * @throws IOException if the merge command failed for a reason other than conflicts
+     */
+    private Boolean tryNativeGitMerge(String branchName, String commitMessage, IProgressMonitor monitor) throws IOException {
+        try {
+            NativeGitResult result = runNativeGit(monitor,
+                    "git", "merge", branchName, "-m", commitMessage); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            
+            if(result.isSuccess()) {
+                Git.open(getLocalRepositoryFolder()).close();
+                invalidateBranchStatusCache();
+                return Boolean.TRUE;
+            }
+            
+            if(result.output().contains("CONFLICT") || result.output().contains("Automatic merge failed")) { //$NON-NLS-1$ //$NON-NLS-2$
+                return Boolean.FALSE;
+            }
+            
+            throw new IOException("Git merge failed (exit " + result.exitCode() + "): " + result.output()); //$NON-NLS-1$ //$NON-NLS-2$
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return null;
             }
             throw ex;
         }
@@ -1436,28 +1555,17 @@ public class ArchiRepository implements IArchiRepository {
      * Native git delegates authentication to Git Credential Manager (GCM) or SSH agent,
      * and is significantly faster than JGit for large repositories.
      * 
+     * @param monitor optional progress monitor for reporting fetch progress
      * @return true if native Git fetch succeeded, false if native Git is not available
      * @throws IOException if the fetch command failed (authentication error, network error, etc.)
      */
-    private boolean tryNativeGitFetch() throws IOException {
+    private boolean tryNativeGitFetch(IProgressMonitor monitor) throws IOException {
         try {
-            ProcessBuilder pb = new ProcessBuilder("git", "fetch", "--prune"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            pb.directory(getLocalRepositoryFolder());
-            pb.redirectErrorStream(true);
+            NativeGitResult result = runNativeGit(monitor,
+                    "git", "fetch", "--prune", "--progress"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
             
-            Process process = pb.start();
-            
-            StringBuilder output = new StringBuilder();
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while((line = reader.readLine()) != null) {
-                    output.append(line).append("\n"); //$NON-NLS-1$
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("Git fetch failed (exit " + exitCode + "): " + output.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+            if(!result.isSuccess()) {
+                throw new IOException("Git fetch failed (exit " + result.exitCode() + "): " + result.output()); //$NON-NLS-1$ //$NON-NLS-2$
             }
             
             return true;
@@ -1479,28 +1587,17 @@ public class ArchiRepository implements IArchiRepository {
      * Low-level method: Try to use native Git for pushing to remote.
      * Native git delegates authentication to Git Credential Manager (GCM) or SSH agent.
      * 
+     * @param monitor optional progress monitor for reporting push progress
      * @return true if native Git push succeeded, false if native Git is not available
      * @throws IOException if the push command failed (authentication error, rejected push, etc.)
      */
-    private boolean tryNativeGitPush() throws IOException {
+    private boolean tryNativeGitPush(IProgressMonitor monitor) throws IOException {
         try {
-            ProcessBuilder pb = new ProcessBuilder("git", "push"); //$NON-NLS-1$ //$NON-NLS-2$
-            pb.directory(getLocalRepositoryFolder());
-            pb.redirectErrorStream(true);
+            NativeGitResult result = runNativeGit(monitor,
+                    "git", "push", "--progress"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
             
-            Process process = pb.start();
-            
-            StringBuilder output = new StringBuilder();
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while((line = reader.readLine()) != null) {
-                    output.append(line).append("\n"); //$NON-NLS-1$
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("Git push failed (exit " + exitCode + "): " + output.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+            if(!result.isSuccess()) {
+                throw new IOException("Git push failed (exit " + result.exitCode() + "): " + result.output()); //$NON-NLS-1$ //$NON-NLS-2$
             }
             
             return true;

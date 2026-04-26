@@ -24,4 +24,11 @@ public class ProgressMonitorWrapper extends EmptyProgressMonitor {
     public boolean isCancelled() {
         return (pm != null) ? pm.isCanceled() : false;
     }
+    
+    /**
+     * @return the wrapped Eclipse progress monitor
+     */
+    public IProgressMonitor getWrappedMonitor() {
+        return pm;
+    }
 }

@@ -76,6 +76,7 @@ public class PushModelAction extends RefreshModelAction {
                         ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
                         
                         // Pull
+                        monitor.subTask(Messages.PushModelAction_3);
                         int status = pull(npw, monitor);
                         
                         // Push

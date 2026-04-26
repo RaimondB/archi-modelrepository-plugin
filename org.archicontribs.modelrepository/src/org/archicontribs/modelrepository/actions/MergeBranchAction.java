@@ -15,6 +15,7 @@ import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
+import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
@@ -25,13 +26,11 @@ import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.MergeCommand.FastForwardMode;
 import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.MergeResult.MergeStatus;
 import org.eclipse.jgit.api.errors.CanceledException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.ObjectId;
-import org.eclipse.jgit.merge.MergeStrategy;
 import org.eclipse.osgi.util.NLS;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.widgets.Display;
@@ -191,10 +190,12 @@ public class MergeBranchAction extends AbstractModelAction {
                         monitor.beginTask(Messages.MergeBranchAction_11, -1);
                         
                         // Pull
+                        monitor.subTask(NLS.bind(Messages.MergeBranchAction_17, currentBranch.getShortName()));
                         int pullStatus = pushAction.pull(npw, monitor);
                         
                         // Push
                         if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
+                            monitor.subTask(NLS.bind(Messages.MergeBranchAction_18, currentBranch.getShortName()));
                             pushAction.push(npw, monitor);
                         }
                         else {
@@ -202,16 +203,18 @@ public class MergeBranchAction extends AbstractModelAction {
                         }
                         
                         // Switch to other branch
-                        monitor.subTask(Messages.MergeBranchAction_14);
+                        monitor.subTask(NLS.bind(Messages.MergeBranchAction_14, branchToMerge.getShortName()));
                         SwitchBranchAction switchBranchAction = new SwitchBranchAction(fWindow);
                         switchBranchAction.setRepository(getRepository());
                         switchBranchAction.switchBranch(branchToMerge, true);
                         
                         // Pull again
+                        monitor.subTask(NLS.bind(Messages.MergeBranchAction_17, branchToMerge.getShortName()));
                         pullStatus = pushAction.pull(npw, monitor);
                         
                         // Push
                         if(pullStatus == RefreshModelAction.PULL_STATUS_OK || pullStatus == RefreshModelAction.PULL_STATUS_UP_TO_DATE) {
+                            monitor.subTask(NLS.bind(Messages.MergeBranchAction_18, branchToMerge.getShortName()));
                             pushAction.push(npw, monitor);
                         }
                         else {
@@ -219,13 +222,14 @@ public class MergeBranchAction extends AbstractModelAction {
                         }
                         
                         // Switch back
-                        monitor.subTask(Messages.MergeBranchAction_14);
+                        monitor.subTask(NLS.bind(Messages.MergeBranchAction_14, currentBranch.getShortName()));
                         switchBranchAction.switchBranch(currentBranch, true);
                         
                         // Merge
                         merge(currentBranch, branchToMerge, monitor);
                         
                         // Final Push on this branch
+                        monitor.subTask(NLS.bind(Messages.MergeBranchAction_18, currentBranch.getShortName()));
                         pushAction.push(npw, monitor);
                         
                         // Ask user to delete branch (if not master)
@@ -283,27 +287,28 @@ public class MergeBranchAction extends AbstractModelAction {
     }
     
     private int merge(BranchInfo currentBranch, BranchInfo branchToMerge, IProgressMonitor monitor) throws GitAPIException, IOException {
-        monitor.subTask(Messages.MergeBranchAction_13);
+        monitor.subTask(NLS.bind(Messages.MergeBranchAction_13, branchToMerge.getShortName(), currentBranch.getShortName()));
 
+        int conflictCount = 0;
+        
         try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
-            ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
             ObjectId oursId = git.getRepository().resolve(IGraficoConstants.HEAD);
+            ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
             
             String mergeMessage = NLS.bind(Messages.MergeBranchAction_2, branchToMerge.getShortName(), currentBranch.getShortName());
             
-            MergeResult mergeResult = git.merge()
-                    .include(theirsId)
-                    .setCommit(true)
-                    .setFastForward(FastForwardMode.FF)
-                    .setStrategy(MergeStrategy.RECURSIVE)
-                    .setSquash(false)
-                    .setMessage(mergeMessage)
-                    .call();
+            // Use ArchiRepository.mergeBranch() — tries native git first for progress streaming
+            MergeResult mergeResult = ((ArchiRepository) getRepository()).mergeBranch(
+                    branchToMerge.getShortName(), mergeMessage, monitor);
             
-            MergeStatus status = mergeResult.getMergeStatus();
+            // null = native git performed a clean merge
+            MergeStatus status = mergeResult != null ? mergeResult.getMergeStatus() : null;
             
             // Conflict
             if(status == MergeStatus.CONFLICTING) {
+                conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+                monitor.subTask(NLS.bind(Messages.MergeBranchAction_16, conflictCount));
+                
                 // Try to handle the merge conflict
                 MergeConflictHandler handler = new MergeConflictHandler(mergeResult, branchToMerge.getShortName(),
                         getRepository(), fWindow.getShell());
@@ -341,10 +346,15 @@ public class MergeBranchAction extends AbstractModelAction {
                 }
             }
             
+            if(conflictCount == 0) {
+                monitor.subTask(Messages.MergeBranchAction_15);
+            }
+            
             // Reload the model from the Grafico XML files
             GraficoModelLoader loader = new GraficoModelLoader(getRepository());
             
             // Phase 1.5: detect and remove elements deleted by one parent but leaked via move by the other
+            monitor.subTask(Messages.RefreshModelAction_12);
             long t = System.nanoTime();
             if(oursId != null && theirsId != null) {
                 int removed = MergeConflictHandler.detectAndRemoveCrossPathDeletions(
@@ -364,6 +374,7 @@ public class MergeBranchAction extends AbstractModelAction {
             
             t = System.nanoTime();
             // Reload the model from the Grafico XML files (must be on UI thread)
+            monitor.subTask(Messages.RefreshModelAction_8);
             final IOException[] loadEx = new IOException[1];
             final long loadStart = t;
             Display.getDefault().syncExec(() -> {
@@ -389,7 +400,13 @@ public class MergeBranchAction extends AbstractModelAction {
             ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[MergeBranchAction] MERGE_HEAD exists=" + mergeHead.exists(), null); //$NON-NLS-1$
             
             if(hasChanges || mergeHead.exists()) {
-                mergeMessage = NLS.bind(Messages.MergeBranchAction_3, branchToMerge.getShortName(), currentBranch.getShortName());
+                monitor.subTask(Messages.RefreshModelAction_9);
+                if(conflictCount > 0) {
+                    mergeMessage = NLS.bind(Messages.MergeBranchAction_3, new Object[] { branchToMerge.getShortName(), currentBranch.getShortName(), conflictCount });
+                }
+                else {
+                    mergeMessage = NLS.bind(Messages.MergeBranchAction_2, branchToMerge.getShortName(), currentBranch.getShortName());
+                }
                 
                 // Did we restore any missing objects?
                 String restoredObjects = loader.getRestoredObjectsAsString();
