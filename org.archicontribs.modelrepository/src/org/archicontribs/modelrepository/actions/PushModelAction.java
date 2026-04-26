@@ -14,23 +14,22 @@ import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
+import org.archicontribs.modelrepository.services.MergeHandler;
+import org.archicontribs.modelrepository.services.RepositoryService.PublishResult;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
-import org.eclipse.jgit.api.errors.GitAPIException;
-import org.eclipse.jgit.transport.PushResult;
-import org.eclipse.jgit.transport.RemoteRefUpdate;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.IWorkbenchWindow;
 
-import com.archimatetool.editor.utils.StringUtils;
 import com.archimatetool.model.IArchimateModel;
 
 /**
  * Push Model Action ("Publish")
  * 
- * 1. Do actions in Refresh Model Action
- * 2. If OK then Push to Remote
+ * 1. Do actions in Refresh Model Action (init)
+ * 2. Pull + merge via RepositoryService
+ * 3. If OK then Push to Remote
  * 
  * @author Phillip Beauvoir
  */
@@ -62,6 +61,9 @@ public class PushModelAction extends RefreshModelAction {
             
             // Get credentials before opening the progress dialog
             UsernamePassword npw = getUsernamePassword();
+            
+            // Create the merge handler for interactive mode
+            MergeHandler mergeHandler = new InteractiveMergeHandler(fWindow.getShell());
 
             // Do main action with PM dialog — run on background thread (true)
             ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
@@ -75,44 +77,15 @@ public class PushModelAction extends RefreshModelAction {
                         // Update Proxy
                         ProxyAuthenticator.update(getRepository().getOnlineRepositoryURL());
                         
-                        // Pull
-                        monitor.subTask(Messages.PushModelAction_3);
-                        int status = pull(npw, monitor);
+                        // Pull + Push via service
+                        PublishResult result = repositoryService.publish(
+                                getRepository(), npw, mergeHandler, monitor);
                         
-                        // Push
-                        if(status == PULL_STATUS_OK || status == PULL_STATUS_UP_TO_DATE) {
-                            Iterable<PushResult> pushResult = push(npw, monitor);
-                            
-                            // Get any errors in Push Results (null when native git handled the push)
-                            StringBuilder sb = new StringBuilder();
-                            
-                            if(pushResult != null) {
-                            pushResult.forEach(result -> {
-                                result.getRemoteUpdates().stream()
-                                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.OK)
-                                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.UP_TO_DATE)
-                                        .forEach(update -> {
-                                            sb.append(update.getStatus().name() + "\n"); // Status enum name //$NON-NLS-1$
-                                            sb.append(update.getRemoteName() + "\n"); //$NON-NLS-1$
-                                            
-                                            String msgs = result.getMessages();
-                                            if(StringUtils.isSet(msgs)) {
-                                                // First char can be zero byte and message will not show on Windows
-                                                if(msgs.charAt(0) == 0) {
-                                                    msgs = msgs.substring(1);
-                                                }
-                                                
-                                                sb.append(msgs + "\n"); //$NON-NLS-1$
-                                            }
-                                        });
+                        // Show push errors if any
+                        if(result.status() == PublishResult.Status.PUSH_ERROR && result.pushErrors() != null) {
+                            Display.getDefault().syncExec(() -> {
+                                displayErrorDialog(Messages.PushModelAction_0, result.pushErrors());
                             });
-                            } // end if(pushResult != null)
-                            
-                            if(sb.length() != 0) {
-                                Display.getDefault().syncExec(() -> {
-                                    displayErrorDialog(Messages.PushModelAction_0, sb.toString());
-                                });
-                            }
                         }
                     }
                     catch(Exception ex) {
@@ -153,10 +126,5 @@ public class PushModelAction extends RefreshModelAction {
         catch(Exception ex) {
             displayErrorDialog(Messages.PushModelAction_0, ex);
         }
-    }
-    
-    Iterable<PushResult> push(UsernamePassword npw, IProgressMonitor monitor) throws IOException, GitAPIException {
-        monitor.subTask(Messages.PushModelAction_2);
-        return getRepository().pushToRemote(npw, new ProgressMonitorWrapper(monitor));
     }
 }

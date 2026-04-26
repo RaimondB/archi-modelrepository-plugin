@@ -28,5 +28,41 @@
             name="Commit Collaboration Model">
       </commandlineProvider>
    </extension>
+   <extension
+         point="com.archimatetool.commandline.commandlineProvider">
+      <commandlineProvider
+            class="org.archicontribs.modelrepository.commandline.PullModelProvider"
+            description="Pull (fetch + merge) changes from the remote repository"
+            id="org.archicontribs.modelrepository.commandlinePullModel"
+            name="Pull Collaboration Model">
+      </commandlineProvider>
+   </extension>
+   <extension
+         point="com.archimatetool.commandline.commandlineProvider">
+      <commandlineProvider
+            class="org.archicontribs.modelrepository.commandline.PushModelProvider"
+            description="Publish (pull + push) changes to the remote repository"
+            id="org.archicontribs.modelrepository.commandlinePushModel"
+            name="Publish Collaboration Model">
+      </commandlineProvider>
+   </extension>
+   <extension
+         point="com.archimatetool.commandline.commandlineProvider">
+      <commandlineProvider
+            class="org.archicontribs.modelrepository.commandline.SwitchBranchProvider"
+            description="Switch to a different branch in the collaboration repository"
+            id="org.archicontribs.modelrepository.commandlineSwitchBranch"
+            name="Switch Branch">
+      </commandlineProvider>
+   </extension>
+   <extension
+         point="com.archimatetool.commandline.commandlineProvider">
+      <commandlineProvider
+            class="org.archicontribs.modelrepository.commandline.MergeBranchProvider"
+            description="Merge a branch into the current branch in the collaboration repository"
+            id="org.archicontribs.modelrepository.commandlineMergeBranch"
+            name="Merge Branch">
+      </commandlineProvider>
+   </extension>
 
 </plugin>

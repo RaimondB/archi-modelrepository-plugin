@@ -5,15 +5,39 @@
  */
 package org.archicontribs.modelrepository.services;
 
+import java.io.File;
 import java.io.IOException;
 
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.UsernamePassword;
+import org.archicontribs.modelrepository.grafico.ArchiRepository;
+import org.archicontribs.modelrepository.grafico.BranchInfo;
+import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoModelExporter;
+import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
+import org.archicontribs.modelrepository.grafico.IGraficoConstants;
+import org.archicontribs.modelrepository.grafico.ProgressMonitorWrapper;
+import org.archicontribs.modelrepository.merge.MergeConflictHandler;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
+import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.MergeResult;
+import org.eclipse.jgit.api.MergeResult.MergeStatus;
+import org.eclipse.jgit.api.errors.CanceledException;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.api.errors.RefNotAdvertisedException;
+import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.transport.FetchResult;
+import org.eclipse.jgit.transport.PushResult;
+import org.eclipse.jgit.transport.RemoteRefUpdate;
+import org.eclipse.osgi.util.NLS;
 
+import com.archimatetool.editor.utils.StringUtils;
 import com.archimatetool.model.IArchimateModel;
 
 /**
@@ -41,6 +65,76 @@ public class RepositoryService {
             COMMITTED,
             /** No changes to commit */
             NOTHING_TO_COMMIT
+        }
+    }
+
+    /**
+     * Result of a refresh (pull) operation.
+     * 
+     * @param status the outcome
+     */
+    public record RefreshResult(Status status) {
+        public enum Status {
+            /** Pull and merge succeeded */
+            OK,
+            /** Already up to date — nothing fetched */
+            UP_TO_DATE,
+            /** User cancelled during conflict resolution */
+            MERGE_CANCELLED,
+            /** An error occurred */
+            ERROR
+        }
+    }
+
+    /**
+     * Result of a publish (pull + push) operation.
+     * 
+     * @param status the outcome
+     * @param pushErrors push error messages, or null if no errors
+     */
+    public record PublishResult(Status status, String pushErrors) {
+        public enum Status {
+            /** Publish succeeded */
+            OK,
+            /** Already up to date (no pull needed, push may or may not have run) */
+            UP_TO_DATE,
+            /** User cancelled during conflict resolution */
+            MERGE_CANCELLED,
+            /** Push had errors */
+            PUSH_ERROR
+        }
+    }
+
+    /**
+     * Result of a switch branch operation.
+     * 
+     * @param status the outcome
+     */
+    public record SwitchResult(Status status) {
+        public enum Status {
+            /** Branch switch succeeded */
+            OK,
+            /** Already on the requested branch */
+            ALREADY_ON_BRANCH
+        }
+    }
+
+    /**
+     * Result of a merge branch operation.
+     * 
+     * @param status the outcome
+     * @param conflictCount number of conflicts resolved (0 if clean merge or fast-forward)
+     */
+    public record MergeBranchResult(Status status, int conflictCount) {
+        public enum Status {
+            /** Merge succeeded */
+            OK,
+            /** Already up to date — nothing to merge */
+            UP_TO_DATE,
+            /** User cancelled during conflict resolution */
+            MERGE_CANCELLED,
+            /** An error occurred */
+            ERROR
         }
     }
     
@@ -124,5 +218,540 @@ public class RepositoryService {
         progress.worked(20);
         
         return new CommitResult(CommitResult.Status.COMMITTED, commit.getName());
+    }
+
+    /**
+     * Fetch from remote, merge, handle conflicts, and reload the model.
+     * <p>
+     * This is the core workflow extracted from {@code RefreshModelAction.pull()}.
+     * All UI interactions are delegated to the {@link MergeHandler} strategy.
+     * <p>
+     * The caller is responsible for:
+     * <ul>
+     *   <li>Saving the model if dirty</li>
+     *   <li>Exporting to GRAFICO and committing staged changes before calling this</li>
+     *   <li>Providing credentials</li>
+     *   <li>Updating proxy settings</li>
+     *   <li>Saving checksum and notifying listeners after this completes</li>
+     * </ul>
+     * 
+     * @param repo the repository to refresh
+     * @param npw credentials for remote operations (may be null for native git/GCM)
+     * @param mergeHandler strategy for resolving conflicts and reloading the model
+     * @param monitor progress monitor
+     * @return the refresh result
+     * @throws IOException on I/O errors
+     * @throws GitAPIException on git errors
+     */
+    public RefreshResult refresh(IArchiRepository repo, UsernamePassword npw,
+            MergeHandler mergeHandler, IProgressMonitor monitor) throws IOException, GitAPIException {
+        long pullStart = System.nanoTime();
+        long phaseStart;
+
+        // Capture HEAD before pull for cross-path deletion detection
+        ObjectId oursIdBeforePull = null;
+        phaseStart = System.nanoTime();
+        try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+            oursIdBeforePull = git.getRepository().resolve(IGraficoConstants.HEAD);
+        }
+        logPerf("Resolve HEAD before pull", phaseStart); //$NON-NLS-1$
+
+        // Phase 1: Fetch from remote
+        monitor.subTask(Messages.RepositoryService_0);
+        FetchResult fetchResult;
+        phaseStart = System.nanoTime();
+        try {
+            fetchResult = repo.fetchFromRemote(npw, new ProgressMonitorWrapper(monitor), false);
+        }
+        catch(Exception ex) {
+            if(ex instanceof RefNotAdvertisedException) {
+                return new RefreshResult(RefreshResult.Status.OK);
+            }
+            throw ex;
+        }
+        logPerf("fetchFromRemote", phaseStart); //$NON-NLS-1$
+
+        // fetchResult is null when native git handled the fetch — assume refs may have changed
+        boolean newTrackingRefUpdates = fetchResult == null || !fetchResult.getTrackingRefUpdates().isEmpty();
+
+        // Phase 2: Determine if merge is needed
+        phaseStart = System.nanoTime();
+        MergeResult mergeResult = null;
+        String remoteBranch;
+
+        try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+            Repository repository = git.getRepository();
+            String currentBranch = repository.getBranch();
+            remoteBranch = IGraficoConstants.ORIGIN + "/" + currentBranch; //$NON-NLS-1$
+            ObjectId remoteId = repository.resolve(Constants.R_REMOTES + remoteBranch);
+            ObjectId headId = repository.resolve(IGraficoConstants.HEAD);
+
+            if(remoteId == null || (headId != null && headId.equals(remoteId))) {
+                logPerf("merge (already up to date)", phaseStart); //$NON-NLS-1$
+                if(newTrackingRefUpdates) {
+                    return new RefreshResult(RefreshResult.Status.OK);
+                }
+                return new RefreshResult(RefreshResult.Status.UP_TO_DATE);
+            }
+        }
+
+        // Merge — ArchiRepository handles native git / JGit switching internally
+        monitor.subTask(Messages.RepositoryService_1);
+        mergeResult = ((ArchiRepository) repo).merge(remoteBranch, monitor);
+        logPerf("merge", phaseStart); //$NON-NLS-1$
+
+        phaseStart = System.nanoTime();
+        BranchStatus branchStatus = repo.getBranchStatus();
+        logPerf("getBranchStatus", phaseStart); //$NON-NLS-1$
+
+        // Setup the Grafico Model Loader
+        GraficoModelLoader loader = new GraficoModelLoader(repo);
+
+        // Track conflict count for commit message
+        int conflictCount = 0;
+
+        // Merge failure — only possible if JGit merge was used (native merge was either clean or aborted+retried)
+        if(mergeResult != null && mergeResult.getMergeStatus() == MergeStatus.CONFLICTING) {
+            conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+            monitor.subTask(NLS.bind(Messages.RepositoryService_2, conflictCount));
+
+            // Get the remote ref name
+            String remoteRef = branchStatus.getCurrentRemoteBranch().getFullName();
+
+            // Try to handle the merge conflict
+            MergeConflictHandler handler = new MergeConflictHandler(mergeResult, remoteRef,
+                    repo, null); // Shell is null — UI interaction via MergeHandler strategy
+
+            try {
+                handler.init(monitor);
+            }
+            catch(IOException | GitAPIException ex) {
+                handler.resetToLocalState();
+
+                if(ex instanceof CanceledException) {
+                    return new RefreshResult(RefreshResult.Status.MERGE_CANCELLED);
+                }
+
+                throw ex;
+            }
+
+            String dialogMessage = NLS.bind(Messages.RepositoryService_2,
+                    branchStatus.getCurrentLocalBranch().getShortName());
+
+            // Delegate to MergeHandler strategy for conflict resolution
+            boolean resolved = mergeHandler.resolveConflicts(handler, dialogMessage);
+
+            if(resolved) {
+                handler.merge();
+                log(IStatus.INFO, "[RepositoryService] handler.merge() completed (refresh)"); //$NON-NLS-1$
+            }
+            else {
+                handler.resetToLocalState();
+                return new RefreshResult(RefreshResult.Status.MERGE_CANCELLED);
+            }
+
+            // Detect and remove elements deleted by one parent but leaked via move
+            monitor.subTask(Messages.RepositoryService_3);
+            detectAndRemoveCrossPathDeletions(repo, oursIdBeforePull, branchStatus);
+
+            // Pre-repair: detect and resolve folder moves before loading the model
+            loader.repairMissingFolderXml();
+            loader.applyFolderMoveResolutions();
+
+            // Reload the model (delegated to MergeHandler — interactive mode needs UI thread)
+            monitor.subTask(Messages.RepositoryService_4);
+            try {
+                mergeHandler.reloadModel(loader, monitor);
+            }
+            catch(IOException ex) {
+                handler.resetToLocalState();
+                throw ex;
+            }
+        }
+        else {
+            // Clean merge path
+            monitor.subTask(Messages.RepositoryService_3);
+            detectAndRemoveCrossPathDeletions(repo, oursIdBeforePull, branchStatus);
+
+            // Pre-repair: detect folder moves before loading the model
+            phaseStart = System.nanoTime();
+            loader.repairMissingFolderXml();
+            logPerf("repairMissingFolderXml", phaseStart); //$NON-NLS-1$
+
+            // Delegate folder move resolution to MergeHandler
+            if(loader.hasPendingFolderMoves()) {
+                mergeHandler.resolveFolderMoves(loader.getFolderMoves());
+            }
+
+            // Apply the user's choices (or defaults if no dialog was needed)
+            phaseStart = System.nanoTime();
+            loader.applyFolderMoveResolutions();
+            logPerf("applyFolderMoveResolutions", phaseStart); //$NON-NLS-1$
+
+            // Reload the model (delegated to MergeHandler — interactive mode needs UI thread)
+            monitor.subTask(Messages.RepositoryService_4);
+            phaseStart = System.nanoTime();
+            mergeHandler.reloadModel(loader, monitor);
+            logPerf("loadModel (import GRAFICO)", phaseStart); //$NON-NLS-1$
+        }
+
+        // Do a commit if needed
+        phaseStart = System.nanoTime();
+        boolean hasChanges = repo.hasChangesToCommit();
+        logPerf("hasChangesToCommit", phaseStart); //$NON-NLS-1$
+        log(IStatus.INFO, "[RepositoryService] hasChangesToCommit=" + hasChanges + " (refresh)"); //$NON-NLS-1$ //$NON-NLS-2$
+
+        File mergeHead = new File(repo.getLocalRepositoryFolder(), ".git/MERGE_HEAD"); //$NON-NLS-1$
+        log(IStatus.INFO, "[RepositoryService] MERGE_HEAD exists=" + mergeHead.exists()); //$NON-NLS-1$
+
+        if(hasChanges || mergeHead.exists()) {
+            monitor.subTask(Messages.RepositoryService_5);
+
+            String commitMessage;
+            if(conflictCount > 0) {
+                commitMessage = NLS.bind(Messages.RepositoryService_6,
+                        branchStatus.getCurrentLocalBranch().getShortName(), conflictCount);
+            }
+            else {
+                commitMessage = NLS.bind(Messages.RepositoryService_7,
+                        branchStatus.getCurrentLocalBranch().getShortName());
+            }
+
+            // Append restored objects info
+            String restoredObjects = loader.getRestoredObjectsAsString();
+            if(restoredObjects != null) {
+                commitMessage += "\n\n" + restoredObjects; //$NON-NLS-1$
+            }
+
+            // Append repair details
+            String repairDetails = loader.getRepairDetailsAsString();
+            if(repairDetails != null) {
+                commitMessage += "\n" + repairDetails; //$NON-NLS-1$
+            }
+
+            phaseStart = System.nanoTime();
+            repo.commitChanges(commitMessage, false);
+            logPerf("commitChanges", phaseStart); //$NON-NLS-1$
+        }
+
+        logPerf("=== TOTAL REFRESH ===", pullStart); //$NON-NLS-1$
+
+        return new RefreshResult(RefreshResult.Status.OK);
+    }
+
+    /**
+     * Refresh (pull) then push to remote.
+     * <p>
+     * This is the core workflow extracted from {@code PushModelAction}.
+     * The caller is responsible for the same prerequisites as {@link #refresh}.
+     * 
+     * @param repo the repository to publish
+     * @param npw credentials for remote operations (may be null for native git/GCM)
+     * @param mergeHandler strategy for resolving conflicts and reloading the model
+     * @param monitor progress monitor
+     * @return the publish result
+     * @throws IOException on I/O errors
+     * @throws GitAPIException on git errors
+     */
+    public PublishResult publish(IArchiRepository repo, UsernamePassword npw,
+            MergeHandler mergeHandler, IProgressMonitor monitor) throws IOException, GitAPIException {
+
+        // Pull first
+        RefreshResult refreshResult = refresh(repo, npw, mergeHandler, monitor);
+
+        // Only push if pull succeeded
+        if(refreshResult.status() != RefreshResult.Status.OK
+                && refreshResult.status() != RefreshResult.Status.UP_TO_DATE) {
+            return new PublishResult(
+                    refreshResult.status() == RefreshResult.Status.MERGE_CANCELLED
+                            ? PublishResult.Status.MERGE_CANCELLED
+                            : PublishResult.Status.PUSH_ERROR,
+                    null);
+        }
+
+        // Push
+        monitor.subTask(Messages.RepositoryService_8);
+        Iterable<PushResult> pushResult = repo.pushToRemote(npw, new ProgressMonitorWrapper(monitor));
+
+        // Check for push errors (null when native git handled the push)
+        StringBuilder sb = new StringBuilder();
+        if(pushResult != null) {
+            pushResult.forEach(result -> {
+                result.getRemoteUpdates().stream()
+                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.OK)
+                        .filter(update -> update.getStatus() != RemoteRefUpdate.Status.UP_TO_DATE)
+                        .forEach(update -> {
+                            sb.append(update.getStatus().name()).append("\n"); //$NON-NLS-1$
+                            sb.append(update.getRemoteName()).append("\n"); //$NON-NLS-1$
+
+                            String msgs = result.getMessages();
+                            if(StringUtils.isSet(msgs)) {
+                                if(msgs.charAt(0) == 0) {
+                                    msgs = msgs.substring(1);
+                                }
+                                sb.append(msgs).append("\n"); //$NON-NLS-1$
+                            }
+                        });
+            });
+        }
+
+        if(sb.length() != 0) {
+            return new PublishResult(PublishResult.Status.PUSH_ERROR, sb.toString());
+        }
+
+        return new PublishResult(PublishResult.Status.OK, null);
+    }
+
+    /**
+     * Switch to a different branch.
+     * <p>
+     * This is the headless-safe workflow extracted from {@code SwitchBranchAction.switchBranch()}.
+     * Creates a local tracking branch if the target is remote-only, performs git checkout,
+     * optionally reloads the model via the {@link MergeHandler}, and saves the checksum.
+     * <p>
+     * The caller is responsible for:
+     * <ul>
+     *   <li>Saving the model if dirty</li>
+     *   <li>Exporting to GRAFICO and committing (or resetting) before calling this</li>
+     *   <li>Notifying UI listeners after this completes</li>
+     * </ul>
+     * 
+     * @param repo the repository
+     * @param branchInfo the branch to switch to
+     * @param doReloadModel whether to reload the model after checkout
+     * @param mergeHandler strategy for reloading the model (needed when doReloadModel is true)
+     * @param monitor progress monitor (may be null)
+     * @return the switch result
+     * @throws IOException on I/O errors
+     * @throws GitAPIException on git errors
+     */
+    public SwitchResult switchBranch(IArchiRepository repo, BranchInfo branchInfo,
+            boolean doReloadModel, MergeHandler mergeHandler,
+            IProgressMonitor monitor) throws IOException, GitAPIException {
+        
+        SubMonitor progress = SubMonitor.convert(monitor, 100);
+        File repoFolder = repo.getLocalRepositoryFolder();
+
+        // If the branch is remote and has no local ref, create local tracking branch
+        if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
+            try(Git git = Git.open(repoFolder)) {
+                git.branchCreate()
+                        .setName(branchInfo.getShortName())
+                        .setStartPoint(branchInfo.getFullName())
+                        .call();
+            }
+        }
+
+        // Determine the branch name for checkout
+        String branchName = branchInfo.isLocal()
+                ? branchInfo.getFullName() : branchInfo.getShortName();
+
+        // Git checkout (tries native git, falls back to JGit)
+        long phaseStart = System.nanoTime();
+        progress.subTask(Messages.RepositoryService_9);
+        repo.checkoutBranch(branchName);
+        logPerf("checkoutBranch", phaseStart); //$NON-NLS-1$
+        progress.worked(30);
+
+        // Reload the model if requested
+        if(doReloadModel && mergeHandler != null) {
+            phaseStart = System.nanoTime();
+            progress.subTask(Messages.RepositoryService_4);
+            GraficoModelLoader loader = new GraficoModelLoader(repo);
+            mergeHandler.reloadModel(loader, progress.split(60));
+            logPerf("reloadModel (switch)", phaseStart); //$NON-NLS-1$
+        }
+
+        // Save the checksum
+        repo.saveChecksum();
+        progress.worked(10);
+
+        return new SwitchResult(SwitchResult.Status.OK);
+    }
+
+    /**
+     * Merge a local branch into the current branch.
+     * <p>
+     * This is the core merge workflow extracted from {@code MergeBranchAction.merge()}.
+     * Handles conflict resolution via the {@link MergeHandler} strategy, cross-path
+     * deletion detection, folder repair, model reload, and final commit.
+     * <p>
+     * The caller is responsible for:
+     * <ul>
+     *   <li>Saving the model if dirty</li>
+     *   <li>Exporting to GRAFICO and committing before calling this</li>
+     *   <li>Notifying UI listeners after this completes</li>
+     * </ul>
+     * 
+     * @param repo the repository
+     * @param currentBranch the current branch (merge target)
+     * @param branchToMerge the branch to merge into the current branch
+     * @param mergeHandler strategy for resolving conflicts and reloading the model
+     * @param monitor progress monitor
+     * @return the merge result
+     * @throws IOException on I/O errors
+     * @throws GitAPIException on git errors
+     */
+    @SuppressWarnings("nls")
+    public MergeBranchResult mergeBranch(IArchiRepository repo, BranchInfo currentBranch,
+            BranchInfo branchToMerge, MergeHandler mergeHandler,
+            IProgressMonitor monitor) throws IOException, GitAPIException {
+        
+        long mergeStart = System.nanoTime();
+        long phaseStart;
+        int conflictCount = 0;
+
+        monitor.subTask(NLS.bind(Messages.RepositoryService_10,
+                branchToMerge.getShortName(), currentBranch.getShortName()));
+
+        try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+            ObjectId oursId = git.getRepository().resolve(IGraficoConstants.HEAD);
+            ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
+
+            String mergeMessage = NLS.bind(Messages.RepositoryService_11,
+                    branchToMerge.getShortName(), currentBranch.getShortName());
+
+            // Merge — ArchiRepository handles native git / JGit switching
+            phaseStart = System.nanoTime();
+            MergeResult mergeResult = ((ArchiRepository) repo).mergeBranch(
+                    branchToMerge.getShortName(), mergeMessage, monitor);
+            logPerf("mergeBranch", phaseStart);
+
+            // null = native git performed a clean merge
+            MergeStatus status = mergeResult != null ? mergeResult.getMergeStatus() : null;
+
+            if(status == MergeStatus.ALREADY_UP_TO_DATE) {
+                return new MergeBranchResult(MergeBranchResult.Status.UP_TO_DATE, 0);
+            }
+
+            // Handle conflicts
+            if(status == MergeStatus.CONFLICTING) {
+                conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+                monitor.subTask(NLS.bind(Messages.RepositoryService_2, conflictCount));
+
+                MergeConflictHandler handler = new MergeConflictHandler(mergeResult,
+                        branchToMerge.getShortName(), repo, null);
+
+                try {
+                    handler.init(monitor);
+                }
+                catch(IOException | GitAPIException ex) {
+                    handler.resetToLocalState();
+                    if(ex instanceof CanceledException) {
+                        return new MergeBranchResult(MergeBranchResult.Status.MERGE_CANCELLED, 0);
+                    }
+                    throw ex;
+                }
+
+                String dialogMessage = NLS.bind(Messages.RepositoryService_12,
+                        branchToMerge.getShortName(), currentBranch.getShortName());
+
+                boolean resolved = mergeHandler.resolveConflicts(handler, dialogMessage);
+
+                if(resolved) {
+                    handler.merge();
+                    log(IStatus.INFO, "[RepositoryService] handler.merge() completed (mergeBranch)");
+                }
+                else {
+                    handler.resetToLocalState();
+                    return new MergeBranchResult(MergeBranchResult.Status.MERGE_CANCELLED, 0);
+                }
+            }
+
+            // Cross-path deletion detection
+            monitor.subTask(Messages.RepositoryService_3);
+            phaseStart = System.nanoTime();
+            if(oursId != null && theirsId != null) {
+                int removed = MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+                        git.getRepository(), oursId, theirsId);
+                log(IStatus.INFO, "[RepositoryService] detectAndRemoveCrossPathDeletions: removed=" + removed);
+            }
+            logPerf("detectAndRemoveCrossPathDeletions (mergeBranch)", phaseStart);
+
+            // Folder repair
+            GraficoModelLoader loader = new GraficoModelLoader(repo);
+            phaseStart = System.nanoTime();
+            loader.repairMissingFolderXml();
+            logPerf("repairMissingFolderXml", phaseStart);
+
+            if(loader.hasPendingFolderMoves()) {
+                mergeHandler.resolveFolderMoves(loader.getFolderMoves());
+            }
+
+            phaseStart = System.nanoTime();
+            loader.applyFolderMoveResolutions();
+            logPerf("applyFolderMoveResolutions", phaseStart);
+
+            // Reload the model
+            monitor.subTask(Messages.RepositoryService_4);
+            phaseStart = System.nanoTime();
+            mergeHandler.reloadModel(loader, monitor);
+            logPerf("reloadModel (mergeBranch)", phaseStart);
+
+            // Commit if needed
+            phaseStart = System.nanoTime();
+            boolean hasChanges = repo.hasChangesToCommit();
+            logPerf("hasChangesToCommit", phaseStart);
+
+            File mergeHead = new File(repo.getLocalRepositoryFolder(), ".git/MERGE_HEAD");
+
+            if(hasChanges || mergeHead.exists()) {
+                monitor.subTask(Messages.RepositoryService_5);
+
+                if(conflictCount > 0) {
+                    mergeMessage = NLS.bind(Messages.RepositoryService_13,
+                            new Object[] { branchToMerge.getShortName(),
+                                           currentBranch.getShortName(), conflictCount });
+                }
+
+                String restoredObjects = loader.getRestoredObjectsAsString();
+                if(restoredObjects != null) {
+                    mergeMessage += "\n\n" + restoredObjects;
+                }
+
+                String repairDetails = loader.getRepairDetailsAsString();
+                if(repairDetails != null) {
+                    mergeMessage += "\n" + repairDetails;
+                }
+
+                phaseStart = System.nanoTime();
+                repo.commitChanges(mergeMessage, false);
+                logPerf("commitChanges (mergeBranch)", phaseStart);
+            }
+        }
+
+        logPerf("=== TOTAL MERGE BRANCH ===", mergeStart);
+
+        return new MergeBranchResult(MergeBranchResult.Status.OK, conflictCount);
+    }
+
+    // ---- Private helpers ----
+
+    private void detectAndRemoveCrossPathDeletions(IArchiRepository repo,
+            ObjectId oursIdBeforePull, BranchStatus branchStatus) throws IOException, GitAPIException {
+        if(oursIdBeforePull != null) {
+            long phaseStart = System.nanoTime();
+            try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+                ObjectId theirsId = git.getRepository().resolve(
+                        branchStatus.getCurrentRemoteBranch().getFullName());
+                if(theirsId != null) {
+                    MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+                            git.getRepository(), oursIdBeforePull, theirsId);
+                }
+            }
+            logPerf("detectAndRemoveCrossPathDeletions", phaseStart); //$NON-NLS-1$
+        }
+    }
+
+    private static void logPerf(String phase, long startNanos) {
+        long ms = (System.nanoTime() - startNanos) / 1_000_000;
+        log(IStatus.INFO, "[RepositoryService] " + phase + ": " + ms + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+    }
+
+    private static void log(int severity, String message) {
+        ModelRepositoryPlugin plugin = ModelRepositoryPlugin.getInstance();
+        if(plugin != null) {
+            plugin.log(severity, message, null);
+        }
     }
 }

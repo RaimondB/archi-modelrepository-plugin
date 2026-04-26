@@ -6,29 +6,18 @@
 package org.archicontribs.modelrepository.actions;
 
 import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.jgit.lib.EmptyProgressMonitor;
 
 /**
- * JGit ProgressMonitor Wrapper around a IProgressMonitor
+ * JGit ProgressMonitor Wrapper around a IProgressMonitor.
+ * <p>
+ * Delegates to {@link org.archicontribs.modelrepository.grafico.ProgressMonitorWrapper}.
+ * This subclass exists for backward compatibility with code in the actions package.
  * 
  * @author Phillip Beauvoir
  */
-public class ProgressMonitorWrapper extends EmptyProgressMonitor {
-    private IProgressMonitor pm;
+public class ProgressMonitorWrapper extends org.archicontribs.modelrepository.grafico.ProgressMonitorWrapper {
 
     public ProgressMonitorWrapper(IProgressMonitor pm) {
-        this.pm = pm;
-    }
-    
-    @Override
-    public boolean isCancelled() {
-        return (pm != null) ? pm.isCanceled() : false;
-    }
-    
-    /**
-     * @return the wrapped Eclipse progress monitor
-     */
-    public IProgressMonitor getWrappedMonitor() {
-        return pm;
+        super(pm);
     }
 }

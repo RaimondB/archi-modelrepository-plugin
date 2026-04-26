@@ -17,6 +17,8 @@ import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
+import org.archicontribs.modelrepository.services.HeadlessMergeHandler;
+import org.archicontribs.modelrepository.services.RepositoryService;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.dialogs.MessageDialog;
@@ -399,6 +401,7 @@ public class SwitchBranchAction extends AbstractModelAction {
     /**
      * Switch branch for headless/command-line usage (no progress dialog).
      * Also used by MergeBranchAction.
+     * Delegates to {@link RepositoryService#switchBranch}.
      */
     protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico) throws IOException, GitAPIException {
         switchBranch(branchInfo, doReloadGrafico, null);
@@ -406,29 +409,15 @@ public class SwitchBranchAction extends AbstractModelAction {
     
     /**
      * Switch branch with optional external progress monitor.
+     * Delegates to {@link RepositoryService#switchBranch}.
      * @param branchInfo The branch to switch to
      * @param doReloadGrafico Whether to reload the model after checkout
      * @param monitor External progress monitor (null for headless mode)
      */
     protected void switchBranch(BranchInfo branchInfo, boolean doReloadGrafico, IProgressMonitor monitor) throws IOException, GitAPIException {
-        // Use SubMonitor if external monitor provided
-        SubMonitor progress = monitor != null ? SubMonitor.convert(monitor, 100) : null;
-        
-        // Perform Git checkout
-        if(progress != null) {
-            performGitCheckoutWithMonitor(branchInfo, progress.split(30));
-        } else {
-            performGitCheckoutHeadless(branchInfo);
-        }
-        
-        // Reload the model if requested
-        if(doReloadGrafico) {
-            IProgressMonitor loadMonitor = progress != null ? progress.split(70) : null;
-            new GraficoModelLoader(getRepository(), monitor == null).loadModel(loadMonitor);
-            
-            // Save the checksum
-            getRepository().saveChecksum();
-        }
+        RepositoryService repositoryService = new RepositoryService();
+        HeadlessMergeHandler mergeHandler = new HeadlessMergeHandler();
+        repositoryService.switchBranch(getRepository(), branchInfo, doReloadGrafico, mergeHandler, monitor);
     }
     
     /**
@@ -464,30 +453,6 @@ public class SwitchBranchAction extends AbstractModelAction {
         progress.subTask(Messages.SwitchBranchAction_17); // "Checkout completed"
         
         progress.worked(90);
-    }
-    
-    /**
-     * Perform the Git checkout operation for headless/command-line usage (no progress).
-     */
-    private void performGitCheckoutHeadless(BranchInfo branchInfo) throws IOException, GitAPIException {
-        File repoFolder = getRepository().getLocalRepositoryFolder();
-        
-        // If the branch is remote and has no local ref, we need to create it first using JGit
-        if(branchInfo.isRemote() && !branchInfo.hasLocalRef()) {
-            try(Git git = Git.open(repoFolder)) {
-                git.branchCreate()
-                        .setName(branchInfo.getShortName())
-                        .setStartPoint(branchInfo.getFullName())
-                        .call();
-            }
-        }
-        
-        // Determine the branch name to checkout
-        String branchName = branchInfo.isLocal() ? 
-                branchInfo.getFullName() : branchInfo.getShortName();
-        
-        // Perform checkout using repository method (tries native git, falls back to JGit automatically)
-        getRepository().checkoutBranch(branchName);
     }
     
     private boolean isBranchRefSameAsCurrentBranchRef(BranchInfo branchInfo) {

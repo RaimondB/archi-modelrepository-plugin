@@ -12,6 +12,7 @@ import org.archicontribs.modelrepository.grafico.GraficoModelLoaderTests;
 import org.archicontribs.modelrepository.grafico.GraficoUtilsTests;
 import org.archicontribs.modelrepository.grafico.RemoteIntegrationTests;
 import org.archicontribs.modelrepository.merge.MergeConflictHandlerTests;
+import org.archicontribs.modelrepository.services.RepositoryServiceTests;
 import org.junit.platform.suite.api.ExcludeTags;
 import org.junit.platform.suite.api.SelectClasses;
 import org.junit.platform.suite.api.Suite;
@@ -31,7 +32,8 @@ import org.junit.platform.suite.api.SuiteDisplayName;
     GraficoUtilsTests.class,
     CryptoDataTests.class,
     MergeConflictHandlerTests.class,
-    RemoteIntegrationTests.class
+    RemoteIntegrationTests.class,
+    RepositoryServiceTests.class
 })
 @ExcludeTags("performance")
 @SuiteDisplayName("All Model Repository Tests")

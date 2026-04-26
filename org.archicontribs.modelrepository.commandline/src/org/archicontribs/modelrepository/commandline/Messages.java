@@ -102,6 +102,55 @@ public class Messages extends NLS {
     
     public static String CommitModelProvider_12;
     
+    public static String PullModelProvider_0;
+    public static String PullModelProvider_1;
+    public static String PullModelProvider_2;
+    public static String PullModelProvider_3;
+    public static String PullModelProvider_4;
+    public static String PullModelProvider_5;
+    public static String PullModelProvider_6;
+    public static String PullModelProvider_7;
+    public static String PullModelProvider_8;
+    public static String PullModelProvider_9;
+    
+    public static String PushModelProvider_0;
+    public static String PushModelProvider_1;
+    public static String PushModelProvider_2;
+    public static String PushModelProvider_3;
+    public static String PushModelProvider_4;
+    public static String PushModelProvider_5;
+    public static String PushModelProvider_6;
+    public static String PushModelProvider_7;
+    public static String PushModelProvider_8;
+    public static String PushModelProvider_9;
+
+    public static String SwitchBranchProvider_0;
+    public static String SwitchBranchProvider_1;
+    public static String SwitchBranchProvider_2;
+    public static String SwitchBranchProvider_3;
+    public static String SwitchBranchProvider_4;
+    public static String SwitchBranchProvider_5;
+    public static String SwitchBranchProvider_6;
+    public static String SwitchBranchProvider_7;
+    public static String SwitchBranchProvider_8;
+    public static String SwitchBranchProvider_9;
+    public static String SwitchBranchProvider_10;
+
+    public static String MergeBranchProvider_0;
+    public static String MergeBranchProvider_1;
+    public static String MergeBranchProvider_2;
+    public static String MergeBranchProvider_3;
+    public static String MergeBranchProvider_4;
+    public static String MergeBranchProvider_5;
+    public static String MergeBranchProvider_6;
+    public static String MergeBranchProvider_7;
+    public static String MergeBranchProvider_8;
+    public static String MergeBranchProvider_9;
+    public static String MergeBranchProvider_10;
+    public static String MergeBranchProvider_11;
+    public static String MergeBranchProvider_12;
+    public static String MergeBranchProvider_13;
+
     static {
         // initialize resource bundle
         NLS.initializeMessages(BUNDLE_NAME, Messages.class);
