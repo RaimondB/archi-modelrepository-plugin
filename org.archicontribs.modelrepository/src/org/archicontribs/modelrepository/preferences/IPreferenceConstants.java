@@ -32,6 +32,8 @@ public interface IPreferenceConstants {
     
     String PREFS_EXPORT_MAX_THREADS = "exportMaxThreads";
     
+    String PREFS_USE_NATIVE_GIT = "useNativeGit";
+    
     String PREFS_FETCH_IN_BACKGROUND = "fetchInBackground";
     String PREFS_FETCH_IN_BACKGROUND_INTERVAL = "fetchInBackgroundInterval";
     

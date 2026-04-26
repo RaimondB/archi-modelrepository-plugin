@@ -48,6 +48,8 @@ implements IPreferenceConstants {
 		int optimalThreads = Math.max(2, Math.min(12, cpuCount));
 		store.setDefault(PREFS_EXPORT_MAX_THREADS, optimalThreads);
 		
+		store.setDefault(PREFS_USE_NATIVE_GIT, true);
+		
 		store.setDefault(PREFS_FETCH_IN_BACKGROUND, false);
 		store.setDefault(PREFS_FETCH_IN_BACKGROUND_INTERVAL, 60);
 		

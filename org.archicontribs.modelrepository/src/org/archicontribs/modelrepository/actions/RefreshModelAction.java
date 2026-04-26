@@ -248,7 +248,8 @@ public class RefreshModelAction extends AbstractModelAction {
             
             // Phase 2a: Try native git merge (dramatically faster for large repos)
             ArchiRepository archiRepo = (ArchiRepository) getRepository();
-            Boolean nativeResult = archiRepo.tryNativeGitMerge(remoteBranch);
+            Boolean nativeResult = ArchiRepository.isNativeGitEnabled()
+                    ? archiRepo.tryNativeGitMerge(remoteBranch) : null;
             
             if(Boolean.TRUE.equals(nativeResult)) {
                 // Native merge succeeded cleanly

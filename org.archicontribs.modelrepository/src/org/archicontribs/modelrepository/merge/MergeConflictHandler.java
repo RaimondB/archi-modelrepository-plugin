@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
@@ -961,7 +962,7 @@ public class MergeConflictHandler {
         log(IStatus.INFO, "[MergeConflictHandler] staging " + affectedPaths.size() //$NON-NLS-1$
                 + " affected path(s): " + affectedPaths); //$NON-NLS-1$
         
-        if(!tryNativeGitAdd(repoRoot, affectedPaths)) {
+        if(!ArchiRepository.isNativeGitEnabled() || !tryNativeGitAdd(repoRoot, affectedPaths)) {
             try(Git git = Git.open(repoRoot)) {
                 stagePathsWithJGit(git, affectedPaths);
             }
@@ -1263,7 +1264,8 @@ public class MergeConflictHandler {
         // Collect element IDs deleted by each parent (base→ours, base→theirs)
         Set<String> deletedIds = new HashSet<>();
         
-        boolean nativeGitAvailable = collectDeletedIdsNative(repoRoot, mergeBaseSha,
+        boolean nativeGitAvailable = ArchiRepository.isNativeGitEnabled()
+                && collectDeletedIdsNative(repoRoot, mergeBaseSha,
                 oursCommitId.getName(), theirsCommitId.getName(), deletedIds);
         
         if(!nativeGitAvailable) {

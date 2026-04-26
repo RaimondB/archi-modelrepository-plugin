@@ -23,8 +23,10 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 
+import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
+import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.operation.IRunnableWithProgress;
@@ -95,6 +97,17 @@ public class ArchiRepository implements IArchiRepository {
         return new File(getLocalRepositoryFolder(), ".git");
     }
 
+    /**
+     * Check whether native git optimizations are enabled.
+     * Controlled by the {@code useNativeGit} preference (default: true).
+     * Can be set in Archi.ini / plugin_customization.ini as:
+     *   org.archicontribs.modelrepository/useNativeGit=false
+     */
+    public static boolean isNativeGitEnabled() {
+        return ModelRepositoryPlugin.getInstance().getPreferenceStore()
+                .getBoolean(IPreferenceConstants.PREFS_USE_NATIVE_GIT);
+    }
+
     @Override
     public String getName() {
         // If the model is open, return its name
@@ -153,7 +166,7 @@ public class ArchiRepository implements IArchiRepository {
     public boolean hasChangesToCommit() throws IOException, GitAPIException {
         // Try native git status first — much faster than JGit for large repos (30k+ files).
         // Native git uses multi-threaded working tree scan and OS file caches efficiently.
-        Boolean nativeResult = tryNativeGitStatus();
+        Boolean nativeResult = isNativeGitEnabled() ? tryNativeGitStatus() : null;
         if(nativeResult != null) {
             return nativeResult;
         }
@@ -222,7 +235,7 @@ public class ArchiRepository implements IArchiRepository {
     public void cloneModel(String repoURL, UsernamePassword npw, ProgressMonitor monitor) throws GitAPIException, IOException {
         // Try native Git for SSH repositories (faster and credentials handled by SSH agent/config)
         // For HTTPS, we need JGit's credential handling
-        boolean useNativeGit = GraficoUtils.isSSH(repoURL);
+        boolean useNativeGit = isNativeGitEnabled() && GraficoUtils.isSSH(repoURL);
         
         if(useNativeGit) {
             try {
@@ -740,7 +753,7 @@ public class ArchiRepository implements IArchiRepository {
         // Native git needs short name (e.g., "main"), JGit can use full ref (e.g., "refs/heads/main")
         String shortName = extractShortBranchName(branchName);
         
-        boolean nativeSuccess = tryNativeGitCheckout(shortName);
+        boolean nativeSuccess = isNativeGitEnabled() && tryNativeGitCheckout(shortName);
         
         if(!nativeSuccess) {
             // Fall back to JGit - can use either full or short name
@@ -846,7 +859,7 @@ public class ArchiRepository implements IArchiRepository {
      * @throws GitAPIException if JGit fallback fails
      */
     private void gitAdd() throws IOException, GitAPIException {
-        boolean nativeSuccess = tryNativeGitAdd();
+        boolean nativeSuccess = isNativeGitEnabled() && tryNativeGitAdd();
         
         if(!nativeSuccess) {
             // Fall back to JGit - need to call add twice to stage new, modified, AND deleted files
@@ -897,7 +910,7 @@ public class ArchiRepository implements IArchiRepository {
                 resetMode = "--mixed"; //$NON-NLS-1$
         }
         
-        boolean nativeSuccess = tryNativeGitReset(ref, resetMode);
+        boolean nativeSuccess = isNativeGitEnabled() && tryNativeGitReset(ref, resetMode);
         
         if(!nativeSuccess) {
             // Fall back to JGit
