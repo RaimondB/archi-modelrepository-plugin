@@ -670,7 +670,7 @@ public class MergeConflictHandler {
                 + ", userChoice=" + (info.getUserChoice() == MergeObjectInfo.OURS ? "OURS" : "THEIRS")); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         if(newFile != null && !oldXmlPath.equals(newXmlPath)) {
-            applyMoveResolvedContentChoice(oldFile, newFile, info, oursHasContent);
+            applyMoveResolvedContentChoice(oldFile, newFile, newXmlPath, info, oursHasContent);
             pathsToAdd.add(oldXmlPath);
             pathsToAdd.add(newXmlPath);
         } else {
@@ -694,9 +694,16 @@ public class MergeConflictHandler {
     /**
      * Apply the user's content choice for a move-resolved element:
      * copy modifier's content to new path if chosen, then delete old file.
+     * 
+     * <p>When the user wants the mover's content, the file normally exists at
+     * the new path from git's auto-merge. However, if the merge base had the
+     * file at both old and new paths (e.g. from a prior merge that duplicated
+     * it), and the modifier's branch deleted the copy at the new path, git
+     * auto-resolves the new path as deleted. In that case we must extract the
+     * mover's content from the appropriate ref and write it to the new path.</p>
      */
     private void applyMoveResolvedContentChoice(File oldFile, File newFile,
-            MergeObjectInfo info, boolean oursHasContent) throws IOException {
+            String newXmlPath, MergeObjectInfo info, boolean oursHasContent) throws IOException {
         // Determine if user wants the modifier's content
         boolean userWantsModifierContent = oursHasContent
                 ? (info.getUserChoice() == MergeObjectInfo.OURS)    // OURS = modifier
@@ -706,6 +713,22 @@ public class MergeConflictHandler {
             newFile.getParentFile().mkdirs();
             Files.copy(oldFile.toPath(), newFile.toPath(),
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } else if(!newFile.exists()) {
+            // Mover's content not on disk (git auto-resolved new path as deleted).
+            // Extract from the mover's ref.
+            String moverRef = oursHasContent ? getTheirRef() : getLocalRef();
+            byte[] moverContent = fArchiRepo.getFileContents(newXmlPath, moverRef);
+            if(moverContent != null) {
+                newFile.getParentFile().mkdirs();
+                Files.write(newFile.toPath(), moverContent);
+            } else {
+                // Fallback: copy modifier's content so the element is not lost
+                log(IStatus.WARNING, "[MergeConflictHandler] Could not extract mover content at " //$NON-NLS-1$
+                        + newXmlPath + " from " + moverRef + ", copying modifier content as fallback"); //$NON-NLS-1$ //$NON-NLS-2$
+                newFile.getParentFile().mkdirs();
+                Files.copy(oldFile.toPath(), newFile.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
         }
         // else: new path already has the mover's content (auto-merged)
         

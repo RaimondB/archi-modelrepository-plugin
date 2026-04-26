@@ -17,6 +17,7 @@ import java.nio.file.Files;
 import org.archicontribs.modelrepository.GitHelper;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.FolderMoveInfo;
+import org.archicontribs.modelrepository.grafico.GraficoModelExporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
@@ -32,7 +33,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import com.archimatetool.editor.utils.FileUtils;
+import com.archimatetool.model.FolderType;
+import com.archimatetool.model.IArchimateElement;
+import com.archimatetool.model.IArchimateFactory;
 import com.archimatetool.model.IArchimateModel;
+import com.archimatetool.model.IFolder;
 
 @SuppressWarnings("nls")
 public class MergeConflictHandlerTests {
@@ -3266,6 +3271,164 @@ public class MergeConflictHandlerTests {
                         "R (new element) should be at folderY");
                 assertFalse(folderX.exists(),
                         "folderX should not exist after merge");
+            }
+        }
+    }
+
+    // ========================================================================
+    // H1: Element duplicated at base, A cleans P copy, B cleans Q copy + renames
+    // ========================================================================
+
+    /**
+     * H1: Base has the element at BOTH folderP and folderQ (duplicated from a prior merge).
+     * Branch A deletes from P, keeps at Q.
+     * Branch B deletes from Q, renames content at P.
+     *
+     * Merge A into B:
+     *   - Conflict at P: A deleted, B modified → modify/delete conflict
+     *   - Q: A kept (unchanged), B deleted → git auto-resolves as DELETE
+     *     (B deleted and A didn't change, so git takes the delete)
+     *
+     * User choice: THEIRS (A = the mover) → element should end up at Q with A's content.
+     *
+     * BUG (before fix): The file at Q does not exist on disk after merge because
+     * git auto-resolved Q as deleted. resolveMoveResolvedElements tries to git-add
+     * the Q path which doesn't exist → IOException.
+     *
+     * Expected: Q has element with A's content, P is deleted.
+     */
+    @Test
+    public void merge_H1_DuplicatedElementAtBase_MoverContentAtDeletedPath() throws Exception {
+        File repoFolder = new File(GitHelper.getTempTestsFolder(), "h1DuplicateBaseRepo");
+
+        try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+            // Build in-memory model: element Q in folderP
+            IArchimateModel model = IArchimateFactory.eINSTANCE.createArchimateModel();
+            model.setDefaults();
+            model.setName("Test");
+
+            IFolder bizFolder = model.getFolder(FolderType.BUSINESS);
+            IFolder folderP = IArchimateFactory.eINSTANCE.createFolder();
+            folderP.setName("FolderP");
+            bizFolder.getFolders().add(folderP);
+            IFolder folderQ = IArchimateFactory.eINSTANCE.createFolder();
+            folderQ.setName("FolderQ");
+            bizFolder.getFolders().add(folderQ);
+
+            IArchimateElement elementQ = IArchimateFactory.eINSTANCE.createBusinessActor();
+            elementQ.setName("Q");
+            folderP.getElements().add(elementQ);
+
+            // Export to create valid GRAFICO structure
+            new GraficoModelExporter(model, repoFolder).exportModel();
+
+            // Locate the exported file paths
+            String qId = elementQ.getId();
+            String qFileName = "BusinessActor_" + qId + ".xml";
+            File bizDir = new File(repoFolder, "model/business");
+            File folderPDir = new File(bizDir, folderP.getId());
+            File folderQDir = new File(bizDir, folderQ.getId());
+            File qFileInP = new File(folderPDir, qFileName);
+            assertTrue(qFileInP.exists(), "Q should exist in folderP after export");
+
+            // Duplicate Q into folderQ (simulates prior merge artifact)
+            File qFileInQ = new File(folderQDir, qFileName);
+            Files.copy(qFileInP.toPath(), qFileInQ.toPath());
+
+            try(Git git = new Git(gitRepo)) {
+                git.add().addFilepattern(".").call();
+                git.commit().setMessage("initial: Q at both folderP and folderQ").call();
+
+                // === Branch A: delete from P, keep at Q (unchanged) ===
+                git.branchCreate().setName("branchA").call();
+                git.checkout().setName("branchA").call();
+                qFileInP.delete();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchA: delete Q from folderP").call();
+
+                // === Branch B: delete from Q, rename at P ===
+                git.checkout().setName("master").call();
+                git.branchCreate().setName("branchB").call();
+                git.checkout().setName("branchB").call();
+                qFileInQ.delete();
+                // Modify Q at folderP (rename Q → Q-renamed)
+                String originalContent = Files.readString(qFileInP.toPath());
+                Files.writeString(qFileInP.toPath(),
+                        originalContent.replace("name=\"Q\"", "name=\"Q-renamed\""));
+                git.add().addFilepattern(".").call();
+                git.add().addFilepattern(".").setUpdate(true).call();
+                git.commit().setMessage("branchB: delete Q from folderQ, rename at folderP").call();
+
+                // === Merge branchA into branchB ===
+                MergeResult mergeResult = git.merge()
+                        .include(gitRepo.resolve("branchA"))
+                        .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                        .call();
+
+                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                        "Should conflict (A deleted Q at folderP, B modified Q at folderP)");
+
+                // Q at folderQ should NOT exist on disk (git auto-resolved B's delete)
+                assertFalse(qFileInQ.exists(),
+                        "Q at folderQ should NOT exist (git auto-resolved B's delete)");
+
+                // Load models from commits (not working tree) because the DirCache
+                // skips conflicted entries — the element only exists at conflicted paths.
+                // In production, locateModel() returns the pre-merge in-memory model.
+                ObjectId branchBId = gitRepo.resolve("branchB");
+                ObjectId branchAId = gitRepo.resolve("branchA");
+                IArchimateModel ourModel;
+                IArchimateModel theirModel;
+                try(RevWalk rw = new RevWalk(gitRepo)) {
+                    RevCommit branchBCommit = rw.parseCommit(branchBId);
+                    ourModel = new GraficoModelImporter(gitRepo, branchBCommit.getTree())
+                            .importFromCommit(null);
+                    RevCommit branchACommit = rw.parseCommit(branchAId);
+                    theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                            .importFromCommit(null);
+                }
+                assertNotNull(ourModel, "Should import our model");
+                assertNotNull(theirModel, "Should import their model");
+
+                IArchiRepository repo = new ArchiRepository(repoFolder);
+                MergeConflictHandler handler = new MergeConflictHandler(
+                        mergeResult, "branchA", repo, null);
+                handler.init(null, ourModel, theirModel);
+
+                // Should detect the conflict as a move
+                assertEquals(1, handler.getMergeObjectInfos().size(),
+                        "Should have exactly 1 conflict. Conflicts: " + mergeResult.getConflicts().keySet());
+                MergeObjectInfo conflictInfo = handler.getMergeObjectInfos().get(0);
+                assertTrue(conflictInfo.isResolvedAsMove(),
+                        "Conflict should be detected as move. Path: " + conflictInfo.getXMLPath()
+                        + ", ours=" + conflictInfo.getEObject(MergeObjectInfo.OURS)
+                        + ", theirs=" + conflictInfo.getEObject(MergeObjectInfo.THEIRS));
+
+                // User chooses THEIRS (mover = branchA)
+                for(MergeObjectInfo info : handler.getMergeObjectInfos()) {
+                    if(!info.isFolderXml()) {
+                        info.setUserChoice(MergeObjectInfo.THEIRS);
+                    }
+                }
+                if(handler.hasMoveGroups()) {
+                    for(MergeConflictHandler.MoveGroup group : handler.getMoveGroups()) {
+                        group.locationChoice = MergeObjectInfo.THEIRS;
+                    }
+                }
+
+                // This should NOT throw IOException (was the bug: git add on non-existent path)
+                handler.merge();
+
+                // Q should be at folderQ with A's content
+                assertTrue(qFileInQ.exists(),
+                        "Q should be at folderQ (user chose A's move)");
+                String content = Files.readString(qFileInQ.toPath());
+                assertTrue(content.contains("name=\"Q\""),
+                        "Q should have A's original content 'Q', got: " + content);
+
+                // Q should NOT be at folderP
+                assertFalse(qFileInP.exists(),
+                        "Q should NOT remain at folderP (moved to folderQ)");
             }
         }
     }
