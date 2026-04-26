@@ -24,7 +24,6 @@ import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.MergeCommand;
 import org.eclipse.jgit.api.MergeResult;
-import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
@@ -41,8 +40,6 @@ import com.archimatetool.model.IFolder;
 
 @SuppressWarnings("nls")
 public class MergeConflictHandlerTests {
-
-    private static final String NS = "xmlns:archimate=\"http://www.archimatetool.com/archimate\"";
 
     @AfterEach
     public void runOnceAfterEachTest() throws IOException {
@@ -89,22 +86,15 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "moveRenameRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            // === Initial state (common ancestor) ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-
-            // Empty standard folders required by importer
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -114,23 +104,19 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                // Create new structure
-                File folderZ = new File(bizDir, "folderZ");
-                File folderY = new File(folderZ, "folderY");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(folderY, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                // Create new structure: folderZ/folderY (folderY keeps folderX's ID)
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File folderYDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(folderYDir, "FolderY", "id-folderX");
+                Files.copy(qFile.toPath(), new File(folderYDir, qFile.getName()).toPath());
 
                 // Remove old path
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                qFile.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
-                // Also stage deletions
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move folderX to folderZ/folderY").call();
 
@@ -139,8 +125,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "P");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to P").call();
@@ -157,11 +142,9 @@ public class MergeConflictHandlerTests {
                         + " conflicts: " + mergeResult.getConflicts());
 
                 // === Load models for the handler ===
-                // "Ours" = branchB's HEAD (current checkout) — import from disk
                 IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
                 assertNotNull(ourModel, "Should import our model");
 
-                // "Theirs" = branchA — import from commit tree
                 IArchimateModel theirModel;
                 ObjectId branchAId = gitRepo.resolve("branchA");
                 try(RevWalk rw = new RevWalk(gitRepo)) {
@@ -187,11 +170,9 @@ public class MergeConflictHandlerTests {
                 assertNotNull(moveGroup.oursFolderPath, "Should have ours path");
 
                 // === Set user choice: keep new location (branch A's structure) ===
-                // Location choice is on the group itself
                 moveGroup.locationChoice = MergeObjectInfo.THEIRS;
                 
                 // Element content choice: user wants branch B's rename (P) = OURS
-                // (OURS = HEAD = branchB which renamed Q to P)
                 for(MergeObjectInfo info : moveGroup.relatedInfos) {
                     if(!info.isFolderXml()) {
                         info.setUserChoice(MergeObjectInfo.OURS);
@@ -202,7 +183,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify end result ===
-                File resultFolderY = new File(bizDir, "folderZ/folderY");
+                File resultFolderY = new File(bizDir, "id-folderZ/id-folderX");
 
                 // 1. The new folder structure should exist with the moved folder's ID
                 File newFolderXml = new File(resultFolderY, "folder.xml");
@@ -212,7 +193,7 @@ public class MergeConflictHandlerTests {
                 assertTrue(newFolderContent.contains("id-folderX"),
                         "Should keep the original folder ID");
 
-                // 2. Element P should exist at the new location (moved from unchosen + renamed by B)
+                // 2. Element P should exist at the new location
                 File elementFile = new File(resultFolderY, "BusinessActor_id-q.xml");
                 assertTrue(elementFile.exists(),
                         "Element should exist at new location (folderZ/folderY/)");
@@ -221,14 +202,14 @@ public class MergeConflictHandlerTests {
                         "Element should have the renamed name 'P' from branch B, got: " + elementContent);
 
                 // 3. Old folderX should be cleaned up
-                assertFalse(new File(folderX, "folder.xml").exists(),
+                assertFalse(new File(folderXDir, "folder.xml").exists(),
                         "Old folderX/folder.xml should be removed");
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-q.xml").exists(),
                         "Old element should be removed from folderX");
 
                 // 4. No duplicate folder IDs on disk
-                if(folderX.exists()) {
-                    File[] remainingFiles = folderX.listFiles();
+                if(folderXDir.exists()) {
+                    File[] remainingFiles = folderXDir.listFiles();
                     assertTrue(remainingFiles == null || remainingFiles.length == 0,
                             "Old folderX should be empty or deleted");
                 }
@@ -275,27 +256,17 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "a4MultiMoveRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
-
-            // === Initial state ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-
-            for(int i = 1; i <= 5; i++) {
-                Files.writeString(new File(folderX, "BusinessActor_id-e" + i + ".xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E" + i + "\" id=\"id-e" + i + "\"/>\n");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement[] elements = new IArchimateElement[5];
+            for(int i = 0; i < 5; i++) {
+                elements[i] = helper.addBusinessActor(folderX, "E" + (i + 1), "id-e" + (i + 1));
             }
+            helper.export(repoFolder);
 
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -307,9 +278,8 @@ public class MergeConflictHandlerTests {
 
                 for(int i = 1; i <= 5; i++) {
                     String filename = "BusinessActor_id-e" + i + ".xml";
-                    Files.writeString(new File(folderY, filename).toPath(),
-                            "<archimate:BusinessActor " + NS + " name=\"E" + i + "\" id=\"id-e" + i + "\"/>\n");
-                    new File(folderX, filename).delete();
+                    Files.copy(new File(folderXDir, filename).toPath(), new File(folderYDir, filename).toPath());
+                    new File(folderXDir, filename).delete();
                 }
 
                 git.add().addFilepattern(".").call();
@@ -321,10 +291,8 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-e1.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E1-B\" id=\"id-e1\"/>\n");
-                Files.writeString(new File(folderX, "BusinessActor_id-e2.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E2-B\" id=\"id-e2\"/>\n");
+                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e1.xml"), "E1", "E1-B");
+                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e2.xml"), "E2", "E2-B");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename E1 and E2").call();
@@ -380,7 +348,7 @@ public class MergeConflictHandlerTests {
                 // === Verify: ALL elements should be at folderY ===
 
                 // E1: at folderY with B's content (OURS chosen)
-                File e1AtNew = new File(folderY, "BusinessActor_id-e1.xml");
+                File e1AtNew = new File(folderYDir, "BusinessActor_id-e1.xml");
                 assertTrue(e1AtNew.exists(),
                         "E1 should be at folderY — OURS content choice should still "
                         + "move the element to where theirs placed it");
@@ -389,25 +357,25 @@ public class MergeConflictHandlerTests {
                         "E1 should have B's renamed content at folderY, got: " + e1Content);
 
                 // E1 should NOT remain at old location
-                assertFalse(new File(folderX, "BusinessActor_id-e1.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-e1.xml").exists(),
                         "E1 should NOT remain at folderX after moved-element cleanup");
 
                 // E2: at folderY with A's content (THEIRS chosen)
-                File e2AtNew = new File(folderY, "BusinessActor_id-e2.xml");
+                File e2AtNew = new File(folderYDir, "BusinessActor_id-e2.xml");
                 assertTrue(e2AtNew.exists(), "E2 should be at folderY");
                 String e2Content = Files.readString(e2AtNew.toPath());
                 assertTrue(e2Content.contains("name=\"E2\""),
                         "E2 should have A's original content, got: " + e2Content);
 
                 // E2 should NOT remain at old location
-                assertFalse(new File(folderX, "BusinessActor_id-e2.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-e2.xml").exists(),
                         "E2 should NOT remain at folderX");
 
                 // E3-E5: at folderY (auto-merged from A, no conflict)
                 for(int i = 3; i <= 5; i++) {
-                    assertTrue(new File(folderY, "BusinessActor_id-e" + i + ".xml").exists(),
+                    assertTrue(new File(folderYDir, "BusinessActor_id-e" + i + ".xml").exists(),
                             "E" + i + " should be at folderY (auto-merged)");
-                    assertFalse(new File(folderX, "BusinessActor_id-e" + i + ".xml").exists(),
+                    assertFalse(new File(folderXDir, "BusinessActor_id-e" + i + ".xml").exists(),
                             "E" + i + " should NOT be at folderX");
                 }
             }
@@ -445,24 +413,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b2MoveGroupRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-
-            // === Initial state ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-
-            for(int i = 1; i <= 5; i++) {
-                Files.writeString(new File(folderX, "BusinessActor_id-e" + i + ".xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E" + i + "\" id=\"id-e" + i + "\"/>\n");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement[] elements = new IArchimateElement[5];
+            for(int i = 0; i < 5; i++) {
+                elements[i] = helper.addBusinessActor(folderX, "E" + (i + 1), "id-e" + (i + 1));
             }
+            helper.export(repoFolder);
 
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -472,21 +432,18 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedFolderX = new File(folderZ, "folderX");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedFolderX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File movedFolderXDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(movedFolderXDir, "FolderX", "id-folderX");
 
                 for(int i = 1; i <= 5; i++) {
                     String filename = "BusinessActor_id-e" + i + ".xml";
-                    Files.writeString(new File(movedFolderX, filename).toPath(),
-                            "<archimate:BusinessActor " + NS + " name=\"E" + i + "\" id=\"id-e" + i + "\"/>\n");
-                    new File(folderX, filename).delete();
+                    Files.copy(new File(folderXDir, filename).toPath(), new File(movedFolderXDir, filename).toPath());
+                    new File(folderXDir, filename).delete();
                 }
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -497,10 +454,8 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-e1.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E1-B\" id=\"id-e1\"/>\n");
-                Files.writeString(new File(folderX, "BusinessActor_id-e2.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"E2-B\" id=\"id-e2\"/>\n");
+                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e1.xml"), "E1", "E1-B");
+                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e2.xml"), "E2", "E2-B");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename E1 and E2").call();
@@ -559,7 +514,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify: ALL elements at folderZ/folderX ===
-                File resultDir = new File(bizDir, "folderZ/folderX");
+                File resultDir = new File(bizDir, "id-folderZ/id-folderX");
 
                 // E1: B's content at new location
                 File e1 = new File(resultDir, "BusinessActor_id-e1.xml");
@@ -582,9 +537,9 @@ public class MergeConflictHandlerTests {
                 }
 
                 // Old folderX should be cleaned up
-                assertFalse(new File(folderX, "BusinessActor_id-e1.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-e1.xml").exists(),
                         "E1 should NOT be at old location");
-                assertFalse(new File(folderX, "BusinessActor_id-e2.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-e2.xml").exists(),
                         "E2 should NOT be at old location");
             }
         }
@@ -623,27 +578,18 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "elementMoveRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
             // folderY is a SUBFOLDER of folderX — this is the real-world layout
             // when an element moves from "Application" to "Application / Shared Services".
             // The old bug excluded the entire folderX tree, missing the duplicate.
-            File folderY = new File(folderX, "folderY");
+            IFolder folderY = helper.addFolder(folderX, "FolderY", "id-folderY");
+            helper.export(repoFolder);
 
-            // === Initial state (common ancestor) ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -653,9 +599,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                GraficoTestHelper.moveElementFile(folderXDir, folderYDir, q);
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -666,8 +610,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "P");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to P").call();
@@ -730,7 +673,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify: element at old location (folderX) with branch B content ===
-                File elementAtOld = new File(folderX, "BusinessActor_id-q.xml");
+                File elementAtOld = new File(folderXDir, "BusinessActor_id-q.xml");
                 assertTrue(elementAtOld.exists(),
                         "Element should exist at old location (folderX) since user chose Mine");
                 String oldContent = Files.readString(elementAtOld.toPath());
@@ -738,7 +681,7 @@ public class MergeConflictHandlerTests {
                         "Element at old location should have branch B name 'P', got: " + oldContent);
 
                 // === Auto-merged copy at new location should be cleaned up ===
-                File elementAtNew = new File(folderY, "BusinessActor_id-q.xml");
+                File elementAtNew = new File(folderYDir, "BusinessActor_id-q.xml");
                 assertFalse(elementAtNew.exists(),
                         "Auto-merged copy at new location (folderY) should be removed "
                         + "when user chose Mine — otherwise model import loads wrong version");
@@ -762,24 +705,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "elementMoveContentRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            // === Initial state (common ancestor) ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -789,9 +724,8 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                Files.copy(qFile.toPath(), new File(folderYDir, qFile.getName()).toPath());
+                qFile.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -802,8 +736,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "P");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to P").call();
@@ -859,7 +792,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify: element should be at folderY with branch B content ===
-                File elementAtNew = new File(folderY, "BusinessActor_id-q.xml");
+                File elementAtNew = new File(folderYDir, qFile.getName());
                 assertTrue(elementAtNew.exists(),
                         "Element should exist at new location (folderY) since move accepted");
                 String newContent = Files.readString(elementAtNew.toPath());
@@ -868,7 +801,7 @@ public class MergeConflictHandlerTests {
                         + newContent);
 
                 // Old location should be cleaned up
-                File elementAtOld = new File(folderX, "BusinessActor_id-q.xml");
+                File elementAtOld = new File(folderXDir, qFile.getName());
                 assertFalse(elementAtOld.exists(),
                         "Element at old location (folderX) should be removed after move accepted");
             }
@@ -887,25 +820,17 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "elementMoveTheirsRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
             // folderY is a SUBFOLDER of folderX to match real-world layout
-            File folderY = new File(folderX, "folderY");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(folderX, "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            // === Initial state (common ancestor) ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -915,9 +840,8 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                Files.copy(qFile.toPath(), new File(folderYDir, qFile.getName()).toPath());
+                qFile.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -928,8 +852,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "P");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to P").call();
@@ -991,7 +914,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify: element at new location (folderY) with theirs' content ===
-                File elementAtNew = new File(folderY, "BusinessActor_id-q.xml");
+                File elementAtNew = new File(folderYDir, qFile.getName());
                 assertTrue(elementAtNew.exists(),
                         "Element should exist at new location (folderY) since user chose Theirs");
                 String newContent = Files.readString(elementAtNew.toPath());
@@ -999,7 +922,7 @@ public class MergeConflictHandlerTests {
                         "Element at new location should have theirs' name 'Q', got: " + newContent);
 
                 // === Old file at conflict path should be removed ===
-                File elementAtOld = new File(folderX, "BusinessActor_id-q.xml");
+                File elementAtOld = new File(folderXDir, qFile.getName());
                 assertFalse(elementAtOld.exists(),
                         "File at old location (folderX) should be removed "
                         + "when user chose Theirs — element is at new location");
@@ -1022,21 +945,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "a5NewElemRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1045,9 +963,8 @@ public class MergeConflictHandlerTests {
                 // Branch A: move Q to folderY
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                Files.copy(qFile.toPath(), new File(folderYDir, qFile.getName()).toPath());
+                qFile.delete();
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move Q to folderY").call();
@@ -1056,8 +973,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
+                GraficoTestHelper.writeBusinessRole(folderXDir, "R", "id-r");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: add R at folderX").call();
 
@@ -1091,13 +1007,13 @@ public class MergeConflictHandlerTests {
                 }
 
                 // Q at folderY
-                assertTrue(new File(folderY, "BusinessActor_id-q.xml").exists(),
+                assertTrue(new File(folderYDir, qFile.getName()).exists(),
                         "Q should be at folderY (moved by A)");
                 // Q NOT at folderX
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(new File(folderXDir, qFile.getName()).exists(),
                         "Q should NOT be at folderX (moved away by A)");
                 // R at folderX (new element stays where B added it)
-                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertTrue(new File(folderXDir, "BusinessRole_id-r.xml").exists(),
                         "R should stay at folderX (added by B, not a move)");
             }
         }
@@ -1119,24 +1035,19 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "a6DualMoveRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
-            File folderZ = new File(bizDir, "folderZ");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IFolder folderZ = helper.addFolder(helper.businessFolder(), "FolderZ", "id-folderZ");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            mkdirAndWrite(folderZ, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File folderZDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderZ);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1145,9 +1056,8 @@ public class MergeConflictHandlerTests {
                 // Branch A: move Q to folderY
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                Files.copy(qFile.toPath(), new File(folderYDir, qFile.getName()).toPath());
+                qFile.delete();
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move Q to folderY").call();
@@ -1156,9 +1066,8 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderZ, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                Files.copy(qFile.toPath(), new File(folderZDir, qFile.getName()).toPath());
+                qFile.delete();
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: move Q to folderZ").call();
@@ -1175,9 +1084,9 @@ public class MergeConflictHandlerTests {
                 // The handler/repair should detect this and let user choose.
 
                 // Verify: Q should end up at exactly ONE location (not duplicated)
-                boolean atY = new File(folderY, "BusinessActor_id-q.xml").exists();
-                boolean atZ = new File(folderZ, "BusinessActor_id-q.xml").exists();
-                boolean atX = new File(folderX, "BusinessActor_id-q.xml").exists();
+                boolean atY = new File(folderYDir, "BusinessActor_id-q.xml").exists();
+                boolean atZ = new File(folderZDir, "BusinessActor_id-q.xml").exists();
+                boolean atX = new File(folderXDir, "BusinessActor_id-q.xml").exists();
 
                 assertFalse(atX, "Q should NOT be at folderX (both branches deleted it)");
 
@@ -1211,20 +1120,17 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b4DeleteRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
+            File rFile = GraficoTestHelper.elementFile(folderXDir, r);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1234,20 +1140,16 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedFolderX = new File(folderZ, "folderX");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedFolderX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(movedFolderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                Files.writeString(new File(movedFolderX, "BusinessRole_id-r.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File movedFolderXDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(movedFolderXDir, "FolderX", "id-folderX");
+                Files.copy(qFile.toPath(), new File(movedFolderXDir, qFile.getName()).toPath());
+                Files.copy(rFile.toPath(), new File(movedFolderXDir, rFile.getName()).toPath());
+                qFile.delete();
+                rFile.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -1257,7 +1159,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
+                rFile.delete();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: delete R").call();
 
@@ -1271,7 +1173,7 @@ public class MergeConflictHandlerTests {
                         .setFastForward(MergeCommand.FastForwardMode.NO_FF)
                         .call();
 
-                File resultDir = new File(bizDir, "folderZ/folderX");
+                File resultDir = new File(bizDir, "id-folderZ/id-folderX");
 
                 if(mergeResult.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
                     IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
@@ -1306,7 +1208,7 @@ public class MergeConflictHandlerTests {
                         "R should NOT be at folderZ/folderX (B deleted it)");
 
                 // R should NOT be at old location either
-                assertFalse(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessRole_id-r.xml").exists(),
                         "R should NOT be at folderX either");
             }
         }
@@ -1336,25 +1238,19 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b2bAutoResolvedRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File appDir = new File(modelDir, "application");
-            File sharedDir = new File(appDir, "sharedServices");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder shared = helper.addFolder(helper.applicationFolder(), "Shared Services", "id-shared");
+            IArchimateElement nwcf = helper.addApplicationComponent(shared, "Network Capacity Forecast", "id-nwcf");
+            IArchimateElement ndcf = helper.addApplicationComponent(shared, "Node Capacity Forecast", "id-ndcf");
+            IArchimateElement other = helper.addApplicationComponent(shared, "Other Component", "id-other");
+            helper.export(repoFolder);
 
-            // === Initial state ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(appDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Application\" id=\"id-app\" type=\"application\"/>\n");
-            mkdirAndWrite(sharedDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Shared Services\" id=\"id-shared\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-nwcf.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Network Capacity Forecast\" id=\"id-nwcf\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-ndcf.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Node Capacity Forecast\" id=\"id-ndcf\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-other.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Other Component\" id=\"id-other\"/>\n");
-
-            writeStandardFolders(modelDir);
+            File appDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.APPLICATION);
+            File sharedDir = GraficoTestHelper.folderDir(repoFolder, FolderType.APPLICATION, shared);
+            File nwcfFile = GraficoTestHelper.elementFile(sharedDir, nwcf);
+            File ndcfFile = GraficoTestHelper.elementFile(sharedDir, ndcf);
+            File otherFile = GraficoTestHelper.elementFile(sharedDir, other);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1365,22 +1261,18 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("branchA").call();
 
                 // Create new parent + move folder there (same folder ID)
-                File masterDir = new File(appDir, "masterElements");
-                File movedShared = new File(masterDir, "sharedServices");
-                mkdirAndWrite(masterDir, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"Master Elements\" id=\"id-master\"/>\n");
-                mkdirAndWrite(movedShared, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+                File masterDir = new File(appDir, "id-master");
+                File movedSharedDir = new File(masterDir, "id-shared");
+                GraficoTestHelper.writeFolderXml(masterDir, "Master Elements", "id-master");
+                GraficoTestHelper.writeFolderXml(movedSharedDir, "Shared Services", "id-shared");
 
                 // Copy all elements to new location (unchanged by A)
-                for(String filename : new String[]{
-                        "ApplicationComponent_id-nwcf.xml",
-                        "ApplicationComponent_id-ndcf.xml",
-                        "ApplicationComponent_id-other.xml"}) {
-                    Files.writeString(new File(movedShared, filename).toPath(),
-                            Files.readString(new File(sharedDir, filename).toPath()));
-                    new File(sharedDir, filename).delete();
-                }
+                Files.copy(nwcfFile.toPath(), new File(movedSharedDir, nwcfFile.getName()).toPath());
+                Files.copy(ndcfFile.toPath(), new File(movedSharedDir, ndcfFile.getName()).toPath());
+                Files.copy(otherFile.toPath(), new File(movedSharedDir, otherFile.getName()).toPath());
+                nwcfFile.delete();
+                ndcfFile.delete();
+                otherFile.delete();
                 new File(sharedDir, "folder.xml").delete();
                 sharedDir.delete();
 
@@ -1394,14 +1286,10 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("branchB").call();
 
                 // Modify NWCF and NDCF (but NOT folder.xml — this is the key!)
-                Files.writeString(new File(sharedDir, "ApplicationComponent_id-nwcf.xml").toPath(),
-                        "<archimate:ApplicationComponent " + NS
-                        + " name=\"Network Capacity Forecast v2\" id=\"id-nwcf\""
-                        + " documentation=\"Updated by B\"/>\n");
-                Files.writeString(new File(sharedDir, "ApplicationComponent_id-ndcf.xml").toPath(),
-                        "<archimate:ApplicationComponent " + NS
-                        + " name=\"Node Capacity Forecast v2\" id=\"id-ndcf\""
-                        + " documentation=\"Updated by B\"/>\n");
+                GraficoTestHelper.renameElement(nwcfFile, "Network Capacity Forecast", "Network Capacity Forecast v2");
+                GraficoTestHelper.setDocumentation(nwcfFile, "Updated by B");
+                GraficoTestHelper.renameElement(ndcfFile, "Node Capacity Forecast", "Node Capacity Forecast v2");
+                GraficoTestHelper.setDocumentation(ndcfFile, "Updated by B");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: modify NWCF and NDCF").call();
@@ -1463,29 +1351,29 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify results ===
-                File resultDir = new File(appDir, "masterElements/sharedServices");
+                File resultDir = new File(appDir, "id-master/id-shared");
 
                 // NWCF: B's modified content at new location
-                File nwcfFile = new File(resultDir, "ApplicationComponent_id-nwcf.xml");
-                assertTrue(nwcfFile.exists(),
+                File nwcfResult = new File(resultDir, "ApplicationComponent_id-nwcf.xml");
+                assertTrue(nwcfResult.exists(),
                         "NWCF should be at new location (masterElements/sharedServices)");
-                String nwcfContent = Files.readString(nwcfFile.toPath());
+                String nwcfContent = Files.readString(nwcfResult.toPath());
                 assertTrue(nwcfContent.contains("name=\"Network Capacity Forecast v2\""),
                         "NWCF should have B's modified name, got: " + nwcfContent);
                 assertTrue(nwcfContent.contains("documentation=\"Updated by B\""),
                         "NWCF should have B's documentation, got: " + nwcfContent);
 
                 // NDCF: B's modified content at new location
-                File ndcfFile = new File(resultDir, "ApplicationComponent_id-ndcf.xml");
-                assertTrue(ndcfFile.exists(),
+                File ndcfResult = new File(resultDir, "ApplicationComponent_id-ndcf.xml");
+                assertTrue(ndcfResult.exists(),
                         "NDCF should be at new location (masterElements/sharedServices)");
-                String ndcfContent = Files.readString(ndcfFile.toPath());
+                String ndcfContent = Files.readString(ndcfResult.toPath());
                 assertTrue(ndcfContent.contains("name=\"Node Capacity Forecast v2\""),
                         "NDCF should have B's modified name, got: " + ndcfContent);
 
                 // Other: auto-merged at new location (untouched by B)
-                File otherFile = new File(resultDir, "ApplicationComponent_id-other.xml");
-                assertTrue(otherFile.exists(),
+                File otherResult = new File(resultDir, "ApplicationComponent_id-other.xml");
+                assertTrue(otherResult.exists(),
                         "Other should be at new location");
 
                 // Old location should be cleaned up
@@ -1529,25 +1417,19 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b2cReversedRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File appDir = new File(modelDir, "application");
-            File sharedDir = new File(appDir, "sharedServices");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder shared = helper.addFolder(helper.applicationFolder(), "Shared Services", "id-shared");
+            IArchimateElement nwcf = helper.addApplicationComponent(shared, "Network Capacity Forecast", "id-nwcf");
+            IArchimateElement ndcf = helper.addApplicationComponent(shared, "Node Capacity Forecast", "id-ndcf");
+            IArchimateElement other = helper.addApplicationComponent(shared, "Other Component", "id-other");
+            helper.export(repoFolder);
 
-            // === Initial state ===
-            writeGraficoModel(modelDir);
-
-            mkdirAndWrite(appDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Application\" id=\"id-app\" type=\"application\"/>\n");
-            mkdirAndWrite(sharedDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Shared Services\" id=\"id-shared\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-nwcf.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Network Capacity Forecast\" id=\"id-nwcf\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-ndcf.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Node Capacity Forecast\" id=\"id-ndcf\"/>\n");
-            Files.writeString(new File(sharedDir, "ApplicationComponent_id-other.xml").toPath(),
-                    "<archimate:ApplicationComponent " + NS + " name=\"Other Component\" id=\"id-other\"/>\n");
-
-            writeStandardFolders(modelDir);
+            File appDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.APPLICATION);
+            File sharedDir = GraficoTestHelper.folderDir(repoFolder, FolderType.APPLICATION, shared);
+            File nwcfFile = GraficoTestHelper.elementFile(sharedDir, nwcf);
+            File ndcfFile = GraficoTestHelper.elementFile(sharedDir, ndcf);
+            File otherFile = GraficoTestHelper.elementFile(sharedDir, other);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1557,22 +1439,18 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File masterDir = new File(appDir, "masterElements");
-                File movedShared = new File(masterDir, "sharedServices");
-                mkdirAndWrite(masterDir, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"Master Elements\" id=\"id-master\"/>\n");
-                mkdirAndWrite(movedShared, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"Shared Services\" id=\"id-shared\"/>\n");
+                File masterDir = new File(appDir, "id-master");
+                File movedSharedDir = new File(masterDir, "id-shared");
+                GraficoTestHelper.writeFolderXml(masterDir, "Master Elements", "id-master");
+                GraficoTestHelper.writeFolderXml(movedSharedDir, "Shared Services", "id-shared");
 
                 // Copy all elements to new location (unchanged by A)
-                for(String filename : new String[]{
-                        "ApplicationComponent_id-nwcf.xml",
-                        "ApplicationComponent_id-ndcf.xml",
-                        "ApplicationComponent_id-other.xml"}) {
-                    Files.writeString(new File(movedShared, filename).toPath(),
-                            Files.readString(new File(sharedDir, filename).toPath()));
-                    new File(sharedDir, filename).delete();
-                }
+                Files.copy(nwcfFile.toPath(), new File(movedSharedDir, nwcfFile.getName()).toPath());
+                Files.copy(ndcfFile.toPath(), new File(movedSharedDir, ndcfFile.getName()).toPath());
+                Files.copy(otherFile.toPath(), new File(movedSharedDir, otherFile.getName()).toPath());
+                nwcfFile.delete();
+                ndcfFile.delete();
+                otherFile.delete();
                 new File(sharedDir, "folder.xml").delete();
                 sharedDir.delete();
 
@@ -1585,14 +1463,10 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(sharedDir, "ApplicationComponent_id-nwcf.xml").toPath(),
-                        "<archimate:ApplicationComponent " + NS
-                        + " name=\"Network Capacity Forecast v2\" id=\"id-nwcf\""
-                        + " documentation=\"Updated by B\"/>\n");
-                Files.writeString(new File(sharedDir, "ApplicationComponent_id-ndcf.xml").toPath(),
-                        "<archimate:ApplicationComponent " + NS
-                        + " name=\"Node Capacity Forecast v2\" id=\"id-ndcf\""
-                        + " documentation=\"Updated by B\"/>\n");
+                GraficoTestHelper.renameElement(nwcfFile, "Network Capacity Forecast", "Network Capacity Forecast v2");
+                GraficoTestHelper.setDocumentation(nwcfFile, "Updated by B");
+                GraficoTestHelper.renameElement(ndcfFile, "Node Capacity Forecast", "Node Capacity Forecast v2");
+                GraficoTestHelper.setDocumentation(ndcfFile, "Updated by B");
 
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: modify NWCF and NDCF").call();
@@ -1656,29 +1530,29 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // === Verify results ===
-                File resultDir = new File(appDir, "masterElements/sharedServices");
+                File resultDir = new File(appDir, "id-master/id-shared");
 
                 // NWCF: B's modified content at new location
-                File nwcfFile = new File(resultDir, "ApplicationComponent_id-nwcf.xml");
-                assertTrue(nwcfFile.exists(),
+                File nwcfResult = new File(resultDir, "ApplicationComponent_id-nwcf.xml");
+                assertTrue(nwcfResult.exists(),
                         "NWCF should be at new location (masterElements/sharedServices)");
-                String nwcfContent = Files.readString(nwcfFile.toPath());
+                String nwcfContent = Files.readString(nwcfResult.toPath());
                 assertTrue(nwcfContent.contains("name=\"Network Capacity Forecast v2\""),
                         "NWCF should have B's modified name, got: " + nwcfContent);
                 assertTrue(nwcfContent.contains("documentation=\"Updated by B\""),
                         "NWCF should have B's documentation, got: " + nwcfContent);
 
                 // NDCF: B's modified content at new location
-                File ndcfFile = new File(resultDir, "ApplicationComponent_id-ndcf.xml");
-                assertTrue(ndcfFile.exists(),
+                File ndcfResult = new File(resultDir, "ApplicationComponent_id-ndcf.xml");
+                assertTrue(ndcfResult.exists(),
                         "NDCF should be at new location (masterElements/sharedServices)");
-                String ndcfContent = Files.readString(ndcfFile.toPath());
+                String ndcfContent = Files.readString(ndcfResult.toPath());
                 assertTrue(ndcfContent.contains("name=\"Node Capacity Forecast v2\""),
                         "NDCF should have B's modified name, got: " + ndcfContent);
 
                 // Other: at new location (untouched by B, moved by A)
-                File otherFile = new File(resultDir, "ApplicationComponent_id-other.xml");
-                assertTrue(otherFile.exists(),
+                File otherResult = new File(resultDir, "ApplicationComponent_id-other.xml");
+                assertTrue(otherResult.exists(),
                         "Other should be at new location");
 
                 // Old location should be cleaned up
@@ -1705,18 +1579,14 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e2DeleteModifyRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1725,7 +1595,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: delete element Q
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                qFile.delete();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: delete Q").call();
 
@@ -1733,8 +1603,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "P");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to P").call();
 
@@ -1767,7 +1636,6 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // Q should exist with B's content
-                File qFile = new File(folderX, "BusinessActor_id-q.xml");
                 assertTrue(qFile.exists(), "Q should exist (user chose to keep B's version)");
                 String content = Files.readString(qFile.toPath());
                 assertTrue(content.contains("name=\"P\""),
@@ -1793,18 +1661,15 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e9MoveAddRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1814,17 +1679,14 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedFolderX = new File(folderZ, "folderX");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedFolderX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(movedFolderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File movedFolderXDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(movedFolderXDir, "FolderX", "id-folderX");
+                Files.copy(qFile.toPath(), new File(movedFolderXDir, qFile.getName()).toPath());
+                qFile.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -1834,10 +1696,8 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-B\" id=\"id-q\"/>\n");
+                GraficoTestHelper.writeBusinessRole(folderXDir, "R", "id-r");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-B");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: add R and modify Q at folderX").call();
 
@@ -1847,7 +1707,7 @@ public class MergeConflictHandlerTests {
                         .setFastForward(MergeCommand.FastForwardMode.NO_FF)
                         .call();
 
-                File resultDir = new File(bizDir, "folderZ/folderX");
+                File resultDir = new File(bizDir, "id-folderZ/id-folderX");
 
                 if(mergeResult.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
                     IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
@@ -1887,9 +1747,9 @@ public class MergeConflictHandlerTests {
                         "R (new element) should follow folder move to folderZ/folderX");
 
                 // Old folderX should not have R or Q
-                assertFalse(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessRole_id-r.xml").exists(),
                         "R should NOT remain at old folderX");
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-q.xml").exists(),
                         "Q should NOT remain at old folderX");
             }
         }
@@ -1915,23 +1775,18 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "d1IntegrationRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement s = helper.addBusinessActor(folderY, "S", "id-s");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            Files.writeString(new File(folderY, "BusinessActor_id-s.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"S\" id=\"id-s\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -1941,22 +1796,18 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedFolderX = new File(folderZ, "folderX");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedFolderX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(movedFolderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File movedFolderXDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(movedFolderXDir, "FolderX", "id-folderX");
+                Files.copy(qFile.toPath(), new File(movedFolderXDir, qFile.getName()).toPath());
                 // Delete at old location
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                qFile.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 // Add T in folderY
-                Files.writeString(new File(folderY, "BusinessRole_id-t.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"T\" id=\"id-t\"/>\n");
+                GraficoTestHelper.writeBusinessRole(folderYDir, "T", "id-t");
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -1966,10 +1817,8 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-B\" id=\"id-q\"/>\n");
-                Files.writeString(new File(folderY, "BusinessRole_id-u.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"U\" id=\"id-u\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-B");
+                GraficoTestHelper.writeBusinessRole(folderYDir, "U", "id-u");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: modify Q, add U in folderY").call();
 
@@ -1979,7 +1828,7 @@ public class MergeConflictHandlerTests {
                         .setFastForward(MergeCommand.FastForwardMode.NO_FF)
                         .call();
 
-                File resultDir = new File(bizDir, "folderZ/folderX");
+                File resultDir = new File(bizDir, "id-folderZ/id-folderX");
 
                 // === Phase 1: Handle conflicts ===
                 if(mergeResult.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
@@ -2027,27 +1876,27 @@ public class MergeConflictHandlerTests {
                 // === Assertions: no data loss ===
 
                 // Q should be at new location with B's content
-                File qFile = new File(resultDir, "BusinessActor_id-q.xml");
-                assertTrue(qFile.exists(),
+                File qResult = new File(resultDir, "BusinessActor_id-q.xml");
+                assertTrue(qResult.exists(),
                         "Q should be at folderZ/folderX (moved by A)");
-                String qContent = Files.readString(qFile.toPath());
+                String qContent = Files.readString(qResult.toPath());
                 assertTrue(qContent.contains("name=\"Q-B\""),
                         "Q should have B's content 'Q-B', got: " + qContent);
 
                 // S should still be in folderY (untouched)
-                assertTrue(new File(folderY, "BusinessActor_id-s.xml").exists(),
+                assertTrue(new File(folderYDir, "BusinessActor_id-s.xml").exists(),
                         "S should remain in folderY (untouched)");
 
                 // T (added by A in folderY) should be present
-                assertTrue(new File(folderY, "BusinessRole_id-t.xml").exists(),
+                assertTrue(new File(folderYDir, "BusinessRole_id-t.xml").exists(),
                         "T should be in folderY (added by A)");
 
                 // U (added by B in folderY) should be present
-                assertTrue(new File(folderY, "BusinessRole_id-u.xml").exists(),
+                assertTrue(new File(folderYDir, "BusinessRole_id-u.xml").exists(),
                         "U should be in folderY (added by B)");
 
                 // Old folderX should be cleaned up
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(new File(folderXDir, "BusinessActor_id-q.xml").exists(),
                         "Q should NOT remain at old folderX");
             }
         }
@@ -2070,20 +1919,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e6FolderDeleteRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
+            File rFile = GraficoTestHelper.elementFile(folderXDir, r);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2092,10 +1937,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: delete entire folderX
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                GraficoTestHelper.deleteFolder(folderXDir);
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: delete entire folderX").call();
 
@@ -2103,8 +1945,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-modified");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to Q-modified").call();
 
@@ -2137,7 +1978,6 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // Q should exist with B's modified content
-                File qFile = new File(folderX, "BusinessActor_id-q.xml");
                 assertTrue(qFile.exists(), "Q should exist (user chose to keep B's version)");
                 String content = Files.readString(qFile.toPath());
                 assertTrue(content.contains("name=\"Q-modified\""),
@@ -2149,7 +1989,7 @@ public class MergeConflictHandlerTests {
                 GraficoModelLoader loader = new GraficoModelLoader(repo2, true);
                 loader.repairMissingFolderXml();
 
-                assertTrue(new File(folderX, "folder.xml").exists(),
+                assertTrue(new File(folderXDir, "folder.xml").exists(),
                         "folder.xml should be restored by Phase 2 repair");
             }
         }
@@ -2170,20 +2010,15 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e6FolderDeleteAcceptRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2192,10 +2027,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: delete entire folderX
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                GraficoTestHelper.deleteFolder(folderXDir);
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: delete entire folderX").call();
 
@@ -2203,8 +2035,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-modified");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to Q-modified").call();
 
@@ -2237,7 +2068,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // Q should NOT exist (user accepted deletion)
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(qFile.exists(),
                         "Q should NOT exist (user accepted A's deletion)");
             }
         }
@@ -2263,23 +2094,18 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "f1MoveDeleteRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
+            File rFile = GraficoTestHelper.elementFile(folderXDir, r);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2288,9 +2114,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: move Q from folderX to folderY
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                GraficoTestHelper.moveElementFile(folderXDir, folderYDir, q);
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move Q to folderY").call();
@@ -2299,7 +2123,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                qFile.delete();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: delete Q").call();
 
@@ -2319,13 +2143,13 @@ public class MergeConflictHandlerTests {
 
                 // Expected (after cross-path deletion detection is implemented):
                 // Q should NOT exist anywhere — B's deletion should be detected.
-                assertFalse(new File(folderY, "BusinessActor_id-q.xml").exists(),
+                assertFalse(GraficoTestHelper.elementFile(folderYDir, q).exists(),
                         "Q should NOT be at folderY (B deleted it, move should not resurrect)");
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(qFile.exists(),
                         "Q should NOT be at folderX (both branches removed it)");
 
                 // R should still be at folderX (untouched by both branches)
-                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertTrue(rFile.exists(),
                         "R should remain at folderX (untouched)");
             }
         }
@@ -2352,21 +2176,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "f2ModifyMoveRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2375,9 +2194,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: move Q from folderX to folderY
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                GraficoTestHelper.moveElementFile(folderXDir, folderYDir, q);
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move Q to folderY").call();
@@ -2386,8 +2203,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-modified");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to Q-modified").call();
 
@@ -2428,7 +2244,7 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // Q should be at folderY with B's modified content
-                File qAtY = new File(folderY, "BusinessActor_id-q.xml");
+                File qAtY = GraficoTestHelper.elementFile(folderYDir, q);
                 assertTrue(qAtY.exists(),
                         "Q should be at folderY (user accepted A's move)");
                 String content = Files.readString(qAtY.toPath());
@@ -2436,7 +2252,7 @@ public class MergeConflictHandlerTests {
                         "Q should have B's content 'Q-modified', got: " + content);
 
                 // Q should NOT be at folderX
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(qFile.exists(),
                         "Q should NOT remain at folderX (moved to folderY)");
             }
         }
@@ -2452,21 +2268,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "f2ModifyMoveOursRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File folderY = new File(bizDir, "folderY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderY = helper.addFolder(helper.businessFolder(), "FolderY", "id-folderY");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(folderY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderY\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File folderYDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderY);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2475,9 +2286,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: move Q from folderX to folderY
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderY, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                GraficoTestHelper.moveElementFile(folderXDir, folderYDir, q);
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: move Q to folderY").call();
@@ -2486,8 +2295,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q-modified\" id=\"id-q\"/>\n");
+                GraficoTestHelper.renameElement(qFile, "Q", "Q-modified");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: rename Q to Q-modified").call();
 
@@ -2527,15 +2335,14 @@ public class MergeConflictHandlerTests {
                 handler.merge();
 
                 // Q should be at folderX with B's modified content
-                File qAtX = new File(folderX, "BusinessActor_id-q.xml");
-                assertTrue(qAtX.exists(),
+                assertTrue(qFile.exists(),
                         "Q should remain at folderX (user rejected move)");
-                String content = Files.readString(qAtX.toPath());
+                String content = Files.readString(qFile.toPath());
                 assertTrue(content.contains("name=\"Q-modified\""),
                         "Q should have B's content 'Q-modified', got: " + content);
 
                 // Q should NOT be at folderY (move was rejected)
-                assertFalse(new File(folderY, "BusinessActor_id-q.xml").exists(),
+                assertFalse(GraficoTestHelper.elementFile(folderYDir, q).exists(),
                         "Q should NOT be at folderY (move rejected)");
             }
         }
@@ -2568,23 +2375,18 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "b5NestedMoveRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
-            File subY = new File(folderX, "subY");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderOuter = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IFolder folderInner = helper.addFolder(folderOuter, "SubY", "id-subY");
+            IArchimateElement q = helper.addBusinessActor(folderOuter, "Q", "id-q");
+            IArchimateElement deep = helper.addBusinessActor(folderInner, "Deep", "id-deep");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            mkdirAndWrite(subY, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"SubY\" id=\"id-subY\"/>\n");
-            Files.writeString(new File(subY, "BusinessActor_id-deep.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Deep\" id=\"id-deep\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderOuterDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderOuter);
+            File folderInnerDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderOuter, folderInner);
+            File deepFile = GraficoTestHelper.elementFile(folderInnerDir, deep);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2594,27 +2396,9 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedX = new File(folderZ, "folderX");
-                File movedSubY = new File(movedX, "subY");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(movedX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                mkdirAndWrite(movedSubY, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"SubY\" id=\"id-subY\"/>\n");
-                Files.writeString(new File(movedSubY, "BusinessActor_id-deep.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Deep\" id=\"id-deep\"/>\n");
-
-                // Remove old path
-                new File(subY, "BusinessActor_id-deep.xml").delete();
-                new File(subY, "folder.xml").delete();
-                subY.delete();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderZDir = new File(bizDir, "id-folderZ");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.moveFolderDir(folderOuterDir, new File(folderZDir, "id-folderX"));
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -2625,8 +2409,7 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                Files.writeString(new File(subY, "BusinessActor_id-deep.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Deep-Modified\" id=\"id-deep\"/>\n");
+                GraficoTestHelper.renameElement(deepFile, "Deep", "Deep-Modified");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: modify deep element").call();
 
@@ -2640,8 +2423,8 @@ public class MergeConflictHandlerTests {
                         .setFastForward(MergeCommand.FastForwardMode.NO_FF)
                         .call();
 
-                File resultX = new File(bizDir, "folderZ/folderX");
-                File resultSubY = new File(resultX, "subY");
+                File resultX = new File(bizDir, "id-folderZ/id-folderX");
+                File resultSubY = new File(resultX, "id-subY");
 
                 if(mergeResult.getMergeStatus() == MergeResult.MergeStatus.CONFLICTING) {
                     IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
@@ -2699,9 +2482,9 @@ public class MergeConflictHandlerTests {
                         "Deep element should have B's content 'Deep-Modified', got: " + deepContent);
 
                 // Old paths should be cleaned up
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(new File(folderOuterDir, "BusinessActor_id-q.xml").exists(),
                         "Q should NOT remain at old folderX");
-                assertFalse(new File(subY, "BusinessActor_id-deep.xml").exists(),
+                assertFalse(new File(folderInnerDir, "BusinessActor_id-deep.xml").exists(),
                         "Deep should NOT remain at old subY");
             }
         }
@@ -2722,20 +2505,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e3BothDeleteRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
+            File rFile = GraficoTestHelper.elementFile(folderXDir, r);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2744,7 +2523,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: delete Q
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                qFile.delete();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: delete Q").call();
 
@@ -2752,7 +2531,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
+                qFile.delete();
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: delete Q").call();
 
@@ -2767,15 +2546,15 @@ public class MergeConflictHandlerTests {
                         "Both-delete should merge cleanly, got: " + mergeResult.getMergeStatus());
 
                 // Q should be gone
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(qFile.exists(),
                         "Q should be deleted (both branches agreed)");
 
                 // R should still exist (untouched)
-                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertTrue(rFile.exists(),
                         "R should still exist (not touched by either branch)");
 
                 // folder.xml should still exist
-                assertTrue(new File(folderX, "folder.xml").exists(),
+                assertTrue(new File(folderXDir, "folder.xml").exists(),
                         "folder.xml should still exist");
             }
         }
@@ -2796,18 +2575,14 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e4BothAddRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2816,8 +2591,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: add element R
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
+                GraficoTestHelper.writeBusinessRole(folderXDir, "R", "id-r");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchA: add R").call();
 
@@ -2825,8 +2599,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(folderX, "BusinessProcess_id-s.xml").toPath(),
-                        "<archimate:BusinessProcess " + NS + " name=\"S\" id=\"id-s\"/>\n");
+                GraficoTestHelper.writeBusinessActor(folderXDir, "S", "id-s");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: add S").call();
 
@@ -2841,11 +2614,11 @@ public class MergeConflictHandlerTests {
                         "Adding different elements should merge cleanly, got: " + mergeResult.getMergeStatus());
 
                 // All three elements should exist
-                assertTrue(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertTrue(qFile.exists(),
                         "Q should still exist");
-                assertTrue(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertTrue(new File(folderXDir, "BusinessRole_id-r.xml").exists(),
                         "R should exist (added by A)");
-                assertTrue(new File(folderX, "BusinessProcess_id-s.xml").exists(),
+                assertTrue(new File(folderXDir, "BusinessActor_id-s.xml").exists(),
                         "S should exist (added by B)");
             }
         }
@@ -2867,20 +2640,16 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e8BothDeleteFolderRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            // === Build and export initial model ===
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            IArchimateElement r = helper.addBusinessRole(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-r.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
+            File rFile = GraficoTestHelper.elementFile(folderXDir, r);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2889,10 +2658,7 @@ public class MergeConflictHandlerTests {
                 // Branch A: delete entire folderX
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                GraficoTestHelper.deleteFolder(folderXDir);
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchA: delete folderX entirely").call();
 
@@ -2900,10 +2666,7 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "BusinessRole_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                GraficoTestHelper.deleteFolder(folderXDir);
                 git.add().addFilepattern(".").setUpdate(true).call();
                 git.commit().setMessage("branchB: delete folderX entirely").call();
 
@@ -2918,13 +2681,13 @@ public class MergeConflictHandlerTests {
                         "Both-delete-folder should merge cleanly, got: " + mergeResult.getMergeStatus());
 
                 // Folder should be completely gone
-                assertFalse(folderX.exists(),
+                assertFalse(folderXDir.exists(),
                         "folderX directory should not exist");
-                assertFalse(new File(folderX, "folder.xml").exists(),
+                assertFalse(new File(folderXDir, "folder.xml").exists(),
                         "folder.xml should not exist");
-                assertFalse(new File(folderX, "BusinessActor_id-q.xml").exists(),
+                assertFalse(qFile.exists(),
                         "Q should not exist");
-                assertFalse(new File(folderX, "BusinessRole_id-r.xml").exists(),
+                assertFalse(rFile.exists(),
                         "R should not exist");
             }
         }
@@ -2948,18 +2711,14 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "e10SubfolderRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            IArchimateElement q = helper.addBusinessActor(folderX, "Q", "id-q");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-q.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+            File qFile = GraficoTestHelper.elementFile(folderXDir, q);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -2969,17 +2728,14 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderZ = new File(bizDir, "folderZ");
-                File movedX = new File(folderZ, "folderX");
-                mkdirAndWrite(folderZ, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderZ\" id=\"id-folderZ\"/>\n");
-                mkdirAndWrite(movedX, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(movedX, "BusinessActor_id-q.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                new File(folderX, "BusinessActor_id-q.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderZDir = new File(bizDir, "id-folderZ");
+                File movedXDir = new File(folderZDir, "id-folderX");
+                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                GraficoTestHelper.writeFolderXml(movedXDir, "FolderX", "id-folderX");
+                Files.copy(qFile.toPath(), new File(movedXDir, qFile.getName()).toPath());
+                qFile.delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -2990,11 +2746,9 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
 
-                File subNew = new File(folderX, "subNew");
-                mkdirAndWrite(subNew, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"SubNew\" id=\"id-subNew\"/>\n");
-                Files.writeString(new File(subNew, "BusinessRole_id-s.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"S\" id=\"id-s\"/>\n");
+                File subNew = new File(folderXDir, "id-subNew");
+                GraficoTestHelper.writeFolderXml(subNew, "SubNew", "id-subNew");
+                GraficoTestHelper.writeBusinessRole(subNew, "S", "id-s");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: add subNew under folderX").call();
 
@@ -3048,7 +2802,7 @@ public class MergeConflictHandlerTests {
 
                 // === Verify ===
 
-                File resultX = new File(bizDir, "folderZ/folderX");
+                File resultX = new File(bizDir, "id-folderZ/id-folderX");
 
                 // Q should be at new location
                 assertTrue(new File(resultX, "BusinessActor_id-q.xml").exists(),
@@ -3057,22 +2811,17 @@ public class MergeConflictHandlerTests {
                 // Subfolder's element S should end up accessible.
                 // It may be at the new location following the parent move,
                 // or it may stay at old location with a repaired folder.xml.
-                File sAtNewSub = new File(resultX, "subNew/BusinessRole_id-s.xml");
-                File sAtOldSub = new File(folderX, "subNew/BusinessRole_id-s.xml");
+                File sAtNewSub = new File(resultX, "id-subNew/BusinessRole_id-s.xml");
+                File sAtOldSub = new File(folderXDir, "id-subNew/BusinessRole_id-s.xml");
                 assertTrue(sAtNewSub.exists() || sAtOldSub.exists(),
                         "S should exist (either moved with parent or repaired at old location). "
                         + "New: " + sAtNewSub.exists() + ", Old: " + sAtOldSub.exists());
 
                 // If S is at old location, it should have a folder.xml (repaired)
                 if(sAtOldSub.exists()) {
-                    File subFolderXml = new File(folderX, "subNew/folder.xml");
+                    File subFolderXml = new File(folderXDir, "id-subNew/folder.xml");
                     assertTrue(subFolderXml.exists(),
                             "If subNew stays at old location, it should have folder.xml (repaired)");
-                    // And old folderX should have folder.xml too
-                    if(folderX.exists() && folderX.listFiles() != null && folderX.listFiles().length > 0) {
-                        // Old folderX has content — repair should have restored folder.xml
-                        // (or created [MERGE FIX])
-                    }
                 }
             }
         }
@@ -3103,22 +2852,15 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "g1ReorgRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            helper.addBusinessActor(folderX, "P", "id-p");
+            helper.addBusinessRole(folderX, "Q", "id-q");
+            helper.addBusinessProcess(folderX, "R", "id-r");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-p.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
-            Files.writeString(new File(folderX, "BusinessRole_id-q.xml").toPath(),
-                    "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-            Files.writeString(new File(folderX, "BusinessProcess_id-r.xml").toPath(),
-                    "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -3128,20 +2870,16 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderY = new File(bizDir, "folderY");
-                mkdirAndWrite(folderY, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(folderY, "BusinessActor_id-p.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
-                Files.writeString(new File(folderY, "BusinessRole_id-q.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                Files.writeString(new File(folderY, "BusinessProcess_id-r.xml").toPath(),
-                        "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
-                new File(folderX, "BusinessActor_id-p.xml").delete();
-                new File(folderX, "BusinessRole_id-q.xml").delete();
-                new File(folderX, "BusinessProcess_id-r.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderYDir = new File(bizDir, "folderY");
+                GraficoTestHelper.writeFolderXml(folderYDir, "FolderY", "id-folderX");
+                GraficoTestHelper.writeBusinessActor(folderYDir, "P", "id-p");
+                GraficoTestHelper.writeBusinessRole(folderYDir, "Q", "id-q");
+                GraficoTestHelper.writeBusinessProcess(folderYDir, "R", "id-r");
+                new File(folderXDir, "BusinessActor_id-p.xml").delete();
+                new File(folderXDir, "BusinessRole_id-q.xml").delete();
+                new File(folderXDir, "BusinessProcess_id-r.xml").delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -3152,9 +2890,8 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
                 // Make a trivial commit so merge is not a fast-forward
-                Files.writeString(new File(modelDir, "folder.xml").toPath(),
-                        "<archimate:ArchimateModel " + NS
-                        + " name=\"Test Updated\" id=\"id-model\" version=\"5.0.0\"/>\n");
+                File modelXml = new File(repoFolder, "model/folder.xml");
+                GraficoTestHelper.setDocumentation(modelXml, "trivial update");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: trivial update").call();
 
@@ -3181,7 +2918,7 @@ public class MergeConflictHandlerTests {
                         "R should be at folderY (not falsely deleted)");
 
                 // Old location should NOT exist
-                assertFalse(folderX.exists(),
+                assertFalse(folderXDir.exists(),
                         "folderX should not exist after merge");
             }
         }
@@ -3204,18 +2941,13 @@ public class MergeConflictHandlerTests {
         File repoFolder = new File(GitHelper.getTempTestsFolder(), "g2AddReorgRepo");
 
         try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
-            File modelDir = new File(repoFolder, "model");
-            File bizDir = new File(modelDir, "business");
-            File folderX = new File(bizDir, "folderX");
+            var helper = new GraficoTestHelper();
+            IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+            helper.addBusinessActor(folderX, "P", "id-p");
+            helper.export(repoFolder);
 
-            writeGraficoModel(modelDir);
-            mkdirAndWrite(bizDir, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"Business\" id=\"id-biz\" type=\"business\"/>\n");
-            mkdirAndWrite(folderX, "folder.xml",
-                    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
-            Files.writeString(new File(folderX, "BusinessActor_id-p.xml").toPath(),
-                    "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
-            writeStandardFolders(modelDir);
+            File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+            File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
 
             try(Git git = new Git(gitRepo)) {
                 git.add().addFilepattern(".").call();
@@ -3225,18 +2957,14 @@ public class MergeConflictHandlerTests {
                 git.branchCreate().setName("branchA").call();
                 git.checkout().setName("branchA").call();
 
-                File folderY = new File(bizDir, "folderY");
-                mkdirAndWrite(folderY, "folder.xml",
-                        "<archimate:Folder " + NS + " name=\"FolderY\" id=\"id-folderX\"/>\n");
-                Files.writeString(new File(folderY, "BusinessActor_id-p.xml").toPath(),
-                        "<archimate:BusinessActor " + NS + " name=\"P\" id=\"id-p\"/>\n");
-                Files.writeString(new File(folderY, "BusinessRole_id-q.xml").toPath(),
-                        "<archimate:BusinessRole " + NS + " name=\"Q\" id=\"id-q\"/>\n");
-                Files.writeString(new File(folderY, "BusinessProcess_id-r.xml").toPath(),
-                        "<archimate:BusinessProcess " + NS + " name=\"R\" id=\"id-r\"/>\n");
-                new File(folderX, "BusinessActor_id-p.xml").delete();
-                new File(folderX, "folder.xml").delete();
-                folderX.delete();
+                File folderYDir = new File(bizDir, "folderY");
+                GraficoTestHelper.writeFolderXml(folderYDir, "FolderY", "id-folderX");
+                GraficoTestHelper.writeBusinessActor(folderYDir, "P", "id-p");
+                GraficoTestHelper.writeBusinessRole(folderYDir, "Q", "id-q");
+                GraficoTestHelper.writeBusinessProcess(folderYDir, "R", "id-r");
+                new File(folderXDir, "BusinessActor_id-p.xml").delete();
+                new File(folderXDir, "folder.xml").delete();
+                folderXDir.delete();
 
                 git.add().addFilepattern(".").call();
                 git.add().addFilepattern(".").setUpdate(true).call();
@@ -3246,9 +2974,8 @@ public class MergeConflictHandlerTests {
                 git.checkout().setName("master").call();
                 git.branchCreate().setName("branchB").call();
                 git.checkout().setName("branchB").call();
-                Files.writeString(new File(modelDir, "folder.xml").toPath(),
-                        "<archimate:ArchimateModel " + NS
-                        + " name=\"Test Updated\" id=\"id-model\" version=\"5.0.0\"/>\n");
+                File modelXml = new File(repoFolder, "model/folder.xml");
+                GraficoTestHelper.setDocumentation(modelXml, "trivial update");
                 git.add().addFilepattern(".").call();
                 git.commit().setMessage("branchB: trivial update").call();
 
@@ -3269,7 +2996,7 @@ public class MergeConflictHandlerTests {
                         "Q (new element) should be at folderY");
                 assertTrue(new File(folderYResult, "BusinessProcess_id-r.xml").exists(),
                         "R (new element) should be at folderY");
-                assertFalse(folderX.exists(),
+                assertFalse(folderXDir.exists(),
                         "folderX should not exist after merge");
             }
         }
@@ -3430,30 +3157,6 @@ public class MergeConflictHandlerTests {
                 assertFalse(qFileInP.exists(),
                         "Q should NOT remain at folderP (moved to folderQ)");
             }
-        }
-    }
-
-    // ========================================================================
-    // Helper methods
-    // ========================================================================
-
-    private void mkdirAndWrite(File dir, String fileName, String content) throws IOException {
-        dir.mkdirs();
-        Files.writeString(new File(dir, fileName).toPath(), content);
-    }
-
-    private void writeGraficoModel(File modelDir) throws IOException {
-        mkdirAndWrite(modelDir, "folder.xml",
-                "<archimate:ArchimateModel " + NS
-                + " name=\"Test\" id=\"id-model\" version=\"5.0.0\"/>\n");
-    }
-
-    private void writeStandardFolders(File modelDir) throws IOException {
-        for(String folder : new String[]{"application", "technology", "motivation",
-                "implementation_migration", "other", "strategy", "relations", "diagrams"}) {
-            mkdirAndWrite(new File(modelDir, folder), "folder.xml",
-                    "<archimate:Folder " + NS
-                    + " name=\"" + folder + "\" id=\"id-" + folder + "\" type=\"" + folder + "\"/>\n");
         }
     }
 }

@@ -1223,3 +1223,97 @@ Format for new entries:
 ### Where This Applies
 [List of files/methods affected]
 ```
+
+---
+
+## Test Setup Strategy: GraficoTestHelper
+
+### The Problem
+
+Tests for merge conflict handling require a valid GRAFICO file structure on disk (model.xml, folder.xml, element XML files for every top-level folder type). Writing raw XML strings in each test is:
+- **Fragile**: GRAFICO namespace, attribute order, and structure must match exactly what the importer expects
+- **Verbose**: Every test repeats boilerplate for `writeGraficoModel()`, `writeStandardFolders()`, and XML namespace constants
+- **Error-prone**: Raw XML paths use arbitrary folder names (e.g., `folderX`) instead of ID-based names that the exporter actually generates (e.g., `id-folderX`)
+
+### Solution: GraficoTestHelper
+
+Use `GraficoTestHelper` to build an in-memory `IArchimateModel` with controlled IDs, then export it via `GraficoModelExporter` to create a guaranteed-valid GRAFICO structure.
+
+```java
+// ✅ CORRECT: Build model, export, get real paths
+var helper = new GraficoTestHelper();
+IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+IArchimateElement p = helper.addBusinessActor(folderX, "P", "id-p");
+helper.export(repoFolder);
+
+File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+File pFile = GraficoTestHelper.elementFile(folderXDir, p);
+```
+
+```java
+// ❌ WRONG: Raw XML with hardcoded paths
+File folderX = new File(bizDir, "folderX");  // Wrong! Real name is folder.getId()
+mkdirAndWrite(folderX, "folder.xml",
+    "<archimate:Folder " + NS + " name=\"FolderX\" id=\"id-folderX\"/>\n");
+writeStandardFolders(modelDir);  // Boilerplate repeated in every test
+```
+
+### Two Phases: Initial State vs Branch Modifications
+
+**Initial state** (base commit): Use `GraficoTestHelper` to build and export the model. This guarantees valid GRAFICO structure.
+
+**Branch modifications** (simulating concurrent changes): Use `GraficoTestHelper`'s static write methods to create/modify files directly on disk. These write simplified XML that's sufficient for the importer.
+
+```java
+// Phase 1: Initial setup via export
+var helper = new GraficoTestHelper();
+IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+helper.addBusinessActor(folderX, "P", "id-p");
+helper.export(repoFolder);
+git.add().addFilepattern(".").call();
+git.commit().setMessage("initial").call();
+
+// Phase 2: Branch modifications via static helpers
+git.branchCreate().setName("branchA").call();
+git.checkout().setName("branchA").call();
+File folderYDir = new File(bizDir, "folderY");
+GraficoTestHelper.writeFolderXml(folderYDir, "FolderY", "id-folderX");  // rename
+GraficoTestHelper.writeBusinessActor(folderYDir, "P", "id-p");          // move element
+```
+
+### Available Helper Methods
+
+**Model building** (instance methods):
+- `addFolder(parent, name, id)` — adds subfolder with controlled ID
+- `addBusinessActor(folder, name, id)`, `addBusinessRole(...)`, `addBusinessProcess(...)`, `addApplicationComponent(...)` — adds element to folder
+- `export(repoFolder)` — exports full GRAFICO structure
+
+**Path resolution** (static methods):
+- `topFolderDir(repoFolder, FolderType)` — e.g., `model/business`
+- `folderDir(repoFolder, FolderType, folder)` — e.g., `model/business/id-folderX`
+- `elementFile(dir, element)` — e.g., `BusinessActor_id-p.xml`
+
+**Branch file operations** (static methods):
+- `writeFolderXml(dir, name, id)` — writes `folder.xml`
+- `writeBusinessActor(dir, name, id)`, `writeBusinessRole(...)`, `writeBusinessProcess(...)`, `writeApplicationComponent(...)` — writes element XML
+- `setDocumentation(file, text)` — modifies an existing XML file
+- `moveElementFile(srcDir, dstDir, element)` — moves an element file
+- `moveFolderDir(srcDir, dstDir)` — moves a folder directory
+- `renameElement(dir, element, newName)` — renames an element in its XML
+- `deleteFolder(dir)` — recursively deletes a folder
+
+### Trivial Commits (No Fast-Forward)
+
+When a test needs branch B to have a commit without meaningful changes (to prevent fast-forward merge), modify the model's root `folder.xml`:
+
+```java
+File modelXml = new File(repoFolder, "model/folder.xml");
+GraficoTestHelper.setDocumentation(modelXml, "trivial update");
+```
+
+### Where This Applies
+
+- `MergeConflictHandlerTests.java` — all 27 merge tests use this pattern
+- `GraficoTestHelper.java` — the helper class itself
+- Any future merge/conflict test should follow this pattern
