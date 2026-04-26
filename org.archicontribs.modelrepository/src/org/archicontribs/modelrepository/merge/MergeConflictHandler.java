@@ -5,10 +5,8 @@
  */
 package org.archicontribs.modelrepository.merge;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -29,7 +27,6 @@ import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.jface.dialogs.Dialog;
 import org.eclipse.jface.window.Window;
-import org.eclipse.jgit.api.AddCommand;
 import org.eclipse.jgit.api.CheckoutCommand;
 import org.eclipse.jgit.api.CheckoutCommand.Stage;
 import org.eclipse.jgit.api.Git;
@@ -42,8 +39,6 @@ import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
-import org.eclipse.jgit.revwalk.filter.RevFilter;
-import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.swt.widgets.Shell;
 
 import com.archimatetool.model.FolderType;
@@ -641,7 +636,7 @@ public class MergeConflictHandler {
         // Git-add all affected paths to resolve conflicts in the index
         if(!pathsToAdd.isEmpty()) {
             log(IStatus.INFO, "[MergeConflictHandler] resolveMoveResolved: staging " + pathsToAdd.size() + " paths: " + pathsToAdd); //$NON-NLS-1$ //$NON-NLS-2$
-            stagePathsWithJGit(git, pathsToAdd);
+            ((ArchiRepository) fArchiRepo).gitAddPaths(pathsToAdd);
         }
     }
     
@@ -962,11 +957,7 @@ public class MergeConflictHandler {
         log(IStatus.INFO, "[MergeConflictHandler] staging " + affectedPaths.size() //$NON-NLS-1$
                 + " affected path(s): " + affectedPaths); //$NON-NLS-1$
         
-        if(!ArchiRepository.isNativeGitEnabled() || !tryNativeGitAdd(repoRoot, affectedPaths)) {
-            try(Git git = Git.open(repoRoot)) {
-                stagePathsWithJGit(git, affectedPaths);
-            }
-        }
+        ((ArchiRepository) fArchiRepo).gitAddPaths(affectedPaths);
     }
     
     /**
@@ -978,71 +969,6 @@ public class MergeConflictHandler {
             if(remaining == null || remaining.length == 0) {
                 dir.delete();
             }
-        }
-    }
-    
-    /**
-     * Stage paths using JGit — adds new files and updates/removes existing ones.
-     */
-    private static void stagePathsWithJGit(Git git, Set<String> paths) throws GitAPIException {
-        AddCommand addNew = git.add();
-        AddCommand addUpdated = git.add().setUpdate(true);
-        for(String path : paths) {
-            addNew.addFilepattern(path);
-            addUpdated.addFilepattern(path);
-        }
-        addNew.call();
-        addUpdated.call();
-    }
-    
-    /**
-     * Try native git add -A for specific paths (much faster than JGit for large repos).
-     * 
-     * @param repoRoot the repository root directory
-     * @param paths repo-relative paths to stage
-     * @return true if native git succeeded, false if native git is not available
-     * @throws IOException if the git command failed
-     */
-    private static boolean tryNativeGitAdd(File repoRoot, Set<String> paths) throws IOException {
-        try {
-            List<String> command = new ArrayList<>();
-            command.add("git"); //$NON-NLS-1$
-            command.add("add"); //$NON-NLS-1$
-            command.add("-A"); //$NON-NLS-1$
-            command.add("--"); //$NON-NLS-1$
-            command.addAll(paths);
-            
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.directory(repoRoot);
-            pb.redirectErrorStream(true);
-            
-            Process process = pb.start();
-            
-            StringBuilder output = new StringBuilder();
-            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while((line = reader.readLine()) != null) {
-                    output.append(line).append("\n"); //$NON-NLS-1$
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("Git add failed: " + output.toString()); //$NON-NLS-1$
-            }
-            
-            return true;
-        }
-        catch(IOException ex) {
-            String message = ex.getMessage();
-            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
-                return false;
-            }
-            throw ex;
-        }
-        catch(InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Git add interrupted", ex); //$NON-NLS-1$
         }
     }
     
@@ -1229,9 +1155,8 @@ public class MergeConflictHandler {
      * <p>Should be called after merge (clean or conflicting) and before
      * repairMissingFolderXml(), as Phase 1.5 of the merge pipeline.</p>
      * 
-     * <p>Performance: Uses native {@code git diff --diff-filter=D} to find deleted
-     * files (one process call per parent, returns only deleted paths). Falls back
-     * to JGit TreeWalk if native git is not available.</p>
+     * <p>Performance: Delegates to {@link ArchiRepository#collectDeletedElementIds}
+     * which handles native git / JGit switching internally.</p>
      * 
      * @param repo the JGit repository (must have a working tree)
      * @param oursCommitId the commit ID of our branch (before merge)
@@ -1246,32 +1171,9 @@ public class MergeConflictHandler {
         long t = System.nanoTime();
         File repoRoot = repo.getWorkTree();
         
-        // Find merge base
-        String mergeBaseSha;
-        try(RevWalk rw = new RevWalk(repo)) {
-            RevCommit oursCommit = rw.parseCommit(oursCommitId);
-            RevCommit theirsCommit = rw.parseCommit(theirsCommitId);
-            rw.setRevFilter(RevFilter.MERGE_BASE);
-            rw.markStart(oursCommit);
-            rw.markStart(theirsCommit);
-            RevCommit mergeBase = rw.next();
-            if(mergeBase == null) {
-                return 0;
-            }
-            mergeBaseSha = mergeBase.getName();
-        }
-        
-        // Collect element IDs deleted by each parent (base→ours, base→theirs)
+        // Collect element IDs deleted by each parent — ArchiRepository handles native/JGit switching
         Set<String> deletedIds = new HashSet<>();
-        
-        boolean nativeGitAvailable = ArchiRepository.isNativeGitEnabled()
-                && collectDeletedIdsNative(repoRoot, mergeBaseSha,
-                oursCommitId.getName(), theirsCommitId.getName(), deletedIds);
-        
-        if(!nativeGitAvailable) {
-            // Fallback: use JGit TreeWalk (slower but always available)
-            collectDeletedIdsJGit(repo, oursCommitId, theirsCommitId, mergeBaseSha, deletedIds);
-        }
+        ArchiRepository.collectDeletedElementIds(repo, oursCommitId, theirsCommitId, deletedIds);
         
         if(deletedIds.isEmpty()) {
             return 0;
@@ -1311,210 +1213,6 @@ public class MergeConflictHandler {
     }
     
     /**
-     * Use native {@code git diff --name-only --diff-filter=D} to find element IDs
-     * truly deleted between merge base and each parent. An element is "truly deleted"
-     * by a parent if the diff shows it removed at an old path AND it is NOT present
-     * anywhere in that same parent's tree (i.e. not just moved to a new path).
-     * 
-     * @return true if native git was available, false to indicate JGit fallback needed
-     */
-    private static boolean collectDeletedIdsNative(File repoRoot, String mergeBaseSha,
-            String oursSha, String theirsSha, Set<String> deletedIds) throws IOException {
-        try {
-            Set<String> deletedByOurs = new HashSet<>();
-            Set<String> deletedByTheirs = new HashSet<>();
-            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, oursSha, deletedByOurs);
-            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, theirsSha, deletedByTheirs);
-            
-            // git diff --diff-filter=D reports path-based deletions. If a parent
-            // moved a folder, all files at the old path show as "deleted" even
-            // though they exist at the new path. We cross-check against the
-            // same parent's full tree to distinguish true deletions from moves.
-            Set<String> presentInOurs = new HashSet<>();
-            Set<String> presentInTheirs = new HashSet<>();
-            collectPresentIdsFromTree(repoRoot, oursSha, presentInOurs);
-            collectPresentIdsFromTree(repoRoot, theirsSha, presentInTheirs);
-            
-            // Truly deleted by ours: diff says deleted AND not present anywhere in ours
-            for(String id : deletedByOurs) {
-                if(!presentInOurs.contains(id)) {
-                    deletedIds.add(id);
-                }
-            }
-            // Truly deleted by theirs: diff says deleted AND not present anywhere in theirs
-            for(String id : deletedByTheirs) {
-                if(!presentInTheirs.contains(id)) {
-                    deletedIds.add(id);
-                }
-            }
-            
-            return true;
-        }
-        catch(IOException ex) {
-            String msg = ex.getMessage();
-            if(msg != null && (msg.contains("Cannot run program") || msg.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
-                return false; // Native git not available
-            }
-            throw ex;
-        }
-    }
-    
-    /**
-     * Run {@code git diff --name-only --diff-filter=D base..commit} and extract
-     * element IDs from deleted GRAFICO filenames.
-     */
-    private static void collectDeletedIdsFromDiff(File repoRoot, String baseSha,
-            String commitSha, Set<String> deletedIds) throws IOException {
-        ProcessBuilder pb = new ProcessBuilder(
-                "git", "diff", "--name-only", "--diff-filter=D", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
-                baseSha, commitSha, "--", IGraficoConstants.MODEL_FOLDER); //$NON-NLS-1$
-        pb.directory(repoRoot);
-        pb.redirectErrorStream(true);
-        
-        Process process;
-        try {
-            process = pb.start();
-        }
-        catch(IOException ex) {
-            throw ex; // "Cannot run program" — caller catches and falls back
-        }
-        
-        try(BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while((line = reader.readLine()) != null) {
-                String fileName = line.substring(line.lastIndexOf('/') + 1);
-                String id = extractIdFromElementFileName(fileName);
-                if(id != null) {
-                    deletedIds.add(id);
-                }
-            }
-        }
-        
-        try {
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("git diff failed with exit code " + exitCode); //$NON-NLS-1$
-            }
-        }
-        catch(InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("git diff interrupted", e); //$NON-NLS-1$
-        }
-    }
-    
-    /**
-     * Use native {@code git ls-tree -r --name-only} to collect element IDs
-     * present in a commit's tree. Used to cross-check deletion candidates.
-     */
-    private static void collectPresentIdsFromTree(File repoRoot, String commitSha,
-            Set<String> presentIds) throws IOException {
-        ProcessBuilder pb = new ProcessBuilder(
-                "git", "ls-tree", "-r", "--name-only", commitSha, //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
-                "--", IGraficoConstants.MODEL_FOLDER); //$NON-NLS-1$
-        pb.directory(repoRoot);
-        pb.redirectErrorStream(true);
-        
-        Process process = pb.start();
-        
-        try(BufferedReader reader = new BufferedReader(
-                new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while((line = reader.readLine()) != null) {
-                String fileName = line.substring(line.lastIndexOf('/') + 1);
-                String id = extractIdFromElementFileName(fileName);
-                if(id != null) {
-                    presentIds.add(id);
-                }
-            }
-        }
-        
-        try {
-            int exitCode = process.waitFor();
-            if(exitCode != 0) {
-                throw new IOException("git ls-tree failed with exit code " + exitCode); //$NON-NLS-1$
-            }
-        }
-        catch(InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("git ls-tree interrupted", e); //$NON-NLS-1$
-        }
-    }
-    
-    /**
-     * JGit fallback: walk both parent trees and the merge base tree to find
-     * truly deleted element IDs. Since {@link #collectElementIdsFromTree} is
-     * path-agnostic (collects IDs regardless of folder location), an element
-     * missing from a parent's ID set means it was truly deleted, not just moved.
-     */
-    private static void collectDeletedIdsJGit(Repository repo, ObjectId oursId,
-            ObjectId theirsId, String mergeBaseSha, Set<String> deletedIds) throws IOException {
-        try(RevWalk rw = new RevWalk(repo)) {
-            RevCommit baseCommit = rw.parseCommit(ObjectId.fromString(mergeBaseSha));
-            RevCommit oursCommit = rw.parseCommit(oursId);
-            RevCommit theirsCommit = rw.parseCommit(theirsId);
-            
-            Set<String> baseIds = collectElementIdsFromTree(repo, baseCommit);
-            Set<String> oursIds = collectElementIdsFromTree(repo, oursCommit);
-            Set<String> theirsIds = collectElementIdsFromTree(repo, theirsCommit);
-            
-            // Elements truly deleted by ours: in base but not in ours at any path
-            for(String id : baseIds) {
-                if(!oursIds.contains(id)) {
-                    deletedIds.add(id);
-                }
-            }
-            // Elements truly deleted by theirs: in base but not in theirs at any path
-            for(String id : baseIds) {
-                if(!theirsIds.contains(id)) {
-                    deletedIds.add(id);
-                }
-            }
-        }
-    }
-    
-    /**
-     * Collect all element IDs from a commit's tree by scanning GRAFICO element filenames.
-     * Element files follow the pattern: {EClassName}_{id}.xml (e.g. BusinessActor_id-q.xml).
-     * Excludes folder.xml files.
-     */
-    private static Set<String> collectElementIdsFromTree(Repository repo, RevCommit commit) throws IOException {
-        Set<String> ids = new HashSet<>();
-        try(TreeWalk tw = new TreeWalk(repo)) {
-            tw.addTree(commit.getTree());
-            tw.setRecursive(true);
-            while(tw.next()) {
-                String path = tw.getPathString();
-                if(!path.startsWith(IGraficoConstants.MODEL_FOLDER + "/")) { //$NON-NLS-1$
-                    continue;
-                }
-                String fileName = path.substring(path.lastIndexOf('/') + 1);
-                String id = extractIdFromElementFileName(fileName);
-                if(id != null) {
-                    ids.add(id);
-                }
-            }
-        }
-        return ids;
-    }
-    
-    /**
-     * Extract the element ID from a GRAFICO element filename.
-     * Format: {EClassName}_{id}.xml → returns {id}
-     * Returns null for folder.xml and non-element files.
-     */
-    static String extractIdFromElementFileName(String fileName) {
-        if(IGraficoConstants.FOLDER_XML.equals(fileName) || !fileName.endsWith(".xml")) { //$NON-NLS-1$
-            return null;
-        }
-        int underscoreIdx = fileName.indexOf('_');
-        if(underscoreIdx < 0 || underscoreIdx >= fileName.length() - 5) {
-            return null;
-        }
-        return fileName.substring(underscoreIdx + 1, fileName.length() - 4);
-    }
-    
-    /**
      * Recursively find element files in the working tree whose IDs are in the leaked set.
      * Adds repo-relative paths to the leakedPaths list.
      */
@@ -1529,7 +1227,7 @@ public class MergeConflictHandler {
                 findLeakedElementFiles(f, repoRoot, leakedIds, leakedPaths);
             }
             else {
-                String id = extractIdFromElementFileName(f.getName());
+                String id = ArchiRepository.extractIdFromElementFileName(f.getName());
                 if(id != null && leakedIds.contains(id)) {
                     String repoRelativePath = repoRoot.toPath().relativize(f.toPath())
                             .toString().replace('\\', '/');

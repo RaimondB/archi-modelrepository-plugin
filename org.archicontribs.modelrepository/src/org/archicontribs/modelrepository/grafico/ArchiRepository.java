@@ -19,8 +19,10 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
@@ -37,6 +39,8 @@ import org.eclipse.jgit.api.CommitCommand;
 import org.eclipse.jgit.api.FetchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.InitCommand;
+import org.eclipse.jgit.api.MergeCommand;
+import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.PullCommand;
 import org.eclipse.jgit.api.PullResult;
 import org.eclipse.jgit.api.PushCommand;
@@ -57,6 +61,7 @@ import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.revwalk.filter.RevFilter;
 import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.URIish;
@@ -292,6 +297,44 @@ public class ArchiRepository implements IArchiRepository {
             // HEAD/remote refs may have changed — invalidate cached branch status
             invalidateBranchStatusCache();
             
+            return result;
+        }
+    }
+    
+    /**
+     * Merge a remote tracking branch into the current branch.
+     * Handles native git / JGit switching internally — callers don't need
+     * to know which implementation is used.
+     * 
+     * @param remoteBranch the remote tracking branch (e.g. "origin/master")
+     * @return MergeResult from JGit if JGit performed the merge (may be clean or conflicting),
+     *         or null if native git performed a clean merge
+     * @throws IOException if the merge command failed
+     * @throws GitAPIException if a JGit operation fails
+     */
+    public MergeResult merge(String remoteBranch) throws IOException, GitAPIException {
+        // Phase 1: Try native git merge (dramatically faster for large repos)
+        if(isNativeGitEnabled()) {
+            Boolean nativeResult = tryNativeGitMerge(remoteBranch);
+            
+            if(Boolean.TRUE.equals(nativeResult)) {
+                // Native merge succeeded cleanly — already invalidated cache
+                return null;
+            }
+            else if(Boolean.FALSE.equals(nativeResult)) {
+                // Native merge had conflicts — abort and fall through to JGit
+                abortNativeMerge();
+            }
+            // null = native git not available — fall through to JGit
+        }
+        
+        // Phase 2: JGit merge fallback
+        try(Git git = Git.open(getLocalRepositoryFolder())) {
+            ObjectId remoteId = git.getRepository().resolve(Constants.R_REMOTES + remoteBranch);
+            MergeCommand mergeCommand = git.merge();
+            mergeCommand.include(remoteBranch, remoteId);
+            MergeResult result = mergeCommand.call();
+            invalidateBranchStatusCache();
             return result;
         }
     }
@@ -885,6 +928,87 @@ public class ArchiRepository implements IArchiRepository {
     }
     
     /**
+     * Stage specific paths using native git (faster) or JGit fallback.
+     * This is the path-specific variant — stages only the given paths
+     * (both additions and removals) unlike {@link #gitAdd()} which stages everything.
+     * 
+     * @param paths repo-relative paths to stage
+     * @throws IOException if the add command failed
+     * @throws GitAPIException if JGit fallback fails
+     */
+    public void gitAddPaths(Set<String> paths) throws IOException, GitAPIException {
+        boolean nativeSuccess = isNativeGitEnabled() && tryNativeGitAddPaths(paths);
+        
+        if(!nativeSuccess) {
+            // Fall back to JGit — stage new, modified and deleted files for the given paths
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                AddCommand addNew = git.add();
+                AddCommand addUpdated = git.add().setUpdate(true);
+                for(String path : paths) {
+                    addNew.addFilepattern(path);
+                    addUpdated.addFilepattern(path);
+                }
+                addNew.call();
+                addUpdated.call();
+            }
+        }
+        else {
+            // After native Git operation, open repository to sync JGit state
+            Git.open(getLocalRepositoryFolder()).close();
+        }
+    }
+    
+    /**
+     * Low-level method: Try native git add -A for specific paths.
+     * 
+     * @param paths repo-relative paths to stage
+     * @return true if native git succeeded, false if native git is not available
+     * @throws IOException if the git command failed
+     */
+    private boolean tryNativeGitAddPaths(Set<String> paths) throws IOException {
+        try {
+            List<String> command = new ArrayList<>();
+            command.add("git"); //$NON-NLS-1$
+            command.add("add"); //$NON-NLS-1$
+            command.add("-A"); //$NON-NLS-1$
+            command.add("--"); //$NON-NLS-1$
+            command.addAll(paths);
+            
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git add failed: " + output.toString()); //$NON-NLS-1$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git add interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
      * Reset the repository to a specific ref using native Git (faster) or JGit fallback.
      * After successful native operation, opens the repository to sync JGit state.
      * 
@@ -986,7 +1110,7 @@ public class ArchiRepository implements IArchiRepository {
      *         {@code null} if native git is not available
      * @throws IOException if the merge command failed for a reason other than conflicts
      */
-    public Boolean tryNativeGitMerge(String remoteBranch) throws IOException {
+    private Boolean tryNativeGitMerge(String remoteBranch) throws IOException {
         try {
             ProcessBuilder pb = new ProcessBuilder(
                     "git", "merge", remoteBranch); //$NON-NLS-1$ //$NON-NLS-2$
@@ -1039,7 +1163,7 @@ public class ArchiRepository implements IArchiRepository {
      * Abort a native git merge in progress. Called when native merge detected
      * conflicts and we need to fall back to JGit merge for conflict handling.
      */
-    public void abortNativeMerge() throws IOException {
+    private void abortNativeMerge() throws IOException {
         try {
             ProcessBuilder pb = new ProcessBuilder(
                     "git", "merge", "--abort"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
@@ -1241,5 +1365,255 @@ public class ArchiRepository implements IArchiRepository {
             Thread.currentThread().interrupt();
             throw new IOException("Git clone interrupted", ex); //$NON-NLS-1$
         }
+    }
+    
+    // ====================================================================================
+    // Cross-Path Deletion Support
+    // ====================================================================================
+    
+    /**
+     * Collect element IDs that were truly deleted between ours and theirs relative
+     * to their merge base. Handles native git / JGit switching internally.
+     * 
+     * <p>An element is "truly deleted" by a parent if its file is missing from that
+     * parent's tree at ANY path (not just moved to a new folder).</p>
+     * 
+     * @param repo the JGit repository
+     * @param oursCommitId our commit (typically HEAD before merge)
+     * @param theirsCommitId their commit (typically the remote branch tip)
+     * @param deletedIds set to populate with deleted element IDs
+     * @throws IOException if an I/O error occurs
+     */
+    public static void collectDeletedElementIds(Repository repo, ObjectId oursCommitId,
+            ObjectId theirsCommitId, Set<String> deletedIds) throws IOException {
+        File repoRoot = repo.getWorkTree();
+        
+        // Find merge base
+        String mergeBaseSha;
+        try(RevWalk rw = new RevWalk(repo)) {
+            RevCommit oursCommit = rw.parseCommit(oursCommitId);
+            RevCommit theirsCommit = rw.parseCommit(theirsCommitId);
+            rw.setRevFilter(RevFilter.MERGE_BASE);
+            rw.markStart(oursCommit);
+            rw.markStart(theirsCommit);
+            RevCommit mergeBase = rw.next();
+            if(mergeBase == null) {
+                return; // No common ancestor
+            }
+            mergeBaseSha = mergeBase.getName();
+        }
+        
+        // Try native git first, fall back to JGit
+        boolean nativeGitUsed = isNativeGitEnabled()
+                && collectDeletedIdsNative(repoRoot, mergeBaseSha,
+                oursCommitId.getName(), theirsCommitId.getName(), deletedIds);
+        
+        if(!nativeGitUsed) {
+            collectDeletedIdsJGit(repo, oursCommitId, theirsCommitId, mergeBaseSha, deletedIds);
+        }
+    }
+    
+    /**
+     * Use native {@code git diff --name-only --diff-filter=D} to find element IDs
+     * truly deleted between merge base and each parent. An element is "truly deleted"
+     * by a parent if the diff shows it removed at an old path AND it is NOT present
+     * anywhere in that same parent's tree (i.e. not just moved to a new path).
+     * 
+     * @return true if native git was available, false to indicate JGit fallback needed
+     */
+    private static boolean collectDeletedIdsNative(File repoRoot, String mergeBaseSha,
+            String oursSha, String theirsSha, Set<String> deletedIds) throws IOException {
+        try {
+            Set<String> deletedByOurs = new HashSet<>();
+            Set<String> deletedByTheirs = new HashSet<>();
+            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, oursSha, deletedByOurs);
+            collectDeletedIdsFromDiff(repoRoot, mergeBaseSha, theirsSha, deletedByTheirs);
+            
+            // git diff --diff-filter=D reports path-based deletions. If a parent
+            // moved a folder, all files at the old path show as "deleted" even
+            // though they exist at the new path. We cross-check against the
+            // same parent's full tree to distinguish true deletions from moves.
+            Set<String> presentInOurs = new HashSet<>();
+            Set<String> presentInTheirs = new HashSet<>();
+            collectPresentIdsFromTree(repoRoot, oursSha, presentInOurs);
+            collectPresentIdsFromTree(repoRoot, theirsSha, presentInTheirs);
+            
+            // Truly deleted by ours: diff says deleted AND not present anywhere in ours
+            for(String id : deletedByOurs) {
+                if(!presentInOurs.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+            // Truly deleted by theirs: diff says deleted AND not present anywhere in theirs
+            for(String id : deletedByTheirs) {
+                if(!presentInTheirs.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            String msg = ex.getMessage();
+            if(msg != null && (msg.contains("Cannot run program") || msg.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return false; // Native git not available
+            }
+            throw ex;
+        }
+    }
+    
+    /**
+     * Run {@code git diff --name-only --diff-filter=D base..commit} and extract
+     * element IDs from deleted GRAFICO filenames.
+     */
+    private static void collectDeletedIdsFromDiff(File repoRoot, String baseSha,
+            String commitSha, Set<String> deletedIds) throws IOException {
+        ProcessBuilder pb = new ProcessBuilder(
+                "git", "diff", "--name-only", "--diff-filter=D", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                baseSha, commitSha, "--", IGraficoConstants.MODEL_FOLDER); //$NON-NLS-1$
+        pb.directory(repoRoot);
+        pb.redirectErrorStream(true);
+        
+        Process process;
+        try {
+            process = pb.start();
+        }
+        catch(IOException ex) {
+            throw ex; // "Cannot run program" — caller catches and falls back
+        }
+        
+        try(BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while((line = reader.readLine()) != null) {
+                String fileName = line.substring(line.lastIndexOf('/') + 1);
+                String id = extractIdFromElementFileName(fileName);
+                if(id != null) {
+                    deletedIds.add(id);
+                }
+            }
+        }
+        
+        try {
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("git diff failed with exit code " + exitCode); //$NON-NLS-1$
+            }
+        }
+        catch(InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("git diff interrupted", e); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Use native {@code git ls-tree -r --name-only} to collect element IDs
+     * present in a commit's tree. Used to cross-check deletion candidates.
+     */
+    private static void collectPresentIdsFromTree(File repoRoot, String commitSha,
+            Set<String> presentIds) throws IOException {
+        ProcessBuilder pb = new ProcessBuilder(
+                "git", "ls-tree", "-r", "--name-only", commitSha, //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+                "--", IGraficoConstants.MODEL_FOLDER); //$NON-NLS-1$
+        pb.directory(repoRoot);
+        pb.redirectErrorStream(true);
+        
+        Process process = pb.start();
+        
+        try(BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while((line = reader.readLine()) != null) {
+                String fileName = line.substring(line.lastIndexOf('/') + 1);
+                String id = extractIdFromElementFileName(fileName);
+                if(id != null) {
+                    presentIds.add(id);
+                }
+            }
+        }
+        
+        try {
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("git ls-tree failed with exit code " + exitCode); //$NON-NLS-1$
+            }
+        }
+        catch(InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("git ls-tree interrupted", e); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * JGit fallback: walk both parent trees and the merge base tree to find
+     * truly deleted element IDs. Since {@link #collectElementIdsFromTree} is
+     * path-agnostic (collects IDs regardless of folder location), an element
+     * missing from a parent's ID set means it was truly deleted, not just moved.
+     */
+    private static void collectDeletedIdsJGit(Repository repo, ObjectId oursId,
+            ObjectId theirsId, String mergeBaseSha, Set<String> deletedIds) throws IOException {
+        try(RevWalk rw = new RevWalk(repo)) {
+            RevCommit baseCommit = rw.parseCommit(ObjectId.fromString(mergeBaseSha));
+            RevCommit oursCommit = rw.parseCommit(oursId);
+            RevCommit theirsCommit = rw.parseCommit(theirsId);
+            
+            Set<String> baseIds = collectElementIdsFromTree(repo, baseCommit);
+            Set<String> oursIds = collectElementIdsFromTree(repo, oursCommit);
+            Set<String> theirsIds = collectElementIdsFromTree(repo, theirsCommit);
+            
+            // Elements truly deleted by ours: in base but not in ours at any path
+            for(String id : baseIds) {
+                if(!oursIds.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+            // Elements truly deleted by theirs: in base but not in theirs at any path
+            for(String id : baseIds) {
+                if(!theirsIds.contains(id)) {
+                    deletedIds.add(id);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Collect all element IDs from a commit's tree by scanning GRAFICO element filenames.
+     * Element files follow the pattern: {EClassName}_{id}.xml (e.g. BusinessActor_id-q.xml).
+     * Excludes folder.xml files.
+     */
+    private static Set<String> collectElementIdsFromTree(Repository repo, RevCommit commit) throws IOException {
+        Set<String> ids = new HashSet<>();
+        try(TreeWalk tw = new TreeWalk(repo)) {
+            tw.addTree(commit.getTree());
+            tw.setRecursive(true);
+            while(tw.next()) {
+                String path = tw.getPathString();
+                if(!path.startsWith(IGraficoConstants.MODEL_FOLDER + "/")) { //$NON-NLS-1$
+                    continue;
+                }
+                String fileName = path.substring(path.lastIndexOf('/') + 1);
+                String id = extractIdFromElementFileName(fileName);
+                if(id != null) {
+                    ids.add(id);
+                }
+            }
+        }
+        return ids;
+    }
+    
+    /**
+     * Extract the element ID from a GRAFICO element filename.
+     * Format: {EClassName}_{id}.xml → returns {id}
+     * Returns null for folder.xml and non-element files.
+     */
+    public static String extractIdFromElementFileName(String fileName) {
+        if(IGraficoConstants.FOLDER_XML.equals(fileName) || !fileName.endsWith(".xml")) { //$NON-NLS-1$
+            return null;
+        }
+        int underscoreIdx = fileName.indexOf('_');
+        if(underscoreIdx < 0 || underscoreIdx >= fileName.length() - 5) {
+            return null;
+        }
+        return fileName.substring(underscoreIdx + 1, fileName.length() - 4);
     }
 }

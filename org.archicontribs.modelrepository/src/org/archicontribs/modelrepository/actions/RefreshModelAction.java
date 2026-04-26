@@ -28,7 +28,6 @@ import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.MergeCommand;
 import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.MergeResult.MergeStatus;
 import org.eclipse.jgit.api.errors.CanceledException;
@@ -229,11 +228,12 @@ public class RefreshModelAction extends AbstractModelAction {
         // Phase 2: Determine if merge is needed
         phaseStart = System.nanoTime();
         MergeResult mergeResult = null;
+        String remoteBranch;
         
         try(Git git = Git.open(getRepository().getLocalRepositoryFolder())) {
             Repository repository = git.getRepository();
             String currentBranch = repository.getBranch();
-            String remoteBranch = IGraficoConstants.ORIGIN + "/" + currentBranch; //$NON-NLS-1$
+            remoteBranch = IGraficoConstants.ORIGIN + "/" + currentBranch; //$NON-NLS-1$
             ObjectId remoteId = repository.resolve(Constants.R_REMOTES + remoteBranch);
             ObjectId headId = repository.resolve(IGraficoConstants.HEAD);
             
@@ -245,42 +245,11 @@ public class RefreshModelAction extends AbstractModelAction {
                 }
                 return PULL_STATUS_UP_TO_DATE;
             }
-            
-            // Phase 2a: Try native git merge (dramatically faster for large repos)
-            ArchiRepository archiRepo = (ArchiRepository) getRepository();
-            Boolean nativeResult = ArchiRepository.isNativeGitEnabled()
-                    ? archiRepo.tryNativeGitMerge(remoteBranch) : null;
-            
-            if(Boolean.TRUE.equals(nativeResult)) {
-                // Native merge succeeded cleanly
-                logPerf("merge (native git)", phaseStart); //$NON-NLS-1$
-            }
-            else if(Boolean.FALSE.equals(nativeResult)) {
-                // Native merge had conflicts — abort and fall back to JGit
-                archiRepo.abortNativeMerge();
-                logPerf("merge (native git — conflicts, aborted)", phaseStart); //$NON-NLS-1$
-                
-                // Re-open git since abort may have changed state
-                phaseStart = System.nanoTime();
-                try(Git git2 = Git.open(getRepository().getLocalRepositoryFolder())) {
-                    ObjectId freshRemoteId = git2.getRepository().resolve(Constants.R_REMOTES + remoteBranch);
-                    MergeCommand mergeCommand = git2.merge();
-                    mergeCommand.include(remoteBranch, freshRemoteId);
-                    mergeResult = mergeCommand.call();
-                }
-                logPerf("merge (JGit fallback for conflicts)", phaseStart); //$NON-NLS-1$
-            }
-            else {
-                // Native git not available — full JGit merge fallback
-                MergeCommand mergeCommand = git.merge();
-                mergeCommand.include(remoteBranch, remoteId);
-                mergeResult = mergeCommand.call();
-                logPerf("merge (JGit fallback)", phaseStart); //$NON-NLS-1$
-            }
         }
         
-        // Invalidate branch status cache since refs may have changed
-        ((ArchiRepository) getRepository()).invalidateBranchStatusCache();
+        // Merge — ArchiRepository handles native git / JGit switching internally
+        mergeResult = ((ArchiRepository) getRepository()).merge(remoteBranch);
+        logPerf("merge", phaseStart); //$NON-NLS-1$
         
         monitor.subTask(Messages.RefreshModelAction_7);
         
