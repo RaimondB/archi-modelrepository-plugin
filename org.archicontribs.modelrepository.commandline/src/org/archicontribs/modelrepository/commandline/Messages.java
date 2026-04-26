@@ -76,6 +76,32 @@ public class Messages extends NLS {
     
     public static String SaveModelToRepositoryProvider_7;
     
+    public static String CommitModelProvider_0;
+    
+    public static String CommitModelProvider_1;
+    
+    public static String CommitModelProvider_2;
+    
+    public static String CommitModelProvider_3;
+    
+    public static String CommitModelProvider_4;
+    
+    public static String CommitModelProvider_5;
+    
+    public static String CommitModelProvider_6;
+    
+    public static String CommitModelProvider_7;
+    
+    public static String CommitModelProvider_8;
+    
+    public static String CommitModelProvider_9;
+    
+    public static String CommitModelProvider_10;
+    
+    public static String CommitModelProvider_11;
+    
+    public static String CommitModelProvider_12;
+    
     static {
         // initialize resource bundle
         NLS.initializeMessages(BUNDLE_NAME, Messages.class);

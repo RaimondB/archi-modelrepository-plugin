@@ -19,6 +19,7 @@ Export-Package: org.archicontribs.modelrepository,
  org.archicontribs.modelrepository.merge,
  org.archicontribs.modelrepository.preferences,
  org.archicontribs.modelrepository.propertysections,
+ org.archicontribs.modelrepository.services,
  org.archicontribs.modelrepository.views.branches,
  org.archicontribs.modelrepository.views.history,
  org.archicontribs.modelrepository.views.repositories

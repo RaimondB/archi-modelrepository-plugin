@@ -6,11 +6,15 @@
 package org.archicontribs.modelrepository.actions;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.dialogs.CommitDialog;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
+import org.archicontribs.modelrepository.services.RepositoryService;
+import org.archicontribs.modelrepository.services.RepositoryService.CommitResult;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.window.Window;
 import org.eclipse.ui.IWorkbenchWindow;
 
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -19,16 +23,18 @@ import com.archimatetool.model.IArchimateModel;
 /**
  * Commit Model Action
  * 
+ * UI wrapper that delegates to {@link RepositoryService#commit}.
+ * 
  * 1. Offer to save the model
- * 2. Create Grafico files from the model
- * 3. Check if there is anything to Commit
- * 4. Show Commit dialog
- * 5. Commit
+ * 2. Show Commit dialog to get message
+ * 3. Delegate to RepositoryService.commit() (export + stage + commit)
  * 
  * @author Jean-Baptiste Sarrodie
  * @author Phillip Beauvoir
  */
 public class CommitModelAction extends AbstractModelAction {
+    
+    private final RepositoryService repositoryService = new RepositoryService();
     
     public CommitModelAction(IWorkbenchWindow window) {
         super(window);
@@ -55,7 +61,7 @@ public class CommitModelAction extends AbstractModelAction {
             }
         }
 
-        // Do the Grafico Export first
+        // Export to GRAFICO and stage changes (so the dialog can show a change summary)
         try {
             getRepository().exportModelToGraficoFiles();
         }
@@ -64,11 +70,21 @@ public class CommitModelAction extends AbstractModelAction {
             return;
         }
         
-        // Then Commit
         try {
             if(getRepository().hasChangesToCommit()) {
-                if(offerToCommitChanges()) {
-                    notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
+                // Show commit dialog to get message and amend flag
+                CommitDialog commitDialog = new CommitDialog(fWindow.getShell(), getRepository());
+                if(commitDialog.open() == Window.OK) {
+                    String commitMessage = commitDialog.getCommitMessage();
+                    boolean amend = commitDialog.getAmend();
+                    
+                    // Delegate commit to service (handles staging + commit + checksum)
+                    CommitResult result = repositoryService.commitChanges(
+                            getRepository(), commitMessage, amend);
+                    
+                    if(result.status() == CommitResult.Status.COMMITTED) {
+                        notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
+                    }
                 }
                 else {
                     // User cancelled commit dialog - reset staged changes

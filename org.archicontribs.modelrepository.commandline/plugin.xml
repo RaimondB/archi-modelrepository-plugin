@@ -19,5 +19,14 @@
             name="Save Collaboration Model">
       </commandlineProvider>
    </extension>
+   <extension
+         point="com.archimatetool.commandline.commandlineProvider">
+      <commandlineProvider
+            class="org.archicontribs.modelrepository.commandline.CommitModelProvider"
+            description="Export the active model to GRAFICO files and commit changes to the local repository"
+            id="org.archicontribs.modelrepository.commandlineCommitModel"
+            name="Commit Collaboration Model">
+      </commandlineProvider>
+   </extension>
 
 </plugin>

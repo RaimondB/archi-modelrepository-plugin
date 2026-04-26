@@ -285,3 +285,32 @@ The most critical lesson: **Use `exportModel()`'s return value** to detect chang
 
 Why? `hasChangesToCommit()` checks git status, which only shows changes after they're staged. The exporter tracks written/deleted files internally and returns `true` if any work was done.
 
+## Architecture Rules
+
+Read [ARCHITECTURE.md](../ARCHITECTURE.md) for the full picture. Key rules:
+
+1. **Service Layer**: All git/model workflow logic goes through `RepositoryService` in the `services/` package.
+   Action classes in `actions/` are UI-only wrappers — they collect input, show progress, delegate to the service, and display results.
+
+2. **No UI in Core**: Classes in `grafico/`, `services/`, and `authentication/` must NEVER import SWT, JFace, or `PlatformUI`.
+
+3. **Strategy Pattern for UI Decisions**: When an operation needs user input (conflict resolution, folder move choice), accept a strategy interface. Never call `Display.syncExec()` from the service layer.
+
+4. **CLI Parity**: Every `RepositoryService` method should have a corresponding CLI command in the `commandline` plugin.
+   When adding a new operation: service method → UI action → CLI command → test.
+
+5. **NLS**: All user-visible strings go in `messages.properties`. Use `NLS.bind()` for parameterized messages.
+
+### Adding a New Operation
+
+1. Add method to `RepositoryService` (must be headless-safe — no SWT imports)
+2. Add NLS message strings
+3. Create or update UI action wrapper in `actions/`
+4. Add CLI command provider in the `commandline` plugin
+5. Add unit test for the service method
+6. Update `ARCHITECTURE.md` if the change affects the overall structure
+
+## Architecture Decision Records
+
+Design decisions are recorded in [docs/adr/](../docs/adr/). When making a non-obvious design choice, create a new ADR using the template. Reference related ADRs in code comments when the "why" isn't obvious.
+
