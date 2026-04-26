@@ -10,6 +10,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.security.GeneralSecurityException;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
@@ -126,8 +127,8 @@ public class FetchJob extends Job {
             cancel();
         });
 
-        // Don't start if we don't have primary password set
-        if(!EncryptedCredentialsStorage.isPrimaryKeySet()) {
+        // Don't start if we don't have primary password set (not needed for GCM)
+        if(!CredentialsAuthenticator.isPrimaryKeyReady()) {
             disablePreference();
         }
         else {
@@ -139,9 +140,9 @@ public class FetchJob extends Job {
     }
     
     private void start() {
-        // Password primary key not set
+        // Password primary key not set (not needed for GCM)
         try {
-            if(!EncryptedCredentialsStorage.checkPrimaryKeySet()) {
+            if(!CredentialsAuthenticator.checkPrimaryKeyIfNeeded()) {
                 disablePreference();
                 return;
             }
@@ -177,9 +178,7 @@ public class FetchJob extends Job {
                 String url = repo.getOnlineRepositoryURL();
                 
                 if(GraficoUtils.isHTTP(url)) {
-                    // Get credentials. In some public repos we can still fetch without needing a password so we try anyway
-                    EncryptedCredentialsStorage cs = EncryptedCredentialsStorage.forRepository(repo);
-                    npw = cs.getUsernamePassword();
+                    npw = CredentialsAuthenticator.getNonInteractiveCredentials(url, repo);
                 }
 
                 // Update ProxyAuthenticator
@@ -192,7 +191,8 @@ public class FetchJob extends Job {
                 needsRefresh = true;
                 
                 // Remote branches might have been deleted or added
-                if(!fetchResult.getTrackingRefUpdates().isEmpty() && !fViewer.getControl().isDisposed()) {
+                // fetchResult is null when native git handled the fetch — assume refs may have changed
+                if((fetchResult == null || !fetchResult.getTrackingRefUpdates().isEmpty()) && !fViewer.getControl().isDisposed()) {
                     fViewer.getControl().getDisplay().asyncExec(() -> {
                         RepositoryListenerManager.INSTANCE.fireRepositoryChangedEvent(IRepositoryListener.BRANCHES_CHANGED, repo);
                     });

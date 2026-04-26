@@ -7,18 +7,17 @@ package org.archicontribs.modelrepository.actions;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.util.concurrent.CancellationException;
 
-import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
 import org.archicontribs.modelrepository.dialogs.CommitDialog;
 import org.archicontribs.modelrepository.dialogs.ErrorMessageDialog;
 import org.archicontribs.modelrepository.dialogs.UserNamePasswordDialog;
-import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.archicontribs.modelrepository.grafico.RepositoryListenerManager;
-import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.window.Window;
@@ -150,30 +149,34 @@ public abstract class AbstractModelAction extends Action implements IGraficoMode
     }
     
     /**
-     * Get user name and password from credentials file if prefs set or from dialog
+     * Get user name and password for the current repository's remote URL.
+     * <ul>
+     *   <li>SSH → returns {@code null} (SSH agent handles auth)</li>
+     *   <li>GCM → returns credentials from Git Credential Manager (may be {@code null})</li>
+     *   <li>HTTP+PAT → returns stored credentials, or prompts the user via dialog</li>
+     * </ul>
+     * 
+     * @return credentials, or {@code null} when no credentials are needed (SSH/GCM)
+     * @throws CancellationException if the user cancels the credentials dialog
      */
     protected UsernamePassword getUsernamePassword() throws IOException, GeneralSecurityException {
-        // SSH
-        if(GraficoUtils.isSSH(getRepository().getOnlineRepositoryURL())) {
-            return null;
+        String url = getRepository().getOnlineRepositoryURL();
+        
+        // Try non-interactive credentials first (SSH → null, GCM → git credential fill, PAT → stored)
+        UsernamePassword npw = CredentialsAuthenticator.getNonInteractiveCredentials(url, getRepository());
+        if(npw != null || !CredentialsAuthenticator.requiresExplicitCredentials(url)) {
+            return npw;
         }
         
-        boolean doStoreInCredentialsFile = ModelRepositoryPlugin.getInstance().getPreferenceStore().getBoolean(IPreferenceConstants.PREFS_STORE_REPO_CREDENTIALS);
-        
+        // HTTP+PAT with no stored credentials — ask the user
         EncryptedCredentialsStorage cs = EncryptedCredentialsStorage.forRepository(getRepository());
-
-        // Is it stored?
-        if(doStoreInCredentialsFile && cs.hasCredentialsFile()) {
-            return cs.getUsernamePassword();
-        }
-        
-        // Else ask the user
         UserNamePasswordDialog dialog = new UserNamePasswordDialog(fWindow.getShell(), cs);
         if(dialog.open() == Window.OK) {
             return new UsernamePassword(dialog.getUsername(), dialog.getPassword());
         }
 
-        return null;
+        // User cancelled the dialog
+        throw new CancellationException();
     }
     
     /**

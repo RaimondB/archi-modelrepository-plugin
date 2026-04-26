@@ -105,12 +105,41 @@ public class ArchiRepository implements IArchiRepository {
     /**
      * Check whether native git optimizations are enabled.
      * Controlled by the {@code useNativeGit} preference (default: true).
-     * Can be set in Archi.ini / plugin_customization.ini as:
+     * 
+     * Can be set as a JVM system property in Archi.ini:
+     *   -Dorg.archicontribs.modelrepository/useNativeGit=false
+     * 
+     * Or as a plugin preference in plugin_customization.ini:
      *   org.archicontribs.modelrepository/useNativeGit=false
+     * 
+     * The system property takes precedence over the preference store.
      */
     public static boolean isNativeGitEnabled() {
+        // Check system property first (set via -D in Archi.ini)
+        String sysProp = System.getProperty("org.archicontribs.modelrepository/" + IPreferenceConstants.PREFS_USE_NATIVE_GIT); //$NON-NLS-1$
+        if(sysProp != null) {
+            return Boolean.parseBoolean(sysProp);
+        }
+        
         return ModelRepositoryPlugin.getInstance().getPreferenceStore()
                 .getBoolean(IPreferenceConstants.PREFS_USE_NATIVE_GIT);
+    }
+    
+    /**
+     * Check whether native git should be used for a remote operation on the given URL.
+     * Native git is used when:
+     * - Native git is enabled AND the repo is SSH (native git handles SSH agent/keys)
+     * - OR the repo is HTTP and GCM auth is selected (native git delegates to GCM)
+     * 
+     * @param repoURL the repository URL
+     * @return true if native git should handle this remote operation
+     */
+    public static boolean shouldUseNativeGitForRemote(String repoURL) {
+        if(GraficoUtils.isSSH(repoURL)) {
+            return isNativeGitEnabled();
+        }
+        // HTTP: use native git only when GCM is the selected auth method
+        return CredentialsAuthenticator.isGCMAuthEnabled();
     }
 
     @Override
@@ -238,9 +267,8 @@ public class ArchiRepository implements IArchiRepository {
     
     @Override
     public void cloneModel(String repoURL, UsernamePassword npw, ProgressMonitor monitor) throws GitAPIException, IOException {
-        // Try native Git for SSH repositories (faster and credentials handled by SSH agent/config)
-        // For HTTPS, we need JGit's credential handling
-        boolean useNativeGit = isNativeGitEnabled() && GraficoUtils.isSSH(repoURL);
+        // Try native Git when SSH (faster, SSH agent handles auth) or when GCM handles HTTPS auth
+        boolean useNativeGit = shouldUseNativeGitForRemote(repoURL);
         
         if(useNativeGit) {
             try {
@@ -268,6 +296,26 @@ public class ArchiRepository implements IArchiRepository {
 
     @Override
     public Iterable<PushResult> pushToRemote(UsernamePassword npw, ProgressMonitor monitor) throws IOException, GitAPIException {
+        // Try native git for SSH or GCM-authenticated HTTPS repos
+        if(shouldUseNativeGitForRemote(getOnlineRepositoryURL())) {
+            try {
+                boolean success = tryNativeGitPush();
+                if(success) {
+                    // After a successful push, ensure we are tracking the current branch
+                    try(Git git = Git.open(getLocalRepositoryFolder())) {
+                        setTrackedBranch(git.getRepository(), git.getRepository().getBranch());
+                    }
+                    invalidateBranchStatusCache();
+                    // Return null to indicate native git handled it — callers must handle null
+                    return null;
+                }
+                // false = native git not available, fall through to JGit
+            }
+            catch(IOException ex) {
+                // Native git failed — fall through to JGit
+            }
+        }
+        
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             PushCommand pushCommand = git.push();
             pushCommand.setTransportConfigCallback(CredentialsAuthenticator.getTransportConfigCallback(getOnlineRepositoryURL(), npw));
@@ -341,6 +389,22 @@ public class ArchiRepository implements IArchiRepository {
     
     @Override
     public FetchResult fetchFromRemote(UsernamePassword npw, ProgressMonitor monitor, boolean isDryrun) throws IOException, GitAPIException {
+        // Try native git for SSH or GCM-authenticated HTTPS repos (faster, no JGit credential setup)
+        if(!isDryrun && shouldUseNativeGitForRemote(getOnlineRepositoryURL())) {
+            try {
+                boolean success = tryNativeGitFetch();
+                if(success) {
+                    invalidateBranchStatusCache();
+                    // Return null to indicate native git handled it — callers must handle null
+                    return null;
+                }
+                // false = native git not available, fall through to JGit
+            }
+            catch(IOException ex) {
+                // Native git failed with an error — fall through to JGit
+            }
+        }
+        
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             // Check and set tracked master branch
             setTrackedBranch(git.getRepository(), IGraficoConstants.MASTER);
@@ -1364,6 +1428,93 @@ public class ArchiRepository implements IArchiRepository {
         catch(InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new IOException("Git clone interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for fetching from remote.
+     * Native git delegates authentication to Git Credential Manager (GCM) or SSH agent,
+     * and is significantly faster than JGit for large repositories.
+     * 
+     * @return true if native Git fetch succeeded, false if native Git is not available
+     * @throws IOException if the fetch command failed (authentication error, network error, etc.)
+     */
+    private boolean tryNativeGitFetch() throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "fetch", "--prune"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git fetch failed (exit " + exitCode + "): " + output.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return false; // Native Git not available
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git fetch interrupted", ex); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Low-level method: Try to use native Git for pushing to remote.
+     * Native git delegates authentication to Git Credential Manager (GCM) or SSH agent.
+     * 
+     * @return true if native Git push succeeded, false if native Git is not available
+     * @throws IOException if the push command failed (authentication error, rejected push, etc.)
+     */
+    private boolean tryNativeGitPush() throws IOException {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "push"); //$NON-NLS-1$ //$NON-NLS-2$
+            pb.directory(getLocalRepositoryFolder());
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            StringBuilder output = new StringBuilder();
+            try(BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while((line = reader.readLine()) != null) {
+                    output.append(line).append("\n"); //$NON-NLS-1$
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if(exitCode != 0) {
+                throw new IOException("Git push failed (exit " + exitCode + "): " + output.toString()); //$NON-NLS-1$ //$NON-NLS-2$
+            }
+            
+            return true;
+        }
+        catch(IOException ex) {
+            String message = ex.getMessage();
+            if(message != null && (message.contains("Cannot run program") || message.contains("not found"))) { //$NON-NLS-1$ //$NON-NLS-2$
+                return false; // Native Git not available
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git push interrupted", ex); //$NON-NLS-1$
         }
     }
     

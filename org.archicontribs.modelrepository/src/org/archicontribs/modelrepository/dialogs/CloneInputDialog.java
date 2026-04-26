@@ -6,8 +6,8 @@
 package org.archicontribs.modelrepository.dialogs;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
-import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
 import org.eclipse.jface.dialogs.IMessageProvider;
 import org.eclipse.jface.dialogs.TitleAreaDialog;
@@ -72,10 +72,11 @@ public class CloneInputDialog extends TitleAreaDialog {
         txtURL.addModifyListener(new ModifyListener() {
             @Override
             public void modifyText(ModifyEvent e) {
-                boolean isHTTP = GraficoUtils.isHTTP(txtURL.getText());
-                txtUsername.setEnabled(isHTTP);
-                txtPassword.setEnabled(isHTTP);
-                storeCredentialsButton.setEnabled(isHTTP);
+                // HTTP fields only needed when using PAT auth (not SSH, not GCM)
+                boolean needsCredentials = CredentialsAuthenticator.requiresExplicitCredentials(txtURL.getText());
+                txtUsername.setEnabled(needsCredentials);
+                txtPassword.setEnabled(needsCredentials);
+                storeCredentialsButton.setEnabled(needsCredentials);
             }
         });
         

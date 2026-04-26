@@ -33,4 +33,33 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Include performance tests: mvn verify -Dinclude.perf.tests=true -->
+        <profile>
+            <id>perf-tests</id>
+            <activation>
+                <property>
+                    <name>include.perf.tests</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.eclipse.tycho</groupId>
+                        <artifactId>tycho-surefire-plugin</artifactId>
+                        <version>${tycho-version}</version>
+                        <configuration>
+                            <useUIHarness>false</useUIHarness>
+                            <useUIThread>false</useUIThread>
+                            <includes>
+                                <include>**/AllTestsWithPerformance.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

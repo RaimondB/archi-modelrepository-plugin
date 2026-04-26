@@ -7,14 +7,13 @@ package org.archicontribs.modelrepository.actions;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.util.concurrent.CancellationException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
-import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
-import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -63,18 +62,13 @@ public class DeleteBranchAction extends AbstractModelAction {
             boolean deleteRemote = branchInfo.hasRemoteRef() || branchInfo.isRemote();
             
             if(deleteRemote) {
-                // Check primary key set
-                if(!EncryptedCredentialsStorage.checkPrimaryKeySet()) {
+                // Check primary key set (only needed for PAT auth, not GCM)
+                if(!CredentialsAuthenticator.checkPrimaryKeyIfNeeded()) {
                     return;
                 }
                 
-                // Get for this before opening the progress dialog
-                // UsernamePassword will be null if using SSH
+                // Get credentials before opening the progress dialog
                 UsernamePassword npw = getUsernamePassword();
-                // User cancelled on HTTP
-                if(npw == null && GraficoUtils.isHTTP(getRepository().getOnlineRepositoryURL())) {
-                    return;
-                }
                 
                 Exception[] exception = new Exception[1];
                 
@@ -110,6 +104,9 @@ public class DeleteBranchAction extends AbstractModelAction {
             else {
                 deleteLocalBranch(branchInfo);
             }
+        }
+        catch(CancellationException ex) {
+            // User cancelled the credentials dialog
         }
         catch(GeneralSecurityException ex) {
             displayCredentialsErrorDialog(ex);

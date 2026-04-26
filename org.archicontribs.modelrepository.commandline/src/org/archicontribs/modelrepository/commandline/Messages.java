@@ -42,6 +42,10 @@ public class Messages extends NLS {
 
     public static String LoadModelFromRepositoryProvider_24;
     
+    public static String LoadModelFromRepositoryProvider_25;
+
+    public static String LoadModelFromRepositoryProvider_26;
+    
     public static String LoadModelFromRepositoryProvider_3;
 
     public static String LoadModelFromRepositoryProvider_4;

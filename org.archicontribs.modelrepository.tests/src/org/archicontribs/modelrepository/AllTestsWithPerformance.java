@@ -12,17 +12,13 @@ import org.archicontribs.modelrepository.grafico.GraficoModelLoaderTests;
 import org.archicontribs.modelrepository.grafico.GraficoUtilsTests;
 import org.archicontribs.modelrepository.grafico.RemoteIntegrationTests;
 import org.archicontribs.modelrepository.merge.MergeConflictHandlerTests;
-import org.junit.platform.suite.api.ExcludeTags;
 import org.junit.platform.suite.api.SelectClasses;
 import org.junit.platform.suite.api.Suite;
 import org.junit.platform.suite.api.SuiteDisplayName;
 
 /**
- * Default test suite — excludes performance tests for fast build cycles.
- * Run with: mvn verify
- * 
- * To include performance tests: mvn verify -Dinclude.perf.tests=true
- * (This switches to AllTestsWithPerformance suite via Maven profile)
+ * Full test suite including performance tests.
+ * Run with: mvn verify -Dinclude.perf.tests=true
  */
 @Suite
 @SelectClasses({
@@ -33,7 +29,6 @@ import org.junit.platform.suite.api.SuiteDisplayName;
     MergeConflictHandlerTests.class,
     RemoteIntegrationTests.class
 })
-@ExcludeTags("performance")
-@SuiteDisplayName("All Model Repository Tests")
-public class AllTests {
+@SuiteDisplayName("All Model Repository Tests (including performance)")
+public class AllTestsWithPerformance {
 }

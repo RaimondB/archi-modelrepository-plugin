@@ -24,6 +24,7 @@ import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import com.archimatetool.editor.utils.FileUtils;
@@ -33,8 +34,12 @@ import com.archimatetool.editor.utils.FileUtils;
  * using a bare repository as the "remote" and local clones to represent
  * different users. This exercises the full push/fetch/merge/cross-path-detection
  * workflow that runs during Refresh Model and Publish Model actions.
+ * 
+ * Tagged as "performance" because these tests do heavy git I/O (clone, fetch, merge).
+ * Excluded from default build; run with: mvn verify -Dinclude.perf.tests=true
  */
 @SuppressWarnings("nls")
+@Tag("performance")
 public class RemoteIntegrationTests {
 
     private static final String NS = "xmlns:archimate=\"http://www.archimatetool.com/archimate\"";

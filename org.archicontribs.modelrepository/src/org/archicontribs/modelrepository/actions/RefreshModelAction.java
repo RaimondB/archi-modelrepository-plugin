@@ -8,12 +8,13 @@ package org.archicontribs.modelrepository.actions;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.security.GeneralSecurityException;
+import java.util.concurrent.CancellationException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
-import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
@@ -90,18 +91,13 @@ public class RefreshModelAction extends AbstractModelAction {
                 return;
             }
             
-            // Check primary key set
-            if(!EncryptedCredentialsStorage.checkPrimaryKeySet()) {
+            // Check primary key set (only needed for PAT auth, not GCM)
+            if(!CredentialsAuthenticator.checkPrimaryKeyIfNeeded()) {
                 return;
             }
 
-            // Get this before opening the progress dialog
-            // UsernamePassword will be null if using SSH
+            // Get credentials before opening the progress dialog
             UsernamePassword npw = getUsernamePassword();
-            // User cancelled on HTTP
-            if(npw == null && GraficoUtils.isHTTP(getRepository().getOnlineRepositoryURL())) {
-                return;
-            }
 
             // Do main action with PM dialog — run on background thread (true)
             ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
@@ -149,6 +145,9 @@ public class RefreshModelAction extends AbstractModelAction {
                     }
                 }
             });
+        }
+        catch(CancellationException ex) {
+            // User cancelled the credentials dialog
         }
         catch(GeneralSecurityException ex) {
             displayCredentialsErrorDialog(ex);
@@ -223,7 +222,8 @@ public class RefreshModelAction extends AbstractModelAction {
         }
         logPerf("fetchFromRemote", phaseStart); //$NON-NLS-1$
         
-        boolean newTrackingRefUpdates = fetchResult != null && !fetchResult.getTrackingRefUpdates().isEmpty();
+        // fetchResult is null when native git handled the fetch — assume refs may have changed
+        boolean newTrackingRefUpdates = fetchResult == null || !fetchResult.getTrackingRefUpdates().isEmpty();
         
         // Phase 2: Determine if merge is needed
         phaseStart = System.nanoTime();

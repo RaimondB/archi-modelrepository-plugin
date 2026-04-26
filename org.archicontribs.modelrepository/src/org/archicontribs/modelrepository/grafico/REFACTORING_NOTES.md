@@ -771,6 +771,434 @@ The 20s floor is caused by per-file metadata overhead. Possible solutions:
 
 ---
 
+## ArchiRepository as Single Gateway for All Git Operations
+
+### The Problem
+
+Before refactoring, native git calls were scattered across multiple classes:
+- `SwitchBranchAction` had its own `tryNativeGitCheckout()`
+- `RefreshModelAction` called native merge directly
+- `MergeConflictHandler` called native `git add` for path staging
+- Each caller duplicated the try-native/fallback-JGit pattern and state sync
+
+This created multiple problems:
+1. Every new native git optimization required changes in multiple files
+2. JGit state synchronization was easy to forget (stale UI after native ops)
+3. Testing required mocking native git in each caller
+
+### Solution
+
+**All git operations are encapsulated in `ArchiRepository`.** Callers use high-level
+methods and never know whether native git or JGit is used underneath.
+
+```java
+// ✅ CORRECT: Caller doesn't know about native git
+MergeResult result = ((ArchiRepository) getRepository()).merge(remoteBranch);
+
+// ❌ WRONG: Caller manages native/JGit switching
+Boolean nativeResult = tryNativeGitMerge(remoteBranch);
+if (Boolean.TRUE.equals(nativeResult)) { ... }
+else if (Boolean.FALSE.equals(nativeResult)) { abortNativeMerge(); }
+// fall through to JGit...
+```
+
+### Key Methods
+
+| Public Method | Internal Native Method | Fallback |
+|--------------|----------------------|----------|
+| `merge(remoteBranch)` | `tryNativeGitMerge` | JGit `MergeCommand` |
+| `checkoutBranch(name)` | `tryNativeGitCheckout` | JGit `CheckoutCommand` |
+| `gitAddPaths(paths)` | `tryNativeGitAddPaths` | JGit `AddCommand` + `RmCommand` |
+| `resetToRef(ref, type)` | `tryNativeGitReset` | JGit `ResetCommand` |
+| `commitChanges(...)` | `tryNativeGitAdd` (internal) | JGit `AddCommand` |
+| `cloneModel(...)` | `tryNativeGitClone` (SSH only) | JGit `CloneCommand` |
+| `collectDeletedElementIds(...)` | `collectDeletedIdsNative` | `collectDeletedIdsJGit` |
+
+### Where This Applies
+
+- `RefreshModelAction.pull()` — calls `archiRepo.merge(remoteBranch)`
+- `MergeConflictHandler.stageMoveGroupPaths()` — calls `archiRepo.gitAddPaths(paths)`
+- `MergeConflictHandler.resolveMoveResolvedElements()` — calls `archiRepo.gitAddPaths(paths)`
+- `MergeConflictHandler.detectAndRemoveCrossPathDeletions()` — calls `ArchiRepository.collectDeletedElementIds()`
+- `SwitchBranchAction` — calls `archiRepo.checkoutBranch(name)`
+- Any future code that needs git operations
+
+### Why This Matters
+
+If we later optimize `git fetch`, `git push`, or any other operation with native git,
+**every caller benefits automatically** — no changes needed outside ArchiRepository.
+
+---
+
+## useNativeGit Preference: System Property Precedence
+
+### The Problem
+
+The `useNativeGit` preference was only read from the Eclipse preference store. When
+set as a system property in `Archi.ini` (`-Dorg.archicontribs.modelrepository/useNativeGit=false`),
+it was ignored because the preference store always returned the default `true`.
+
+### Solution
+
+`isNativeGitEnabled()` checks the system property first, then falls back to the
+preference store:
+
+```java
+public static boolean isNativeGitEnabled() {
+    String sysProp = System.getProperty(
+        "org.archicontribs.modelrepository/" + IPreferenceConstants.PREFS_USE_NATIVE_GIT);
+    if (sysProp != null) {
+        return Boolean.parseBoolean(sysProp);
+    }
+    return ModelRepositoryPlugin.getInstance().getPreferenceStore()
+            .getBoolean(IPreferenceConstants.PREFS_USE_NATIVE_GIT);
+}
+```
+
+This allows quick toggling for performance comparison without modifying saved preferences.
+
+### Where This Applies
+
+- `ArchiRepository.isNativeGitEnabled()` — the single check point
+- Archi.ini — add `-Dorg.archicontribs.modelrepository/useNativeGit=false` to disable
+
+---
+
+## Performance Test Separation
+
+### The Problem
+
+`RemoteIntegrationTests` (6 tests) exercise full git clone/fetch/merge workflows.
+They are I/O-heavy and slow. Running them on every build wastes developer time.
+
+### Solution
+
+JUnit 5 `@Tag("performance")` on `RemoteIntegrationTests`, excluded by default
+in `AllTests` via `@ExcludeTags("performance")`.
+
+```bash
+# Fast build (80 tests, excludes integration):
+mvn verify
+
+# Full build (86 tests, includes integration):
+mvn verify -Dinclude.perf.tests=true
+```
+
+Implementation:
+- `RemoteIntegrationTests` — `@Tag("performance")` at class level
+- `AllTests` — `@ExcludeTags("performance")` (default suite)
+- `AllTestsWithPerformance` — no tag exclusion (full suite)
+- `tests/pom.xml` — `perf-tests` Maven profile switches to full suite
+
+### Where This Applies
+
+- `AllTests.java` — default suite entry point
+- `AllTestsWithPerformance.java` — full suite entry point
+- `org.archicontribs.modelrepository.tests/pom.xml` — profile configuration
+- Future slow/integration tests should use `@Tag("performance")`
+
+---
+
+## UI Responsiveness: Moving Git I/O Off the UI Thread
+
+### The Problem
+
+Eclipse SWT is single-threaded — all UI updates must run on the display thread. Git
+operations (`getBranchStatus()`, `getCommits()`, `isHeadAndRemoteSame()`) can take
+100ms–500ms each. If called directly from selection handlers or event listeners, the
+UI freezes visibly.
+
+Symptoms observed before the fix:
+- Clicking a repository in the tree caused a 200–500ms freeze
+- Branch list flickered or showed stale data
+- Action buttons (Undo, Reset) were slow to update or showed wrong state
+- History view lagged behind branch switches
+
+### Solution: Background Thread + asyncExec Pattern
+
+Every view follows the same pattern:
+
+```java
+// ❌ WRONG: Git I/O on UI thread → UI freezes
+@Override
+public void selectionChanged(IWorkbenchPart part, ISelection selection) {
+    BranchStatus status = repo.getBranchStatus();  // 200ms+ on UI thread!
+    viewer.setInput(status);
+}
+
+// ✅ CORRECT: Git I/O on background thread, UI update via asyncExec
+@Override
+public void selectionChanged(IWorkbenchPart part, ISelection selection) {
+    Thread.ofVirtual().name("View-Load").start(() -> {
+        BranchStatus status = repo.getBranchStatus();  // Background thread
+        display.asyncExec(() -> {
+            if (!control.isDisposed() && repo.equals(fSelectedRepository)) {
+                viewer.setInput(status);  // UI thread
+            }
+        });
+    });
+}
+```
+
+### Where This Pattern Is Applied
+
+| View / Component | Background Work | UI Callback |
+|-----------------|----------------|-------------|
+| `ModelRepositoryTreeViewer` | `updateStatusCache()` — parallel status for all repos | `refresh()` |
+| `BranchesView.selectionChanged` | `getBranchStatus()` | `doSetInput(repo, branchStatus)` |
+| `BranchesView.repositoryChanged` | `getBranchStatus()` | `doSetInput(repo, branchStatus)` |
+| `HistoryTableViewer` | `getCommits()` — RevWalk up to 500 commits | `setInput(commits)` |
+| `HistoryView.recomputeActionStates` | `resolve(HEAD)`, `isHeadAndRemoteSame()` | `updateActions()` |
+
+---
+
+## Stale Background Result Prevention
+
+### The Problem
+
+When a user clicks rapidly between repositories, multiple background threads can be
+in flight simultaneously. If an older thread delivers its result after a newer one,
+the UI shows stale data for the wrong repository.
+
+### Solution: Thread Reference Guard
+
+Track the current background thread. When the asyncExec callback fires, check whether
+the thread is still the current one:
+
+```java
+// In HistoryTableViewer:
+private final AtomicReference<Thread> fCurrentLoadThread = new AtomicReference<>();
+
+private void loadCommitsInBackground(IArchiRepository archiRepo) {
+    Thread loadThread = Thread.ofVirtual().start(() -> {
+        Thread thisThread = Thread.currentThread();
+        List<RevCommit> commits = getCommits(archiRepo);
+        
+        display.asyncExec(() -> {
+            // Discard if a newer load was started
+            if (fCurrentLoadThread.get() != thisThread) {
+                return;  // Stale — discard
+            }
+            setInput(commits);
+        });
+    });
+    fCurrentLoadThread.set(loadThread);  // Replaces reference to old thread
+}
+```
+
+For views that also want to cancel the old thread (stop wasted work):
+
+```java
+// In BranchesView:
+Thread oldThread = fCurrentLoadThread;
+if (oldThread != null) {
+    oldThread.interrupt();  // Cancel stale background work
+}
+fCurrentLoadThread = newThread;
+```
+
+### Where This Applies
+
+- `HistoryTableViewer.loadCommitsInBackground()` — `AtomicReference<Thread>` guard
+- `BranchesView.selectionChanged()` / `repositoryChanged()` — interrupt + replace
+- `ModelRepositoryTreeViewer.refreshStatusCacheInBackground()` — interrupt + replace
+- `HistoryView` — interrupt stale thread on `selectionChanged`, `HISTORY_CHANGED`, `BRANCHES_CHANGED`
+
+---
+
+## BranchStatus TTL Cache
+
+### The Problem
+
+`getBranchStatus()` creates a `BranchStatus` object which does a full RevWalk to compute
+branch info and merge status. Multiple views call this within milliseconds of each other
+(tree viewer, branches view, history view all respond to the same event). Without caching,
+the same expensive computation runs 3–4 times.
+
+### Solution
+
+`ArchiRepository` caches the result for 2 seconds:
+
+```java
+private volatile BranchStatus fCachedBranchStatus;
+private volatile long fBranchStatusTimestamp;
+private static final long BRANCH_STATUS_TTL_NANOS = 2_000_000_000L; // 2 seconds
+
+public BranchStatus getBranchStatus() throws IOException, GitAPIException {
+    long now = System.nanoTime();
+    BranchStatus cached = fCachedBranchStatus;
+    if (cached != null && (now - fBranchStatusTimestamp) < BRANCH_STATUS_TTL_NANOS) {
+        return cached;
+    }
+    BranchStatus fresh = new BranchStatus(this);
+    fCachedBranchStatus = fresh;
+    fBranchStatusTimestamp = System.nanoTime();
+    return fresh;
+}
+```
+
+**Cache invalidation**: `invalidateBranchStatusCache()` is called after every mutation
+(commit, push, pull, merge, checkout, reset). This forces the next call to recompute.
+
+### Why 2 Seconds?
+
+- Multiple views respond to the same event within ~50ms of each other
+- 2s is long enough to serve all views from one computation
+- Short enough that manual user actions always get fresh data
+
+---
+
+## O(N²) → O(N) Branch Merge Status
+
+### The Problem
+
+The old `BranchStatus` computed "is branch merged?" by doing a separate RevWalk for
+each branch against each other branch. With N branches, this is O(N²) RevWalks.
+For repositories with 20+ branches, this caused multi-second delays.
+
+### Solution
+
+`computeMergedStatus()` uses `RevWalkUtils.findBranchesReachableFrom()` in a single
+pass per branch (O(N) total):
+
+```java
+// Single RevWalk, reused across all branches
+try (RevWalk revWalk = new RevWalk(repository)) {
+    for (BranchInfo info : infos.values()) {
+        List<Ref> otherRefs = allRefs.stream()
+            .filter(r -> !r.getTarget().getName().equals(info.getFullName()))
+            .collect(toList());
+        
+        List<Ref> reachable = RevWalkUtils.findBranchesReachableFrom(
+            revWalk.parseCommit(branchHead), revWalk, otherRefs);
+        info.setMerged(!reachable.isEmpty());
+        revWalk.reset();
+    }
+}
+```
+
+### Where This Applies
+
+- `BranchStatus.computeMergedStatus()` — the single O(N) implementation
+
+---
+
+## Action State Caching (HistoryView)
+
+### The Problem
+
+`UndoLastCommitAction` and `ResetToRemoteCommitAction` need git I/O to determine
+their enabled state (`isHeadAndRemoteSame()`, commit count check). If `updateActions()`
+is called on the UI thread (e.g., on every selection change), each action check blocks
+the UI.
+
+### Solution: Background Computation + Cached States
+
+Action states are computed once on a background thread and cached. The UI thread
+`updateActions()` reads only cached values — zero git I/O:
+
+```java
+// Cached states (set by background thread)
+private volatile ObjectId fCachedHeadId;
+private volatile boolean fCachedUndoEnabled;
+private volatile boolean fCachedResetEnabled;
+
+// Called from background thread after loading branch data
+private void recomputeActionStates(IArchiRepository repo, BranchStatus branchStatus) {
+    // ... git I/O to compute headId, undoEnabled, resetEnabled ...
+    fCachedHeadId = headId;
+    fCachedUndoEnabled = undoEnabled;
+    fCachedResetEnabled = resetEnabled;
+    
+    display.asyncExec(() -> updateActions());  // Uses cached values
+}
+
+// Called on UI thread — zero git I/O
+private void updateActions() {
+    fActionRestoreCommit.setEnabled(commit != null && !commit.getId().equals(fCachedHeadId));
+    fActionUndoLastCommit.setEnabled(fCachedUndoEnabled);
+    fActionResetToRemoteCommit.setEnabled(fCachedResetEnabled);
+}
+```
+
+### Quiet Repository Set
+
+When actions are updated from a background thread, use `setRepositoryQuiet()` to
+set the repository reference without triggering `shouldBeEnabled()` (which would
+do git I/O on the calling thread):
+
+```java
+// ✅ CORRECT: Quiet set — no shouldBeEnabled() triggered
+fActionUndoLastCommit.setRepositoryQuiet(repo);
+fActionUndoLastCommit.setEnabled(cachedUndoEnabled);
+
+// ❌ WRONG: setRepository triggers shouldBeEnabled → git I/O on UI thread
+fActionUndoLastCommit.setRepository(repo);  // Calls shouldBeEnabled() internally!
+```
+
+### Where This Applies
+
+- `HistoryView.recomputeActionStates()` — background computation
+- `HistoryView.updateActions()` — UI thread consumer of cached states
+- `AbstractModelAction.setRepositoryQuiet()` — base class quiet setter
+
+---
+
+## Event Flow: Operation → View Update
+
+### The Complete Pipeline
+
+When an action (e.g., Refresh, Branch Switch) completes:
+
+```
+1. Action completes operation (merge, checkout, etc.)
+2. Action calls invalidateBranchStatusCache()
+3. Action calls notifyChangeListeners(BRANCHES_CHANGED / HISTORY_CHANGED)
+4. RepositoryListenerManager broadcasts to all registered views
+5. Each view receives repositoryChanged(eventName, repository)
+6. Each view spawns a background thread for git I/O
+7. Background thread computes data (getBranchStatus, getCommits, etc.)
+8. Background thread posts UI update via Display.asyncExec()
+9. UI thread applies update (setInput, refresh, updateActions)
+```
+
+### Critical Rules
+
+1. **Always invalidate cache before notifying listeners** — otherwise views get stale data
+2. **Never call `getBranchStatus()` on the UI thread** — always in background
+3. **Always guard asyncExec with disposed checks** — the view might have been closed
+4. **Always check for stale results in asyncExec** — a newer load might have started
+5. **Use `Display.syncExec()` only for final operations** (e.g., `saveChecksumAndNotifyListeners`)
+   that must complete before the caller continues
+
+### syncExec vs asyncExec
+
+| Method | When to Use |
+|--------|------------|
+| `asyncExec` | Fire-and-forget UI updates (view refresh, label text, action states) |
+| `syncExec` | Caller must wait for completion (saving state before listeners fire) |
+
+**Prefer `asyncExec`** — it doesn't block the background thread. Use `syncExec` only
+when the calling code depends on the UI operation having completed.
+
+---
+
+## Performance Logging: UIPerfLogger
+
+All UI-related timing is logged via `UIPerfLogger.log(tag, message, startNanos)`:
+
+```java
+long tBg = System.nanoTime();
+BranchStatus status = repo.getBranchStatus();
+UIPerfLogger.log("[BranchesView]", "getBranchStatus", tBg);
+// Output: [BranchesView] getBranchStatus: 153ms
+```
+
+This makes it easy to identify which operations are slow in the Archi log. The pattern
+is used consistently across all views and background operations.
+
+---
+
 ## Keeping This Document Updated
 
 **INSTRUCTION FOR AI ASSISTANTS AND DEVELOPERS:**

@@ -37,6 +37,9 @@ implements IPreferenceConstants {
 		store.setDefault(PREFS_SCAN_REPOSITORY_FOLDER, true);
 		store.setDefault(PREFS_STORE_REPO_CREDENTIALS, true);
 		
+		store.setDefault(PREFS_HTTP_AUTH_METHOD, HTTP_AUTH_PAT);
+		store.setDefault(PREFS_GCM_ONBOARDING_SHOWN, false);
+		
 		store.setDefault(PREFS_PROXY_USE, false);
 		store.setDefault(PREFS_PROXY_REQUIRES_AUTHENTICATION, false);
 		store.setDefault(PREFS_PROXY_PORT, 8088);

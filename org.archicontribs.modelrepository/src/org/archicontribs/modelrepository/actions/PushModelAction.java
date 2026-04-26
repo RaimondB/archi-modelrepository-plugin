@@ -8,12 +8,12 @@ package org.archicontribs.modelrepository.actions;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.security.GeneralSecurityException;
+import java.util.concurrent.CancellationException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
-import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
-import org.archicontribs.modelrepository.grafico.GraficoUtils;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.jface.dialogs.ProgressMonitorDialog;
 import org.eclipse.jface.operation.IRunnableWithProgress;
@@ -55,18 +55,13 @@ public class PushModelAction extends RefreshModelAction {
                 return;
             }
             
-            // Check primary key set
-            if(!EncryptedCredentialsStorage.checkPrimaryKeySet()) {
+            // Check primary key set (only needed for PAT auth, not GCM)
+            if(!CredentialsAuthenticator.checkPrimaryKeyIfNeeded()) {
                 return;
             }
             
-            // Get this before opening the progress dialog
-            // UsernamePassword is will be null if using SSH
+            // Get credentials before opening the progress dialog
             UsernamePassword npw = getUsernamePassword();
-            // User cancelled on HTTP
-            if(npw == null && GraficoUtils.isHTTP(getRepository().getOnlineRepositoryURL())) {
-                return;
-            }
 
             // Do main action with PM dialog — run on background thread (true)
             ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
@@ -87,9 +82,10 @@ public class PushModelAction extends RefreshModelAction {
                         if(status == PULL_STATUS_OK || status == PULL_STATUS_UP_TO_DATE) {
                             Iterable<PushResult> pushResult = push(npw, monitor);
                             
-                            // Get any errors in Push Results
+                            // Get any errors in Push Results (null when native git handled the push)
                             StringBuilder sb = new StringBuilder();
                             
+                            if(pushResult != null) {
                             pushResult.forEach(result -> {
                                 result.getRemoteUpdates().stream()
                                         .filter(update -> update.getStatus() != RemoteRefUpdate.Status.OK)
@@ -109,6 +105,7 @@ public class PushModelAction extends RefreshModelAction {
                                             }
                                         });
                             });
+                            } // end if(pushResult != null)
                             
                             if(sb.length() != 0) {
                                 Display.getDefault().syncExec(() -> {
@@ -145,6 +142,9 @@ public class PushModelAction extends RefreshModelAction {
                     }
                 }
             });
+        }
+        catch(CancellationException ex) {
+            // User cancelled the credentials dialog
         }
         catch(GeneralSecurityException ex) {
             displayCredentialsErrorDialog(ex);

@@ -25,6 +25,30 @@ public interface IPreferenceConstants {
     String PREFS_SSH_SCAN_DIR = "sshScanSshDir";
     String PREFS_STORE_REPO_CREDENTIALS = "storeCredentials";
     
+    /**
+     * HTTP authentication method: "httpPat" (default, backward-compatible) or "httpGcm" (Git Credential Manager).
+     * This only applies to HTTP/HTTPS repositories. SSH repositories always use SSH keys.
+     */
+    String PREFS_HTTP_AUTH_METHOD = "httpAuthMethod";
+    
+    /**
+     * Value for PREFS_HTTP_AUTH_METHOD: use username/password or personal access token (PAT) via JGit.
+     * This is the default and backward-compatible option.
+     */
+    String HTTP_AUTH_PAT = "httpPat";
+    
+    /**
+     * Value for PREFS_HTTP_AUTH_METHOD: use Git Credential Manager via native git.
+     * GCM handles OAuth, SSO, PAT caching, and browser-based authentication flows.
+     */
+    String HTTP_AUTH_GCM = "httpGcm";
+    
+    /**
+     * Whether the user has been asked about GCM onboarding.
+     * Set to true after the first-run GCM detection dialog, regardless of user choice.
+     */
+    String PREFS_GCM_ONBOARDING_SHOWN = "gcmOnboardingShown";
+    
     String PREFS_PROXY_USE = "proxyUse";
     String PREFS_PROXY_HOST = "proxyHost";
     String PREFS_PROXY_PORT = "proxyPort";

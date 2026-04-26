@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.security.GeneralSecurityException;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.GitCredentialManagerDetector;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
 import org.archicontribs.modelrepository.dialogs.NewPrimaryPasswordDialog;
 import org.archicontribs.modelrepository.grafico.GraficoUtils;
@@ -66,6 +67,10 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
     private Button fSSHScanDirButton;
     
     private Button fStoreCredentialsButton;
+    
+    private Button fHttpPatRadio;
+    private Button fHttpGcmRadio;
+    private Label fGcmStatusLabel;
     
     private Button fFetchInBackgroundButton;
     private Spinner fFetchInBackgroundIntervalSpinner;
@@ -239,10 +244,38 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
         httpGroup.setLayout(new GridLayout(1, false));
         httpGroup.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
 
+        fHttpPatRadio = new Button(httpGroup, SWT.RADIO);
+        fHttpPatRadio.setText(Messages.ModelRepositoryPreferencePage_27);
+        gd = new GridData(GridData.FILL_HORIZONTAL);
+        fHttpPatRadio.setLayoutData(gd);
+        fHttpPatRadio.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                updateHttpAuthControls();
+            }
+        });
+        
         fStoreCredentialsButton = new Button(httpGroup, SWT.CHECK);
         fStoreCredentialsButton.setText(Messages.ModelRepositoryPreferencePage_8);
         gd = new GridData(GridData.FILL_HORIZONTAL);
+        gd.horizontalIndent = 20;
         fStoreCredentialsButton.setLayoutData(gd);
+        
+        fHttpGcmRadio = new Button(httpGroup, SWT.RADIO);
+        fHttpGcmRadio.setText(Messages.ModelRepositoryPreferencePage_28);
+        gd = new GridData(GridData.FILL_HORIZONTAL);
+        fHttpGcmRadio.setLayoutData(gd);
+        fHttpGcmRadio.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                updateHttpAuthControls();
+            }
+        });
+        
+        fGcmStatusLabel = new Label(httpGroup, SWT.NULL);
+        gd = new GridData(GridData.FILL_HORIZONTAL);
+        gd.horizontalIndent = 20;
+        fGcmStatusLabel.setLayoutData(gd);
         
         
         
@@ -381,6 +414,16 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
         // Store HTTP details by default
         fStoreCredentialsButton.setSelection(getPreferenceStore().getBoolean(PREFS_STORE_REPO_CREDENTIALS));
         
+        // HTTP auth method
+        String httpAuthMethod = getPreferenceStore().getString(PREFS_HTTP_AUTH_METHOD);
+        boolean isGcm = HTTP_AUTH_GCM.equals(httpAuthMethod);
+        fHttpPatRadio.setSelection(!isGcm);
+        fHttpGcmRadio.setSelection(isGcm);
+        
+        // GCM status
+        updateGcmStatusLabel();
+        updateHttpAuthControls();
+        
         // Proxy details
         fUseProxyButton.setSelection(getPreferenceStore().getBoolean(PREFS_PROXY_USE));
         fProxyHostTextField.setText(getPreferenceStore().getString(PREFS_PROXY_HOST));
@@ -430,6 +473,8 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
         getPreferenceStore().setValue(PREFS_FETCH_IN_BACKGROUND_INTERVAL, fFetchInBackgroundIntervalSpinner.getSelection());
         
         getPreferenceStore().setValue(PREFS_STORE_REPO_CREDENTIALS, fStoreCredentialsButton.getSelection());
+        
+        getPreferenceStore().setValue(PREFS_HTTP_AUTH_METHOD, fHttpGcmRadio.getSelection() ? HTTP_AUTH_GCM : HTTP_AUTH_PAT);
         
         getPreferenceStore().setValue(PREFS_PROXY_USE, fUseProxyButton.getSelection());
         getPreferenceStore().setValue(PREFS_PROXY_HOST, fProxyHostTextField.getText());
@@ -492,6 +537,10 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
         
         fStoreCredentialsButton.setSelection(getPreferenceStore().getDefaultBoolean(PREFS_STORE_REPO_CREDENTIALS));
         
+        fHttpPatRadio.setSelection(true);
+        fHttpGcmRadio.setSelection(false);
+        updateHttpAuthControls();
+        
         fUseProxyButton.setSelection(getPreferenceStore().getDefaultBoolean(PREFS_PROXY_USE));
         fProxyHostTextField.setText(getPreferenceStore().getDefaultString(PREFS_PROXY_HOST));
         fProxyPortTextField.setText(getPreferenceStore().getDefaultString(PREFS_PROXY_PORT));
@@ -513,6 +562,20 @@ implements IWorkbenchPreferencePage, IPreferenceConstants {
     
     private void updateIdentityControls() {
     	fSSHIdentityPasswordTextField.setEnabled(fSSHIdentityRequiresPasswordButton.getSelection());
+    }
+    
+    private void updateHttpAuthControls() {
+        fStoreCredentialsButton.setEnabled(fHttpPatRadio.getSelection());
+    }
+    
+    private void updateGcmStatusLabel() {
+        boolean gcmAvailable = GitCredentialManagerDetector.isGCMAvailable();
+        if(gcmAvailable) {
+            fGcmStatusLabel.setText(Messages.ModelRepositoryPreferencePage_30);
+        }
+        else {
+            fGcmStatusLabel.setText(Messages.ModelRepositoryPreferencePage_31);
+        }
     }
     
     private void updateProxyControls() {

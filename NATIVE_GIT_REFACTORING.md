@@ -1,5 +1,10 @@
 # Native Git Utility Methods Refactoring
 
+> **Historical document.** This captures the refactoring from scattered native git calls
+> to the current centralized architecture. For the current design and performance data,
+> see [NATIVE_GIT_OPTIMIZATION.md](NATIVE_GIT_OPTIMIZATION.md) and
+> [REFACTORING_NOTES.md](org.archicontribs.modelrepository/src/org/archicontribs/modelrepository/grafico/REFACTORING_NOTES.md).
+
 ## Overview
 
 This refactoring implements the "try native git, fallback to JGit" pattern as private methods in `ArchiRepository`. This ensures consistent behavior across all git operations and includes critical JGit state synchronization.

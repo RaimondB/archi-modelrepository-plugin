@@ -54,6 +54,7 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
     static final String OPTION_USERNAME = "modelrepository.userName"; //$NON-NLS-1$
     static final String OPTION_PASSFILE = "modelrepository.passFile"; //$NON-NLS-1$
     static final String OPTION_SSH_IDENTITY_FILE = "modelrepository.identityFile"; //$NON-NLS-1$
+    static final String OPTION_AUTH_METHOD = "modelrepository.authMethod"; //$NON-NLS-1$
     
     public LoadModelFromRepositoryProvider() {
     }
@@ -86,20 +87,25 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
             boolean isSSH = GraficoUtils.isSSH(url);
             boolean isHTTP = !isSSH;
             
+            // Check if using GCM auth (via CLI option or stored preference)
+            String authMethod = commandLine.getOptionValue(OPTION_AUTH_METHOD);
+            boolean useGCM = "gcm".equalsIgnoreCase(authMethod) || //$NON-NLS-1$
+                             "httpGcm".equalsIgnoreCase(authMethod); //$NON-NLS-1$
+            
             if(!StringUtils.isSet(url)) {
                 logError(Messages.LoadModelFromRepositoryProvider_2);
                 return;
             }
             
-            // HTTP requires user name
-            if(isHTTP && !StringUtils.isSet(username)) {
+            // HTTP requires user name (unless using GCM which handles auth itself)
+            if(isHTTP && !useGCM && !StringUtils.isSet(username)) {
                 logError(Messages.LoadModelFromRepositoryProvider_3);
                 return;
             }
             
-            // If using HTTP then password is needed for connection
+            // If using HTTP then password is needed for connection (unless using GCM)
             // If using SSH then password is optional for the identity file
-            if(isHTTP && (password == null || password.length == 0)) {
+            if(isHTTP && !useGCM && (password == null || password.length == 0)) {
                 logError(Messages.LoadModelFromRepositoryProvider_17);
                 return;
             }
@@ -136,12 +142,27 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
             }
             // HTTP
             else {
-                UsernamePassword npw = new UsernamePassword(username, password);
-                try {
-                    repo.cloneModel(url, npw, null);
+                if(useGCM) {
+                    // GCM mode: get credentials from Git Credential Manager via git credential fill
+                    // This ensures JGit fallback also works if native git clone fails
+                    UsernamePassword gcmCreds = CredentialsAuthenticator.getGCMCredentials(url);
+                    try {
+                        repo.cloneModel(url, gcmCreds, null);
+                    }
+                    finally {
+                        if(gcmCreds != null) {
+                            gcmCreds.clear();
+                        }
+                    }
                 }
-                finally {
-                    npw.clear(); // Clear this
+                else {
+                    UsernamePassword npw = new UsernamePassword(username, password);
+                    try {
+                        repo.cloneModel(url, npw, null);
+                    }
+                    finally {
+                        npw.clear(); // Clear this
+                    }
                 }
             }
             
@@ -276,6 +297,14 @@ public class LoadModelFromRepositoryProvider extends AbstractCommandLineProvider
                 .hasArg()
                 .argName(Messages.LoadModelFromRepositoryProvider_19)
                 .desc(NLS.bind(Messages.LoadModelFromRepositoryProvider_20, OPTION_CLONE_MODEL))
+                .build();
+        options.addOption(option);
+
+        option = Option.builder()
+                .longOpt(OPTION_AUTH_METHOD)
+                .hasArg()
+                .argName(Messages.LoadModelFromRepositoryProvider_25)
+                .desc(Messages.LoadModelFromRepositoryProvider_26)
                 .build();
         options.addOption(option);
 

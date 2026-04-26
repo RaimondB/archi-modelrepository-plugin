@@ -6,10 +6,12 @@
 package org.archicontribs.modelrepository.actions;
 
 import java.io.File;
+import java.io.IOException;
 import java.security.GeneralSecurityException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
+import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.authentication.internal.EncryptedCredentialsStorage;
@@ -51,9 +53,9 @@ public class CloneModelAction extends AbstractModelAction {
 
     @Override
     public void run() {
-        // Check primary key set
+        // Check primary key set (only needed for PAT auth, not GCM)
         try {
-            if(!EncryptedCredentialsStorage.checkPrimaryKeySet()) {
+            if(!CredentialsAuthenticator.checkPrimaryKeyIfNeeded()) {
                 return;
             }
         }
@@ -73,13 +75,22 @@ public class CloneModelAction extends AbstractModelAction {
     	
         final String repoURL = dialog.getURL();
         final boolean storeCredentials = dialog.doStoreCredentials();
-        final UsernamePassword npw = dialog.getUsernamePassword();
         
         if(!StringUtils.isSet(repoURL)) {
             return;
         }
         
-        if(GraficoUtils.isHTTP(repoURL) && !StringUtils.isSet(npw.getUsername()) && npw.getPassword().length == 0) {
+        // Get credentials (PAT → dialog creds, GCM → credential manager, SSH → null)
+        final UsernamePassword npw;
+        try {
+            npw = CredentialsAuthenticator.getCloneCredentials(repoURL, dialog.getUsernamePassword());
+        }
+        catch(IOException | GeneralSecurityException ex) {
+            displayErrorDialog(Messages.CloneModelAction_0, ex);
+            return;
+        }
+        
+        if(!CredentialsAuthenticator.hasValidCredentials(repoURL, npw)) {
             MessageDialog.openError(fWindow.getShell(), 
                     Messages.CloneModelAction_0,
                     Messages.CloneModelAction_1);
@@ -140,8 +151,8 @@ public class CloneModelAction extends AbstractModelAction {
                 getRepository().saveChecksum();
             }
             
-            // Store repo credentials if HTTP and option is set
-            if(GraficoUtils.isHTTP(repoURL) && storeCredentials) {
+            // Store repo credentials if HTTP+PAT and option is set (not needed for GCM)
+            if(CredentialsAuthenticator.requiresExplicitCredentials(repoURL) && storeCredentials) {
                 EncryptedCredentialsStorage cs = EncryptedCredentialsStorage.forRepository(getRepository());
                 cs.store(npw);
             }
