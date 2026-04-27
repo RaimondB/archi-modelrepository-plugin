@@ -262,7 +262,7 @@ class MergeObjectInfo {
      */
     private EObject loadEObject(String ref, int side) throws IOException {
         // Load the contents of the ref not the actual file because "theirs" is not an actual file
-        byte[] contents = handler.getArchiRepository().getFileContents(xmlPath, ref);
+        byte[] contents = handler.getFileContents(xmlPath, ref);
         // Not found so was deleted by us or them
         if(contents == null) {
             rawContentExists[side] = false;

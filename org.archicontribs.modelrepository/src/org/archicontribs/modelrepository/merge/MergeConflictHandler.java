@@ -117,6 +117,9 @@ public class MergeConflictHandler {
     private IArchimateModel fOurModel, fTheirModel;
     
     private IProgressMonitor fProgressMonitor;
+    
+    /** Bulk-loaded content cache for conflict paths. Replaces per-file Git.open()+TreeWalk calls. */
+    private MergeContentCache fContentCache;
 
     public MergeConflictHandler(MergeResult mergeResult, String theirRef, IArchiRepository repo, Shell shell) {
         fMergeResult = mergeResult;
@@ -148,6 +151,12 @@ public class MergeConflictHandler {
         t = System.nanoTime();
         fTheirModel = extractModel(getTheirRef());
         log(IStatus.INFO, "[MergeConflictHandler] extractModel(" + getTheirRef() + "): " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+        
+        // Bulk-load content for all conflict paths from DirCache (1 read vs N individual TreeWalks)
+        t = System.nanoTime();
+        fContentCache = new MergeContentCache(fArchiRepo.getLocalRepositoryFolder(),
+                fMergeResult.getConflicts().keySet(), fArchiRepo, getLocalRef(), getTheirRef());
+        log(IStatus.INFO, "[MergeConflictHandler] initContentCache: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Create Merge Infos
         t = System.nanoTime();
@@ -188,6 +197,10 @@ public class MergeConflictHandler {
         fProgressMonitor = pm;
         fOurModel = ourModel;
         fTheirModel = theirModel;
+        
+        // Bulk-load content for all conflict paths from DirCache
+        fContentCache = new MergeContentCache(fArchiRepo.getLocalRepositoryFolder(),
+                fMergeResult.getConflicts().keySet(), fArchiRepo, getLocalRef(), getTheirRef());
         
         fMergeObjectInfos = new ArrayList<MergeObjectInfo>();
         for(String xmlPath : fMergeResult.getConflicts().keySet()) {
@@ -274,7 +287,7 @@ public class MergeConflictHandler {
                 // Both paths are in conflicts (paired conflicts)
                 byte[] headContent = null;
                 try {
-                    headContent = fArchiRepo.getFileContents(
+                    headContent = getFileContents(
                             infos.get(0).getXMLPath(), getLocalRef());
                 } catch(IOException e) { /* Fall through */ }
                 
@@ -292,7 +305,7 @@ public class MergeConflictHandler {
                 MergeObjectInfo conflictInfo = infos.get(0);
                 byte[] headContent = null;
                 try {
-                    headContent = fArchiRepo.getFileContents(
+                    headContent = getFileContents(
                             conflictInfo.getXMLPath(), getLocalRef());
                 } catch(IOException e) { /* Fall through */ }
                 
@@ -358,7 +371,7 @@ public class MergeConflictHandler {
             // Determine which side is the mover.
             byte[] headContent = null;
             try {
-                headContent = fArchiRepo.getFileContents(info.getXMLPath(), getLocalRef());
+                headContent = getFileContents(info.getXMLPath(), getLocalRef());
             } catch(IOException e) { /* Fall through */ }
             boolean oursIsTheMover = (headContent == null);
             
@@ -479,7 +492,7 @@ public class MergeConflictHandler {
         
         // Try ours
         try {
-            byte[] content = fArchiRepo.getFileContents(xmlPath, getLocalRef());
+            byte[] content = getFileContents(xmlPath, getLocalRef());
             if(content != null) {
                 return GraficoUtils.extractIdFromFolderXml(content);
             }
@@ -489,7 +502,7 @@ public class MergeConflictHandler {
         
         // Try theirs
         try {
-            byte[] content = fArchiRepo.getFileContents(xmlPath, getTheirRef());
+            byte[] content = getFileContents(xmlPath, getTheirRef());
             if(content != null) {
                 return GraficoUtils.extractIdFromFolderXml(content);
             }
@@ -684,7 +697,7 @@ public class MergeConflictHandler {
      */
     private boolean hasContentAtRef(String xmlPath, String ref) {
         try {
-            byte[] content = fArchiRepo.getFileContents(xmlPath, ref);
+            byte[] content = getFileContents(xmlPath, ref);
             return content != null;
         } catch(IOException e) {
             return false;
@@ -717,7 +730,7 @@ public class MergeConflictHandler {
             // Mover's content not on disk (git auto-resolved new path as deleted).
             // Extract from the mover's ref.
             String moverRef = oursHasContent ? getTheirRef() : getLocalRef();
-            byte[] moverContent = fArchiRepo.getFileContents(newXmlPath, moverRef);
+            byte[] moverContent = getFileContents(newXmlPath, moverRef);
             if(moverContent != null) {
                 newFile.getParentFile().mkdirs();
                 Files.write(newFile.toPath(), moverContent);
@@ -1057,6 +1070,18 @@ public class MergeConflictHandler {
     
     IArchiRepository getArchiRepository() {
         return fArchiRepo;
+    }
+    
+    /**
+     * Get file contents for a path at a given ref, using the bulk content cache
+     * when available. Falls back to {@link IArchiRepository#getFileContents} for
+     * paths not in the cache or when the cache hasn't been initialized yet.
+     */
+    byte[] getFileContents(String path, String ref) throws IOException {
+        if(fContentCache != null) {
+            return fContentCache.getContent(path, ref);
+        }
+        return fArchiRepo.getFileContents(path, ref);
     }
     
     List<MergeObjectInfo> getMergeObjectInfos() {
