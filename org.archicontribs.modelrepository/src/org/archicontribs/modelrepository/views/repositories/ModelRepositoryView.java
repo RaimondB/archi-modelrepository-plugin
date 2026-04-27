@@ -339,13 +339,22 @@ implements IContextProvider, ISelectionListener, ITabbedPropertySheetPageContrib
             return;
         }
         
+        IArchiRepository selectedRepository = null;
+        
         // Model selected, but is it in a git repo?
         IArchimateModel model = part.getAdapter(IArchimateModel.class);
         if(model != null) {
             if(GraficoUtils.isModelInLocalRepository(model)) {
-                IArchiRepository selectedRepository = new ArchiRepository(GraficoUtils.getLocalRepositoryFolderForModel(model));
-                getViewer().setSelection(new StructuredSelection(selectedRepository));
+                selectedRepository = new ArchiRepository(GraficoUtils.getLocalRepositoryFolderForModel(model));
             }
+        }
+        // Another part provides repository context (e.g. BranchesView, HistoryView)
+        else {
+            selectedRepository = part.getAdapter(IArchiRepository.class);
+        }
+        
+        if(selectedRepository != null) {
+            getViewer().setSelection(new StructuredSelection(selectedRepository));
         }
     }
 

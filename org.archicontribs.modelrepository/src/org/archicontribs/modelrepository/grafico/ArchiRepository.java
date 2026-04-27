@@ -838,6 +838,16 @@ public class ArchiRepository implements IArchiRepository {
         return fresh;
     }
     
+    @Override
+    public BranchStatus getCachedBranchStatus() {
+        long now = System.nanoTime();
+        BranchStatus cached = fCachedBranchStatus;
+        if(cached != null && (now - fBranchStatusTimestamp) < BRANCH_STATUS_TTL_NANOS) {
+            return cached;
+        }
+        return null;
+    }
+    
     private String getLatestChecksum() throws IOException {
         File checksumFile = new File(getLocalGitFolder(), "checksum");
         if(!checksumFile.exists()) {

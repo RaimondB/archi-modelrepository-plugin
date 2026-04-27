@@ -5,11 +5,10 @@
  */
 package org.archicontribs.modelrepository.actions;
 
+import org.archicontribs.modelrepository.grafico.IArchiRepository;
 import org.eclipse.core.commands.ExecutionEvent;
 import org.eclipse.core.commands.ExecutionException;
 import org.eclipse.ui.handlers.HandlerUtil;
-
-import com.archimatetool.model.IArchimateModel;
 
 
 /**
@@ -21,10 +20,11 @@ public class DeleteModelHandler extends AbstractModelHandler {
     
     @Override
     public Object execute(ExecutionEvent event) throws ExecutionException {
-        IArchimateModel model = getActiveArchimateModel();
+        IArchiRepository repository = getActiveArchiRepository();
         
-        if(model != null) {
-            DeleteModelAction action = new DeleteModelAction(HandlerUtil.getActiveWorkbenchWindowChecked(event), model);
+        if(repository != null) {
+            DeleteModelAction action = new DeleteModelAction(HandlerUtil.getActiveWorkbenchWindowChecked(event));
+            action.setRepository(repository);
             action.run();
         }
         

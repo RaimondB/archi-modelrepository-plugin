@@ -38,6 +38,6 @@ public abstract class AbstractModelHandler extends AbstractHandler {
 
     @Override
     public boolean isEnabled() {
-        return GraficoUtils.isModelInLocalRepository(getActiveArchimateModel());
+        return getActiveArchiRepository() != null;
     }
 }

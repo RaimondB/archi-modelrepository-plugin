@@ -234,4 +234,11 @@ public interface IArchiRepository extends IGraficoConstants {
      * @throws GitAPIException
      */
     BranchStatus getBranchStatus() throws IOException, GitAPIException;
+    
+    /**
+     * Return the cached BranchStatus if it is still valid (within TTL), or null if the cache
+     * is empty or stale. This is a non-blocking peek that never opens the repository.
+     * Use this for fast-path UI refreshes when the cache was recently pre-warmed.
+     */
+    BranchStatus getCachedBranchStatus();
 }

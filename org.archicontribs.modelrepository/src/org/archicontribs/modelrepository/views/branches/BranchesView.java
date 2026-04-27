@@ -312,6 +312,18 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                 case IRepositoryListener.HISTORY_CHANGED:
                 case IRepositoryListener.BRANCHES_CHANGED:
                     UIPerfLogger.log("[BranchesView]", "repositoryChanged(" + eventName + ") received"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    
+                    // Fast path: if BranchStatus is cached (pre-warmed by the operation),
+                    // update synchronously on the UI thread for instant feedback.
+                    BranchStatus cached = repository.getCachedBranchStatus();
+                    if(cached != null) {
+                        long tFast = System.nanoTime();
+                        getBranchesViewer().doSetInput(repository, cached);
+                        UIPerfLogger.log("[BranchesView]", "repositoryChanged fast-path update", tFast); //$NON-NLS-1$ //$NON-NLS-2$
+                        break;
+                    }
+                    
+                    // Slow path: cache miss — load on background thread to avoid blocking UI
                     // Cancel any stale background thread
                     Thread oldThread = fCurrentLoadThread;
                     if(oldThread != null) {
@@ -366,6 +378,15 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     @Override
     public IWorkbenchPart getContributingPart() {
         return null;
+    }
+    
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> T getAdapter(Class<T> adapter) {
+        if(adapter == IArchiRepository.class) {
+            return (T)fSelectedRepository;
+        }
+        return super.getAdapter(adapter);
     }
     
     @Override

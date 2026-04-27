@@ -508,6 +508,21 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
                     fRepoLabel.setText(Messages.HistoryView_0 + " " + repository.getName()); //$NON-NLS-1$
                     fCommentViewer.setCommit(null);
                     
+                    // Fast path: if BranchStatus is cached, update the table synchronously
+                    // but recompute action states on a background thread (they require JGit I/O)
+                    BranchStatus cachedHistory = repository.getCachedBranchStatus();
+                    if(cachedHistory != null) {
+                        long tFast = System.nanoTime();
+                        getHistoryViewer().doSetInput(repository, cachedHistory);
+                        UIPerfLogger.log("[HistoryView]", "HISTORY_CHANGED fast-path update", tFast); //$NON-NLS-1$ //$NON-NLS-2$
+                        // Action states still need background computation
+                        Thread.ofVirtual().name("HistoryView-RecomputeActions").start(() -> { //$NON-NLS-1$
+                            recomputeActionStates(repository, cachedHistory);
+                        });
+                        break;
+                    }
+                    
+                    // Slow path: cache miss — load on background thread
                     // Cancel any stale background thread
                     Thread oldHistoryThread = fCurrentLoadThread;
                     if(oldHistoryThread != null) {
@@ -556,6 +571,23 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
 
                 case IRepositoryListener.BRANCHES_CHANGED:
                     UIPerfLogger.log("[HistoryView]", "repositoryChanged(BRANCHES_CHANGED) received"); //$NON-NLS-1$ //$NON-NLS-2$
+                    
+                    // Fast path: if BranchStatus is cached (pre-warmed by the operation),
+                    // update synchronously on the UI thread for instant feedback.
+                    BranchStatus cachedStatus = repository.getCachedBranchStatus();
+                    if(cachedStatus != null) {
+                        long tFast = System.nanoTime();
+                        getHistoryViewer().doSetInput(repository, cachedStatus);
+                        getBranchesViewer().doSetInput(cachedStatus);
+                        UIPerfLogger.log("[HistoryView]", "BRANCHES_CHANGED fast-path update", tFast); //$NON-NLS-1$ //$NON-NLS-2$
+                        // Action states still need background computation
+                        Thread.ofVirtual().name("HistoryView-RecomputeActions").start(() -> { //$NON-NLS-1$
+                            recomputeActionStates(repository, cachedStatus);
+                        });
+                        break;
+                    }
+                    
+                    // Slow path: cache miss — load on background thread
                     // Cancel any stale background thread
                     Thread oldBranchThread = fCurrentLoadThread;
                     if(oldBranchThread != null) {
@@ -605,6 +637,15 @@ implements IContextProvider, ISelectionListener, IRepositoryListener, IContribut
     @Override
     public IWorkbenchPart getContributingPart() {
         return null;
+    }
+    
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> T getAdapter(Class<T> adapter) {
+        if(adapter == IArchiRepository.class) {
+            return (T)fSelectedRepository;
+        }
+        return super.getAdapter(adapter);
     }
     
     @Override
