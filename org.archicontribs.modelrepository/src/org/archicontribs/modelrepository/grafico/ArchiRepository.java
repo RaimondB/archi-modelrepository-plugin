@@ -929,6 +929,9 @@ public class ArchiRepository implements IArchiRepository {
             // This is critical for triggering UI updates and ensuring JGit sees the changes
             Git.open(getLocalRepositoryFolder()).close();
         }
+        
+        // HEAD has changed — invalidate cached branch status
+        invalidateBranchStatusCache();
     }
     
     /**

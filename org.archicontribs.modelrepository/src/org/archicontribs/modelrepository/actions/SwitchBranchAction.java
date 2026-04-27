@@ -281,6 +281,18 @@ public class SwitchBranchAction extends AbstractModelAction {
                             importedModel[0] = importerRef[0].importAsModel(nonCancellableMonitor);
                             UIPerfLogger.log(TAG, "grafico import", tImport); //$NON-NLS-1$
                         }
+                        
+                        // Pre-warm the BranchStatus cache while the progress dialog is still open.
+                        // This avoids a 1-2s delay between dialog close and branch highlight update,
+                        // since the BRANCHES_CHANGED handlers use async threads that call getBranchStatus().
+                        try {
+                            long tCache = System.nanoTime();
+                            getRepository().getBranchStatus();
+                            UIPerfLogger.log(TAG, "pre-warm BranchStatus cache", tCache); //$NON-NLS-1$
+                        }
+                        catch(Exception cacheEx) {
+                            // Non-critical — handlers will recompute if cache miss
+                        }
                     }
                     catch(IOException | GitAPIException ex) {
                         exception[0] = ex;

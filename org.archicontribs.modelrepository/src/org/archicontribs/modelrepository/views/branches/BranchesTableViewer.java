@@ -18,6 +18,7 @@ import org.eclipse.jface.layout.TableColumnLayout;
 import org.eclipse.jface.viewers.CellLabelProvider;
 import org.eclipse.jface.viewers.ColumnWeightData;
 import org.eclipse.jface.viewers.IStructuredContentProvider;
+import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.jface.viewers.TableViewer;
 import org.eclipse.jface.viewers.TableViewerColumn;
 import org.eclipse.jface.viewers.Viewer;
@@ -113,6 +114,9 @@ public class BranchesTableViewer extends TableViewer {
         
         // Do the Layout kludge
         getTable().getParent().layout();
+        
+        // Reveal and select the current branch so the user gets immediate visual confirmation
+        revealCurrentBranch(branchStatus);
     }
     
     /**
@@ -120,6 +124,20 @@ public class BranchesTableViewer extends TableViewer {
      * Used by BranchesContentProvider to avoid redundant getBranchStatus() calls.
      */
     private BranchStatus fPrecomputedBranchStatus;
+    
+    /**
+     * Scroll to and select the current branch in the table.
+     * Gives the user immediate visual confirmation of which branch is active.
+     */
+    private void revealCurrentBranch(BranchStatus branchStatus) {
+        if(branchStatus == null) {
+            return;
+        }
+        BranchInfo currentBranch = branchStatus.getCurrentLocalBranch();
+        if(currentBranch != null) {
+            setSelection(new StructuredSelection(currentBranch), true);
+        }
+    }
     
     // ===============================================================================================
 	// ===================================== Table Model ==============================================

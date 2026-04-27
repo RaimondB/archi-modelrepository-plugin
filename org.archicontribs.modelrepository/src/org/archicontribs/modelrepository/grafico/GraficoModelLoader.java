@@ -34,8 +34,6 @@ import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorReference;
 import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.PlatformUI;
-import org.eclipse.swt.graphics.Rectangle;
-import org.eclipse.swt.widgets.Shell;
 
 import com.archimatetool.editor.diagram.DiagramEditorInput;
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -305,42 +303,17 @@ public class GraficoModelLoader {
             // Store ids of open diagrams
             List<String> openModelIDs = getOpenDiagramModelIdentifiers(model);
             
-            // Save shell state before close/open cycle.
-            // closeModel() can cause the shell to lose its maximized state when
-            // the editor area collapses, resulting in a visible window resize.
-            Shell shell = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell();
-            boolean wasMaximized = shell.getMaximized();
-            Rectangle savedBounds = shell.getBounds();
+            t = System.nanoTime();
+            IEditorModelManager.INSTANCE.closeModel(model);
+            UIPerfLogger.log("[ModelLoader]", "closeModel", t); //$NON-NLS-1$ //$NON-NLS-2$
             
-            shell.setRedraw(false);
-            try {
-                t = System.nanoTime();
-                IEditorModelManager.INSTANCE.closeModel(model);
-                UIPerfLogger.log("[ModelLoader]", "closeModel", t); //$NON-NLS-1$ //$NON-NLS-2$
-                
-                t = System.nanoTime();
-                IEditorModelManager.INSTANCE.openModel(graficoModel);
-                UIPerfLogger.log("[ModelLoader]", "openModel", t); //$NON-NLS-1$ //$NON-NLS-2$
-                
-                t = System.nanoTime();
-                reopenEditors(graficoModel, openModelIDs);
-                UIPerfLogger.log("[ModelLoader]", "reopenEditors (" + openModelIDs.size() + " diagrams)", t); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-            } finally {
-                shell.setRedraw(true);
-                
-                // Defer shell state restoration to after the current event loop completes.
-                // Setting maximized/bounds while layout is still recalculating causes a
-                // visible minimize/maximize flash on Windows.
-                shell.getDisplay().asyncExec(() -> {
-                    if(!shell.isDisposed()) {
-                        if(wasMaximized && !shell.getMaximized()) {
-                            shell.setMaximized(true);
-                        } else if(!wasMaximized) {
-                            shell.setBounds(savedBounds);
-                        }
-                    }
-                });
-            }
+            t = System.nanoTime();
+            IEditorModelManager.INSTANCE.openModel(graficoModel);
+            UIPerfLogger.log("[ModelLoader]", "openModel", t); //$NON-NLS-1$ //$NON-NLS-2$
+            
+            t = System.nanoTime();
+            reopenEditors(graficoModel, openModelIDs);
+            UIPerfLogger.log("[ModelLoader]", "reopenEditors (" + openModelIDs.size() + " diagrams)", t); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         }
         UIPerfLogger.log("[ModelLoader]", "openModel() total", tOpen); //$NON-NLS-1$ //$NON-NLS-2$
     }
