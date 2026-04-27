@@ -5,23 +5,17 @@
  */
 package org.archicontribs.modelrepository.actions;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.lib.ObjectId;
-import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
-import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.ui.IWorkbenchWindow;
 
 import com.archimatetool.editor.model.IEditorModelManager;
 import com.archimatetool.editor.ui.IArchiImages;
-import com.archimatetool.editor.utils.FileUtils;
 import com.archimatetool.model.IArchimateModel;
 
 /**
@@ -53,37 +47,10 @@ public class ExtractModelFromCommitAction extends AbstractModelAction {
             return;
         }
         
-        File tempOutputFolder = getTempFolder();
-        
-        deleteFolder(tempOutputFolder);
-        
-        // Wlak the tree and get the contents of the commit
+        // Load model directly from git commit objects (no temp folder I/O)
         try(Repository repository = Git.open(getRepository().getLocalRepositoryFolder()).getRepository()) {
-            try(TreeWalk treeWalk = new TreeWalk(repository)) {
-                treeWalk.addTree(fCommit.getTree());
-                treeWalk.setRecursive(true);
-
-                while(treeWalk.next()) {
-                    ObjectId objectId = treeWalk.getObjectId(0);
-                    ObjectLoader loader = repository.open(objectId);
-                    
-                    File file = new File(tempOutputFolder, treeWalk.getPathString());
-                    file.getParentFile().mkdirs();
-                    
-                    try(FileOutputStream out = new FileOutputStream(file)) {
-                        loader.copyTo(out);
-                    }
-                }
-            }
-        }
-        catch(IOException ex) {
-            displayErrorDialog(Messages.ExtractModelFromCommitAction_1, ex);
-        }
-        
-        // Open the model with no file name
-        try {
-            GraficoModelImporter importer = new GraficoModelImporter(tempOutputFolder);
-            IArchimateModel graficoModel = importer.importAsModel();
+            GraficoModelImporter importer = new GraficoModelImporter(repository, fCommit.getTree());
+            IArchimateModel graficoModel = importer.importFromCommit(null);
             
             if(graficoModel != null) {
                 // Open it, this will do the necessary checks and add a command stack and an archive manager
@@ -99,26 +66,8 @@ public class ExtractModelFromCommitAction extends AbstractModelAction {
         catch(IOException ex) {
             displayErrorDialog(Messages.ExtractModelFromCommitAction_1, ex);
         }
-        
-        // Clean up
-        deleteFolder(tempOutputFolder);
     }
     
-    private File getTempFolder() {
-        File file = new File(System.getProperty("java.io.tmpdir"), "org.archicontribs.modelrepository.tmp"); //$NON-NLS-1$ //$NON-NLS-2$
-        file.mkdirs();
-        return file;
-    }
-    
-    private void deleteFolder(File folder) {
-        try {
-            FileUtils.deleteFolder(folder);
-        }
-        catch(IOException ex) {
-            displayErrorDialog(Messages.ExtractModelFromCommitAction_1, ex);
-        }
-    }
-
     @Override
     protected boolean shouldBeEnabled() {
         return fCommit != null && getRepository() != null;

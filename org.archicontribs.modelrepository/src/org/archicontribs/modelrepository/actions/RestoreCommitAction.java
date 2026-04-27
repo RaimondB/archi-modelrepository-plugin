@@ -10,6 +10,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
 import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
@@ -81,8 +82,9 @@ public class RestoreCommitAction extends AbstractModelAction {
             return;
         }
         
-        // Walk the tree and get the contents of the commit
+        // Walk the tree: write commit files to working tree AND load model from git objects
         try(Repository repository = Git.open(getRepository().getLocalRepositoryFolder()).getRepository()) {
+            // 1. Write commit files to working tree (needed for git commit)
             try(TreeWalk treeWalk = new TreeWalk(repository)) {
                 treeWalk.addTree(fCommit.getTree());
                 treeWalk.setRecursive(true);
@@ -99,18 +101,17 @@ public class RestoreCommitAction extends AbstractModelAction {
                     }
                 }
             }
-        }
-        catch(IOException ex) {
-            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
-            return;
-        }
-
-        // Reload the model from the Grafico XML files
-        try {
-            IArchimateModel graficoModel = new GraficoModelLoader(getRepository()).loadModel();
-            // If this is null then it failed because of no model in this commit
-            if(graficoModel == null) {
-                // Reset
+            
+            // 2. Load model directly from commit tree (skip re-reading files from disk)
+            GraficoModelImporter importer = new GraficoModelImporter(repository, fCommit.getTree());
+            IArchimateModel graficoModel = importer.importFromCommit(null);
+            
+            if(graficoModel != null) {
+                // Use GraficoModelLoader.openModel() for repair/editor integration
+                new GraficoModelLoader(getRepository()).openModel(graficoModel, importer);
+            }
+            else {
+                // No model in this commit — reset
                 getRepository().resetToRef(IGraficoConstants.HEAD);
                 MessageDialog.openError(fWindow.getShell(), Messages.RestoreCommitAction_0, Messages.RestoreCommitAction_2);
                 return;
@@ -118,6 +119,7 @@ public class RestoreCommitAction extends AbstractModelAction {
         }
         catch(Exception ex) {
             displayErrorDialog(Messages.RestoreCommitAction_0, ex);
+            return;
         }
         
         // Commit changes
