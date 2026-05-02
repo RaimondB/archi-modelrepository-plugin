@@ -30,6 +30,7 @@ import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.AddCommand;
+import org.eclipse.jgit.api.CheckoutCommand;
 import org.eclipse.jgit.api.CleanCommand;
 import org.eclipse.jgit.api.CloneCommand;
 import org.eclipse.jgit.api.CommitCommand;
@@ -213,6 +214,28 @@ public class ArchiRepository implements IArchiRepository {
             Status status = git.status().call();
             return !status.isClean();
         }
+    }
+    
+    /**
+     * Checkout paths from a specific commit, restoring both working tree and index.
+     * Uses native git for speed, falls back to JGit.
+     * @return true if checkout succeeded
+     */
+    public boolean checkoutPathsFromCommit(String commitSha, String... paths) throws Exception {
+        boolean nativeSuccess = isNativeGitEnabled()
+                && NativeGitExecutor.checkoutPathsFromCommit(getLocalRepositoryFolder(), commitSha, paths);
+        
+        if(!nativeSuccess) {
+            try(Git git = Git.open(getLocalRepositoryFolder())) {
+                CheckoutCommand checkout = git.checkout();
+                checkout.setStartPoint(commitSha);
+                for(String path : paths) {
+                    checkout.addPath(path);
+                }
+                checkout.call();
+            }
+        }
+        return true;
     }
     
     /**

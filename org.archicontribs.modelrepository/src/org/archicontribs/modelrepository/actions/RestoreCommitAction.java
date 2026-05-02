@@ -6,7 +6,6 @@
 package org.archicontribs.modelrepository.actions;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
@@ -17,10 +16,8 @@ import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
-import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
-import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.ui.IWorkbenchWindow;
 
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -66,52 +63,45 @@ public class RestoreCommitAction extends AbstractModelAction {
             return;
         }
         
+        String commitSha = fCommit.getName();
+        File repoFolder = getRepository().getLocalRepositoryFolder();
+        
         // Delete the content folders first
         try {
-            File modelFolder = new File(getRepository().getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
+            File modelFolder = new File(repoFolder, IGraficoConstants.MODEL_FOLDER);
             FileUtils.deleteFolder(modelFolder);
             modelFolder.mkdirs();
 
-            File imagesFolder = new File(getRepository().getLocalRepositoryFolder(), IGraficoConstants.IMAGES_FOLDER);
+            File imagesFolder = new File(repoFolder, IGraficoConstants.IMAGES_FOLDER);
             FileUtils.deleteFolder(imagesFolder);
             imagesFolder.mkdirs();
-
         }
         catch(IOException ex) {
             displayErrorDialog(Messages.RestoreCommitAction_0, ex);
             return;
         }
         
-        // Walk the tree: write commit files to working tree AND load model from git objects
-        try(Repository repository = Git.open(getRepository().getLocalRepositoryFolder()).getRepository()) {
-            // 1. Write commit files to working tree (needed for git commit)
-            try(TreeWalk treeWalk = new TreeWalk(repository)) {
-                treeWalk.addTree(fCommit.getTree());
-                treeWalk.setRecursive(true);
-
-                while(treeWalk.next()) {
-                    ObjectId objectId = treeWalk.getObjectId(0);
-                    ObjectLoader loader = repository.open(objectId);
-                    
-                    File file = new File(getRepository().getLocalRepositoryFolder(), treeWalk.getPathString());
-                    file.getParentFile().mkdirs();
-                    
-                    try(FileOutputStream out = new FileOutputStream(file)) {
-                        loader.copyTo(out);
-                    }
-                }
-            }
-            
-            // 2. Load model directly from commit tree (skip re-reading files from disk)
+        // Restore working tree + index from the commit.
+        // Uses native git if available (dramatically faster for large trees),
+        // falls back to JGit CheckoutCommand.
+        try {
+            getRepository().checkoutPathsFromCommit(commitSha,
+                    IGraficoConstants.MODEL_FOLDER, IGraficoConstants.IMAGES_FOLDER);
+        }
+        catch(Exception ex) {
+            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
+            return;
+        }
+        
+        // Load model from commit tree (skip re-reading files from disk)
+        try(Repository repository = Git.open(repoFolder).getRepository()) {
             GraficoModelImporter importer = new GraficoModelImporter(repository, fCommit.getTree());
             IArchimateModel graficoModel = importer.importFromCommit(null);
             
             if(graficoModel != null) {
-                // Use GraficoModelLoader.openModel() for repair/editor integration
                 new GraficoModelLoader(getRepository()).openModel(graficoModel, importer);
             }
             else {
-                // No model in this commit — reset
                 getRepository().resetToRef(IGraficoConstants.HEAD);
                 MessageDialog.openError(fWindow.getShell(), Messages.RestoreCommitAction_0, Messages.RestoreCommitAction_2);
                 return;

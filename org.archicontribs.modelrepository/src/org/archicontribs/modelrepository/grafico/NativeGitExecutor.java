@@ -148,6 +148,47 @@ class NativeGitExecutor {
     }
 
     /**
+     * Native git checkout of specific paths from a commit.
+     * This overwrites the working tree AND index with the commit's content
+     * for the given paths. Much faster than TreeWalk + write for large trees.
+     * 
+     * <p>Usage: {@code git checkout <commitSha> -- path1 path2 ...}</p>
+     *
+     * @param repoDir the repository working directory
+     * @param commitSha the full or abbreviated commit SHA
+     * @param paths the paths to restore (e.g. "model/", "images/")
+     * @return true if succeeded, false if native git is not available
+     * @throws IOException if the checkout failed
+     */
+    static boolean checkoutPathsFromCommit(File repoDir, String commitSha, String... paths) throws IOException {
+        try {
+            List<String> command = new ArrayList<>();
+            command.add("git");
+            command.add("checkout");
+            command.add(commitSha);
+            command.add("--");
+            for(String path : paths) {
+                command.add(path);
+            }
+            Result result = runSimple(repoDir, command.toArray(new String[0]));
+            if(!result.isSuccess()) {
+                throw new IOException("Git checkout paths failed: " + result.output());
+            }
+            return true;
+        }
+        catch(IOException ex) {
+            if(isGitNotFound(ex)) {
+                return false;
+            }
+            throw ex;
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Git checkout paths interrupted", ex);
+        }
+    }
+
+    /**
      * Native git add -A (stage all changes).
      *
      * @param repoDir the repository working directory

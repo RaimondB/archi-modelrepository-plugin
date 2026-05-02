@@ -76,6 +76,16 @@ public interface IArchiRepository extends IGraficoConstants {
     ChangeSummary getChangeSummary(int maxItems) throws IOException, GitAPIException;
 
     /**
+     * Checkout paths from a specific commit, restoring both working tree and index.
+     * Uses native git for speed, falls back to JGit.
+     * @param commitSha The commit SHA to restore from
+     * @param paths The paths to checkout
+     * @return true if checkout succeeded
+     * @throws Exception
+     */
+    boolean checkoutPathsFromCommit(String commitSha, String... paths) throws Exception;
+
+    /**
      * Commit any changes
      * @param commitMessage
      * @param amend If true, previous commit is amended
