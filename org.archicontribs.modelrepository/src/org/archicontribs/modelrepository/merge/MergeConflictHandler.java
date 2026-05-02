@@ -1109,7 +1109,7 @@ public class MergeConflictHandler {
         return fArchiRepo.getFileContents(path, ref);
     }
     
-    List<MergeObjectInfo> getMergeObjectInfos() {
+    public List<MergeObjectInfo> getMergeObjectInfos() {
         return fMergeObjectInfos;
     }
     
@@ -1240,6 +1240,23 @@ public class MergeConflictHandler {
      */
     public static int detectAndRemoveCrossPathDeletions(Repository repo, ObjectId oursCommitId,
             ObjectId theirsCommitId) throws IOException, GitAPIException {
+        return detectAndRemoveCrossPathDeletions(repo, oursCommitId, theirsCommitId, null);
+        }
+
+        /**
+         * Detect and remove cross-path deletion leaks, optionally scoped to impacted
+         * repo-relative model directories.
+         *
+         * @param repo the JGit repository (must have a working tree)
+         * @param oursCommitId the commit ID of our branch (before merge)
+         * @param theirsCommitId the commit ID of the branch being merged in
+         * @param impactedModelDirs repo-relative directories under model/, or null for full scan
+         * @return the number of leaked element files removed
+         * @throws IOException if an I/O error occurs
+         * @throws GitAPIException if a git operation fails
+         */
+        public static int detectAndRemoveCrossPathDeletions(Repository repo, ObjectId oursCommitId,
+            ObjectId theirsCommitId, Set<String> impactedModelDirs) throws IOException, GitAPIException {
         
         long t = System.nanoTime();
         File repoRoot = repo.getWorkTree();
@@ -1252,14 +1269,39 @@ public class MergeConflictHandler {
             return 0;
         }
         
-        // Find leaked element files in the working tree
-        File modelDir = new File(repoRoot, IGraficoConstants.MODEL_FOLDER);
-        if(!modelDir.isDirectory()) {
-            return 0;
-        }
-        
         List<String> leakedPaths = new ArrayList<>();
-        findLeakedElementFiles(modelDir, repoRoot, deletedIds, leakedPaths);
+
+        if(impactedModelDirs == null || impactedModelDirs.isEmpty()) {
+            File modelDir = new File(repoRoot, IGraficoConstants.MODEL_FOLDER);
+            if(!modelDir.isDirectory()) {
+                return 0;
+            }
+            findLeakedElementFiles(modelDir, repoRoot, deletedIds, leakedPaths);
+        }
+        else {
+            Set<String> visitedDirs = new HashSet<>();
+            for(String relDir : impactedModelDirs) {
+                if(relDir == null || relDir.isBlank()) {
+                    continue;
+                }
+
+                String normalized = relDir.replace('\\', '/');
+                if(!normalized.startsWith(IGraficoConstants.MODEL_FOLDER)) {
+                    continue;
+                }
+
+                if(!visitedDirs.add(normalized)) {
+                    continue;
+                }
+
+                File scopedDir = new File(repoRoot, normalized.replace('/', File.separatorChar));
+                if(!scopedDir.isDirectory()) {
+                    continue;
+                }
+
+                findLeakedElementFiles(scopedDir, repoRoot, deletedIds, leakedPaths);
+            }
+        }
         
         if(leakedPaths.isEmpty()) {
             return 0;

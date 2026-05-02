@@ -11,8 +11,10 @@ import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.UIPerfLogger;
@@ -919,13 +921,24 @@ public class GraficoModelLoader {
      * @throws IOException if the model directory cannot be read
      */
     public int repairMissingFolderXml() throws IOException {
+        return repairMissingFolderXml(null);
+    }
+
+    /**
+     * Repair missing folder.xml files, optionally scoped to repo-relative model directories
+     * impacted by the merge.
+     *
+     * @param impactedModelDirs repo-relative directories under model/, or null for full scan
+     * @return number of repaired directories (excluding pending moves)
+     * @throws IOException if model directory cannot be read
+     */
+    public int repairMissingFolderXml(Set<String> impactedModelDirs) throws IOException {
         File modelDir = new File(fRepository.getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
         if(!modelDir.isDirectory()) {
             return 0;
         }
         
-        List<File> dirsWithMissingFolderXml = new ArrayList<>();
-        findDirsWithMissingFolderXml(modelDir, dirsWithMissingFolderXml);
+        List<File> dirsWithMissingFolderXml = collectScopedMissingFolderDirs(modelDir, impactedModelDirs);
         
         // Build a map of folder ID → directories (for move and duplicate detection)
         java.util.Map<String, java.util.List<File>> folderIdMap = collectFolderIdMap(modelDir);
@@ -961,6 +974,44 @@ public class GraficoModelLoader {
         }
         
         return repairedDirPatterns.size();
+    }
+
+    /**
+     * Collect directories missing folder.xml, either by full model scan or by scanning
+     * only impacted directories and their descendants.
+     */
+    private List<File> collectScopedMissingFolderDirs(File modelDir, Set<String> impactedModelDirs) {
+        LinkedHashSet<File> uniqueDirs = new LinkedHashSet<>();
+
+        if(impactedModelDirs == null || impactedModelDirs.isEmpty()) {
+            List<File> fullScan = new ArrayList<>();
+            findDirsWithMissingFolderXml(modelDir, fullScan);
+            uniqueDirs.addAll(fullScan);
+        }
+        else {
+            File repoRoot = fRepository.getLocalRepositoryFolder();
+            for(String relDir : impactedModelDirs) {
+                if(relDir == null || relDir.isBlank()) {
+                    continue;
+                }
+
+                String normalized = relDir.replace('\\', '/');
+                if(!normalized.startsWith(IGraficoConstants.MODEL_FOLDER)) {
+                    continue;
+                }
+
+                File scopedDir = new File(repoRoot, normalized.replace('/', File.separatorChar));
+                if(!scopedDir.isDirectory()) {
+                    continue;
+                }
+
+                List<File> scopedResults = new ArrayList<>();
+                findDirsWithMissingFolderXml(scopedDir, scopedResults);
+                uniqueDirs.addAll(scopedResults);
+            }
+        }
+
+        return new ArrayList<>(uniqueDirs);
     }
     
     /**

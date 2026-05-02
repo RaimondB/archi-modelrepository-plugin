@@ -46,6 +46,9 @@ import org.eclipse.jgit.api.RemoteAddCommand;
 import org.eclipse.jgit.api.ResetCommand.ResetType;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.diff.DiffEntry;
+import org.eclipse.jgit.diff.DiffFormatter;
+import org.eclipse.jgit.diff.RawTextComparator;
 import org.eclipse.jgit.errors.ConfigInvalidException;
 import org.eclipse.jgit.lib.ConfigConstants;
 import org.eclipse.jgit.lib.Constants;
@@ -66,6 +69,7 @@ import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.jgit.treewalk.filter.PathFilter;
+import org.eclipse.jgit.util.io.DisabledOutputStream;
 import org.eclipse.ui.PlatformUI;
 
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -1129,6 +1133,87 @@ public class ArchiRepository implements IArchiRepository {
         
         if(!nativeGitUsed) {
             collectDeletedIdsJGit(repo, oursCommitId, theirsCommitId, mergeBaseSha, deletedIds);
+        }
+    }
+
+    /**
+     * Collect repo-relative model directories impacted by a merge between ours and theirs.
+     * Uses merge-base deltas from both parents and includes ancestor directories up to model/.
+     *
+     * @param repo the JGit repository
+     * @param oursCommitId our commit (typically HEAD before merge)
+     * @param theirsCommitId their commit (typically remote tip)
+     * @param impactedModelDirs set populated with repo-relative directories under model/
+     * @throws IOException if git history cannot be read
+     */
+    public static void collectMergeImpactedModelDirs(Repository repo, ObjectId oursCommitId,
+            ObjectId theirsCommitId, Set<String> impactedModelDirs) throws IOException {
+        if(repo == null || oursCommitId == null || theirsCommitId == null || impactedModelDirs == null) {
+            return;
+        }
+
+        try(RevWalk rw = new RevWalk(repo)) {
+            RevCommit oursCommit = rw.parseCommit(oursCommitId);
+            RevCommit theirsCommit = rw.parseCommit(theirsCommitId);
+            rw.setRevFilter(RevFilter.MERGE_BASE);
+            rw.markStart(oursCommit);
+            rw.markStart(theirsCommit);
+            RevCommit mergeBase = rw.next();
+            if(mergeBase == null) {
+                impactedModelDirs.add(IGraficoConstants.MODEL_FOLDER);
+                return;
+            }
+
+            collectImpactedDirsFromDiff(repo, mergeBase, oursCommit, impactedModelDirs);
+            collectImpactedDirsFromDiff(repo, mergeBase, theirsCommit, impactedModelDirs);
+        }
+
+        if(impactedModelDirs.isEmpty()) {
+            impactedModelDirs.add(IGraficoConstants.MODEL_FOLDER);
+        }
+    }
+
+    private static void collectImpactedDirsFromDiff(Repository repo, RevCommit oldCommit,
+            RevCommit newCommit, Set<String> impactedModelDirs) throws IOException {
+        try(DiffFormatter df = new DiffFormatter(DisabledOutputStream.INSTANCE)) {
+            df.setRepository(repo);
+            df.setDetectRenames(true);
+            df.setDiffComparator(RawTextComparator.DEFAULT);
+
+            for(DiffEntry diff : df.scan(oldCommit.getTree(), newCommit.getTree())) {
+                addImpactedDirForPath(diff.getOldPath(), impactedModelDirs);
+                addImpactedDirForPath(diff.getNewPath(), impactedModelDirs);
+            }
+        }
+    }
+
+    private static void addImpactedDirForPath(String path, Set<String> impactedModelDirs) {
+        if(path == null || DiffEntry.DEV_NULL.equals(path)) {
+            return;
+        }
+
+        if(!path.startsWith(IGraficoConstants.MODEL_FOLDER + "/")) { //$NON-NLS-1$
+            return;
+        }
+
+        int slash = path.lastIndexOf('/');
+        if(slash <= 0) {
+            impactedModelDirs.add(IGraficoConstants.MODEL_FOLDER);
+            return;
+        }
+
+        String dir = path.substring(0, slash);
+        while(dir.startsWith(IGraficoConstants.MODEL_FOLDER)) {
+            impactedModelDirs.add(dir);
+            if(IGraficoConstants.MODEL_FOLDER.equals(dir)) {
+                break;
+            }
+            int idx = dir.lastIndexOf('/');
+            if(idx <= 0) {
+                impactedModelDirs.add(IGraficoConstants.MODEL_FOLDER);
+                break;
+            }
+            dir = dir.substring(0, idx);
         }
     }
     

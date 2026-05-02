@@ -7,6 +7,8 @@ package org.archicontribs.modelrepository.services;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.HashSet;
+import java.util.Set;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
@@ -350,12 +352,12 @@ public class RepositoryService {
                 return new RefreshResult(RefreshResult.Status.MERGE_CANCELLED);
             }
 
-            // Detect and remove elements deleted by one parent but leaked via move
-            monitor.subTask(Messages.RepositoryService_3);
-            detectAndRemoveCrossPathDeletions(repo, oursIdBeforePull, branchStatus);
+            // Conflicting merges are resolved by explicit user choices in handler.merge().
+            // Skip cross-path deletion cleanup here so we don't override chosen outcomes.
+            Set<String> impactedModelDirs = collectMergeImpactedModelDirs(repo, oursIdBeforePull, branchStatus);
 
             // Pre-repair: detect and resolve folder moves before loading the model
-            loader.repairMissingFolderXml();
+            loader.repairMissingFolderXml(impactedModelDirs);
             loader.applyFolderMoveResolutions();
 
             // Reload the model (delegated to MergeHandler — interactive mode needs UI thread)
@@ -371,11 +373,12 @@ public class RepositoryService {
         else {
             // Clean merge path
             monitor.subTask(Messages.RepositoryService_3);
-            detectAndRemoveCrossPathDeletions(repo, oursIdBeforePull, branchStatus);
+            Set<String> impactedModelDirs = collectMergeImpactedModelDirs(repo, oursIdBeforePull, branchStatus);
+            detectAndRemoveCrossPathDeletions(repo, oursIdBeforePull, branchStatus, impactedModelDirs);
 
             // Pre-repair: detect folder moves before loading the model
             phaseStart = System.nanoTime();
-            loader.repairMissingFolderXml();
+            loader.repairMissingFolderXml(impactedModelDirs);
             logPerf("repairMissingFolderXml", phaseStart); //$NON-NLS-1$
 
             // Delegate folder move resolution to MergeHandler
@@ -658,20 +661,25 @@ public class RepositoryService {
                 }
             }
 
-            // Cross-path deletion detection
-            monitor.subTask(Messages.RepositoryService_3);
-            phaseStart = System.nanoTime();
-            if(oursId != null && theirsId != null) {
-                int removed = MergeConflictHandler.detectAndRemoveCrossPathDeletions(
-                        git.getRepository(), oursId, theirsId);
-                log(IStatus.INFO, "[RepositoryService] detectAndRemoveCrossPathDeletions: removed=" + removed);
+            Set<String> impactedModelDirs = collectMergeImpactedModelDirs(git.getRepository(), oursId, theirsId);
+
+            // Cross-path deletion detection is safe for clean merges. For conflicting
+            // merges, user conflict choices are authoritative, so skip this cleanup.
+            if(shouldRunCrossPathDeletion(status)) {
+                monitor.subTask(Messages.RepositoryService_3);
+                phaseStart = System.nanoTime();
+                if(oursId != null && theirsId != null) {
+                    int removed = MergeConflictHandler.detectAndRemoveCrossPathDeletions(
+                            git.getRepository(), oursId, theirsId, impactedModelDirs);
+                    log(IStatus.INFO, "[RepositoryService] detectAndRemoveCrossPathDeletions: removed=" + removed);
+                }
+                logPerf("detectAndRemoveCrossPathDeletions (mergeBranch)", phaseStart);
             }
-            logPerf("detectAndRemoveCrossPathDeletions (mergeBranch)", phaseStart);
 
             // Folder repair
             GraficoModelLoader loader = new GraficoModelLoader(repo);
             phaseStart = System.nanoTime();
-            loader.repairMissingFolderXml();
+            loader.repairMissingFolderXml(impactedModelDirs);
             logPerf("repairMissingFolderXml", phaseStart);
 
             if(loader.hasPendingFolderMoves()) {
@@ -728,7 +736,8 @@ public class RepositoryService {
     // ---- Private helpers ----
 
     private void detectAndRemoveCrossPathDeletions(IArchiRepository repo,
-            ObjectId oursIdBeforePull, BranchStatus branchStatus) throws IOException, GitAPIException {
+            ObjectId oursIdBeforePull, BranchStatus branchStatus,
+            Set<String> impactedModelDirs) throws IOException, GitAPIException {
         if(oursIdBeforePull != null) {
             long phaseStart = System.nanoTime();
             try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
@@ -736,11 +745,46 @@ public class RepositoryService {
                         branchStatus.getCurrentRemoteBranch().getFullName());
                 if(theirsId != null) {
                     MergeConflictHandler.detectAndRemoveCrossPathDeletions(
-                            git.getRepository(), oursIdBeforePull, theirsId);
+                            git.getRepository(), oursIdBeforePull, theirsId, impactedModelDirs);
                 }
             }
             logPerf("detectAndRemoveCrossPathDeletions", phaseStart); //$NON-NLS-1$
         }
+    }
+
+    private Set<String> collectMergeImpactedModelDirs(IArchiRepository repo,
+            ObjectId oursIdBeforePull, BranchStatus branchStatus) throws IOException {
+        if(oursIdBeforePull == null || branchStatus == null || branchStatus.getCurrentRemoteBranch() == null) {
+            return null;
+        }
+
+        try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+            ObjectId theirsId = git.getRepository().resolve(
+                    branchStatus.getCurrentRemoteBranch().getFullName());
+            return collectMergeImpactedModelDirs(git.getRepository(), oursIdBeforePull, theirsId);
+        }
+    }
+
+    private Set<String> collectMergeImpactedModelDirs(Repository repository,
+            ObjectId oursCommitId, ObjectId theirsCommitId) throws IOException {
+        if(repository == null || oursCommitId == null || theirsCommitId == null) {
+            return null;
+        }
+
+        Set<String> impactedModelDirs = new HashSet<>();
+        ArchiRepository.collectMergeImpactedModelDirs(
+                repository, oursCommitId, theirsCommitId, impactedModelDirs);
+
+        log(IStatus.INFO, "[RepositoryService] impacted model dirs=" + impactedModelDirs.size()); //$NON-NLS-1$
+        return impactedModelDirs;
+    }
+
+    /**
+     * Cross-path deletion cleanup is safe for clean merges, but must be skipped
+     * for conflicting merges where explicit user conflict choices are authoritative.
+     */
+    static boolean shouldRunCrossPathDeletion(MergeStatus status) {
+        return status != MergeStatus.CONFLICTING;
     }
 
     private static void logPerf(String phase, long startNanos) {
