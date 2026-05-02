@@ -11,6 +11,7 @@ import java.text.DateFormat;
 import java.util.Date;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
@@ -28,6 +29,7 @@ import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Control;
 
 import com.archimatetool.editor.ui.ColorFactory;
 import com.archimatetool.editor.ui.FontFactory;
@@ -94,7 +96,8 @@ public class BranchesTableViewer extends TableViewer {
         setInput(archiRepo);
         
         // Do the Layout kludge
-        getTable().getParent().layout();
+        UIPerfLogger.log("[BranchesTable]", "parent.layout() called (doSetInput)"); //$NON-NLS-1$
+        getTable().getParent().layout(new Control[] { getTable() });
 
         // Select first row
         //Object element = getElementAt(0);
@@ -113,7 +116,8 @@ public class BranchesTableViewer extends TableViewer {
         fPrecomputedBranchStatus = null;
         
         // Do the Layout kludge
-        getTable().getParent().layout();
+        UIPerfLogger.log("[BranchesTable]", "parent.layout() called (doSetInput+BranchStatus)"); //$NON-NLS-1$
+        getTable().getParent().layout(new Control[] { getTable() });
         
         // Reveal and select the current branch so the user gets immediate visual confirmation
         revealCurrentBranch(branchStatus);

@@ -35,6 +35,7 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.swt.SWT;
+import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
@@ -196,7 +197,8 @@ public class HistoryTableViewer extends TableViewer {
                     }
                     
                     // Layout and select outside setRedraw block
-                    getTable().getParent().layout();
+                    UIPerfLogger.log("[HistoryTable]", "parent.layout() called"); //$NON-NLS-1$
+                    getTable().getParent().layout(new Control[] { getTable() });
                     
                     // Select first row
                     Object element = getElementAt(0);

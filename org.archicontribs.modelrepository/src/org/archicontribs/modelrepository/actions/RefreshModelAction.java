@@ -11,6 +11,7 @@ import java.security.GeneralSecurityException;
 import java.util.concurrent.CancellationException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator;
 import org.archicontribs.modelrepository.authentication.ProxyAuthenticator;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
@@ -92,7 +93,9 @@ public class RefreshModelAction extends AbstractModelAction {
             MergeHandler mergeHandler = new InteractiveMergeHandler(fWindow.getShell());
 
             // Do main action with PM dialog — run on background thread (true)
-            ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(fWindow.getShell());
+            // null parent avoids Windows WM_ACTIVATE/WM_DEACTIVATE cycle that causes maximize/restore flash
+            UIPerfLogger.log("[Refresh]", "ProgressMonitorDialog opening, shell.maximized=" + fWindow.getShell().getMaximized()); //$NON-NLS-1$
+            ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(null);
             
             pmDialog.run(true, true, new IRunnableWithProgress() {
                 @Override

@@ -244,7 +244,9 @@ public class SwitchBranchAction extends AbstractModelAction {
         long tSwitch = System.nanoTime();
         
         // Use ProgressMonitorDialog directly so we can control the cancel button
-        ProgressMonitorDialog dialog = new ProgressMonitorDialog(fWindow.getShell());
+        // null parent avoids Windows WM_ACTIVATE/WM_DEACTIVATE cycle that causes maximize/restore flash
+        UIPerfLogger.log(TAG, "ProgressMonitorDialog opening, shell.maximized=" + fWindow.getShell().getMaximized()); //$NON-NLS-1$
+        ProgressMonitorDialog dialog = new ProgressMonitorDialog(null);
         dialog.setCancelable(true);  // Start with cancel enabled (for checkout phase)
         
         try {
@@ -315,7 +317,7 @@ public class SwitchBranchAction extends AbstractModelAction {
             // Should not happen - import phase ignores cancellation
         }
         
-        UIPerfLogger.log(TAG, "dialog.run() returned", tSwitch); //$NON-NLS-1$
+        UIPerfLogger.log(TAG, "dialog.run() returned, shell.maximized=" + fWindow.getShell().getMaximized(), tSwitch); //$NON-NLS-1$
         
         // Re-throw any exception from the background phase
         if(exception[0] != null) {

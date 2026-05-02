@@ -58,6 +58,11 @@ import com.archimatetool.model.util.ArchimateModelUtils;
  * @author Phillip Beauvoir
  */
 public class GraficoModelLoader {
+    /**
+     * Result container for import-only phase so callers can run import in a
+     * worker thread and do UI open/close/reopen on the SWT thread.
+     */
+    public record ImportResult(IArchimateModel model, GraficoModelImporter importer) {}
     
     private IArchiRepository fRepository;
     private boolean bHeadless;
@@ -161,9 +166,10 @@ public class GraficoModelLoader {
             // Use ProgressMonitorDialog instead of busyCursorWhile() to ensure
             // the event loop is pumped and asyncExec runnables are processed
             try {
+                // null parent avoids Windows WM_ACTIVATE/WM_DEACTIVATE cycle that causes maximize/restore flash
+                UIPerfLogger.log("[ModelLoader]", "ProgressMonitorDialog opening, shell.maximized=" + PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell().getMaximized()); //$NON-NLS-1$
                 org.eclipse.jface.dialogs.ProgressMonitorDialog dialog = 
-                    new org.eclipse.jface.dialogs.ProgressMonitorDialog(
-                        PlatformUI.getWorkbench().getActiveWorkbenchWindow().getShell());
+                    new org.eclipse.jface.dialogs.ProgressMonitorDialog(null);
                 dialog.run(true, true, new IRunnableWithProgress() {
                     @Override
                     public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
@@ -249,6 +255,31 @@ public class GraficoModelLoader {
         }
         
         return graficoModel[0];
+    }
+
+    /**
+     * Import the model data only (no save/close/open editor operations).
+     * <p>
+     * Use this from background worker threads and then call
+     * {@link #openModel(IArchimateModel, GraficoModelImporter)} on the UI thread.
+     * </p>
+     *
+     * @param monitor progress monitor (may be null)
+     * @return import result containing model and importer context
+     * @throws IOException on import errors
+     */
+    public ImportResult importModelOnly(IProgressMonitor monitor) throws IOException {
+        GraficoModelImporter importer = new GraficoModelImporter(fRepository.getLocalRepositoryFolder());
+        IArchimateModel model;
+        
+        if(monitor != null) {
+            model = importer.importAsModel(monitor);
+        }
+        else {
+            model = importer.importAsModel();
+        }
+        
+        return new ImportResult(model, importer);
     }
     
     /**

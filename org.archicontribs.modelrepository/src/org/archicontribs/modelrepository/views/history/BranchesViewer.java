@@ -8,6 +8,7 @@ package org.archicontribs.modelrepository.views.history;
 import java.io.IOException;
 import java.text.Collator;
 
+import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.IArchiRepository;
@@ -20,6 +21,7 @@ import org.eclipse.jface.viewers.ViewerComparator;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Control;
 
 /**
  * Branches Viewer
@@ -105,6 +107,7 @@ public class BranchesViewer extends ComboViewer {
         }
         
         // And relayout
-        getControl().getParent().layout();
+        UIPerfLogger.log("[BranchesViewer]", "parent.layout() called"); //$NON-NLS-1$
+        getControl().getParent().layout(new Control[] { getControl() });
     }
 }
