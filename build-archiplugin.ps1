@@ -28,6 +28,34 @@ $mainPluginId = "org.archicontribs.modelrepository"
 $cmdlinePluginId = "org.archicontribs.modelrepository.commandline"
 $sourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# --- Cleanup function to release locks from previous builds ---
+function Cleanup-BuildLocks {
+    param([string]$SourceDir)
+    
+    # Kill any orphaned Maven/Java processes that may be holding locks
+    try {
+        Get-Process java -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "maven|tycho" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    } catch { }
+    
+    # Remove OSGi runtime working directory which holds file locks on extracted JARs
+    # This is the most common cause of "The process cannot access the file" errors
+    $workDirs = @(
+        "$SourceDir\org.archicontribs.modelrepository\target\work",
+        "$SourceDir\org.archicontribs.modelrepository.tests\target\work"
+    )
+    
+    foreach ($workDir in $workDirs) {
+        if (Test-Path $workDir) {
+            try {
+                Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Cleaned OSGi runtime directory: $workDir" -ForegroundColor DarkGray
+            } catch {
+                Write-Host "Note: Could not clean $workDir, may retry after build" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 # Load local config if exists
 $configFile = Join-Path $sourceDir "build-config.local.json"
 if (Test-Path $configFile) {
@@ -169,6 +197,9 @@ $runtimeBlock
 # Update classpath before build (if runtime already exists from previous build)
 Update-Classpath -SourceDir $sourceDir
 
+# Clean up any orphaned processes and file locks before Maven build
+Cleanup-BuildLocks -SourceDir $sourceDir
+
 # Run Maven build unless skipped
 if (-not $SkipMaven) {
     Write-Host ""
@@ -184,6 +215,9 @@ if (-not $SkipMaven) {
         Pop-Location
     }
 }
+
+# Final cleanup to ensure all build processes are fully released
+Cleanup-BuildLocks -SourceDir $sourceDir
 
 # Update classpath after build (picks up newly downloaded Archi runtime)
 Update-Classpath -SourceDir $sourceDir

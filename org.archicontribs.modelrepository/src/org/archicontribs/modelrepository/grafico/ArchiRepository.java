@@ -17,7 +17,10 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -27,6 +30,7 @@ import org.archicontribs.modelrepository.authentication.CredentialsAuthenticator
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.preferences.IPreferenceConstants;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jface.operation.IRunnableWithProgress;
 import org.eclipse.jgit.api.AddCommand;
@@ -86,6 +90,11 @@ import com.archimatetool.model.IArchimateModel;
  */
 @SuppressWarnings("nls")
 public class ArchiRepository implements IArchiRepository {
+
+    /**
+     * Lightweight merge outcome for service-layer workflows.
+     */
+    public record MergeOperationResult(MergeResult.MergeStatus status, Set<String> conflictingPaths) {}
     
     /**
      * The folder location of the local repository
@@ -215,6 +224,19 @@ public class ArchiRepository implements IArchiRepository {
             return !status.isClean();
         }
     }
+
+    private Set<String> getConflictingPaths() throws IOException, GitAPIException {
+        try(Git git = Git.open(getLocalRepositoryFolder())) {
+            return new LinkedHashSet<>(git.status().call().getConflicting());
+        }
+    }
+
+    private MergeOperationResult fromJGitMergeResult(MergeResult result) {
+        Set<String> conflictingPaths = result.getConflicts() != null
+                ? new LinkedHashSet<>(result.getConflicts().keySet())
+                : Set.of();
+        return new MergeOperationResult(result.getMergeStatus(), conflictingPaths);
+    }
     
     /**
      * Checkout paths from a specific commit, restoring both working tree and index.
@@ -222,14 +244,54 @@ public class ArchiRepository implements IArchiRepository {
      * @return true if checkout succeeded
      */
     public boolean checkoutPathsFromCommit(String commitSha, String... paths) throws Exception {
+        List<String> existingPaths = new ArrayList<>();
+
+        try(Git git = Git.open(getLocalRepositoryFolder());
+                RevWalk revWalk = new RevWalk(git.getRepository())) {
+            ObjectId commitId = git.getRepository().resolve(commitSha);
+            if(commitId == null) {
+                throw new IOException("Cannot resolve commit: " + commitSha);
+            }
+
+            RevCommit commit = revWalk.parseCommit(commitId);
+            RevTree tree = commit.getTree();
+
+            for(String path : paths) {
+                if(path == null || path.isBlank()) {
+                    continue;
+                }
+
+                String normalizedPath = path.replace('\\', '/');
+                while(normalizedPath.startsWith("/")) {
+                    normalizedPath = normalizedPath.substring(1);
+                }
+                while(normalizedPath.endsWith("/")) {
+                    normalizedPath = normalizedPath.substring(0, normalizedPath.length() - 1);
+                }
+
+                if(normalizedPath.isEmpty()) {
+                    continue;
+                }
+
+                if(TreeWalk.forPath(git.getRepository(), normalizedPath, tree) != null) {
+                    existingPaths.add(normalizedPath);
+                }
+            }
+        }
+
+        if(existingPaths.isEmpty()) {
+            return true;
+        }
+
         boolean nativeSuccess = isNativeGitEnabled()
-                && NativeGitExecutor.checkoutPathsFromCommit(getLocalRepositoryFolder(), commitSha, paths);
+                && NativeGitExecutor.checkoutPathsFromCommit(
+                        getLocalRepositoryFolder(), commitSha, existingPaths.toArray(new String[0]));
         
         if(!nativeSuccess) {
             try(Git git = Git.open(getLocalRepositoryFolder())) {
                 CheckoutCommand checkout = git.checkout();
                 checkout.setStartPoint(commitSha);
-                for(String path : paths) {
+                for(String path : existingPaths) {
                     checkout.addPath(path);
                 }
                 checkout.call();
@@ -386,12 +448,11 @@ public class ArchiRepository implements IArchiRepository {
      * 
      * @param remoteBranch the remote tracking branch (e.g. "origin/master")
      * @param monitor optional progress monitor for reporting merge status (can be null)
-     * @return MergeResult from JGit if JGit performed the merge (may be clean or conflicting),
-     *         or null if native git performed a clean merge
+     * @return merge outcome containing status and any conflicting paths
      * @throws IOException if the merge command failed
      * @throws GitAPIException if a JGit operation fails
      */
-    public MergeResult merge(String remoteBranch, IProgressMonitor monitor) throws IOException, GitAPIException {
+    public MergeOperationResult merge(String remoteBranch, IProgressMonitor monitor) throws IOException, GitAPIException {
         // Phase 1: Try native git merge (dramatically faster for large repos)
         if(isNativeGitEnabled()) {
             Boolean nativeResult = NativeGitExecutor.merge(getLocalRepositoryFolder(), remoteBranch, monitor);
@@ -400,12 +461,13 @@ public class ArchiRepository implements IArchiRepository {
                 // Native merge succeeded cleanly — sync JGit state
                 Git.open(getLocalRepositoryFolder()).close();
                 invalidateBranchStatusCache();
-                return null;
+                return new MergeOperationResult(null, Set.of());
             }
             else if(Boolean.FALSE.equals(nativeResult)) {
-                // Native merge had conflicts — abort and fall through to JGit
-                NativeGitExecutor.abortMerge(getLocalRepositoryFolder());
+                // Native merge had conflicts — keep its state and use the conflicting paths directly.
                 Git.open(getLocalRepositoryFolder()).close();
+                invalidateBranchStatusCache();
+                return new MergeOperationResult(MergeResult.MergeStatus.CONFLICTING, getConflictingPaths());
             }
             // null = native git not available — fall through to JGit
         }
@@ -417,7 +479,7 @@ public class ArchiRepository implements IArchiRepository {
             mergeCommand.include(remoteBranch, remoteId);
             MergeResult result = mergeCommand.call();
             invalidateBranchStatusCache();
-            return result;
+            return fromJGitMergeResult(result);
         }
     }
     
@@ -429,28 +491,38 @@ public class ArchiRepository implements IArchiRepository {
      * @param branchName the local branch name to merge (e.g. "feature")
      * @param commitMessage the commit message for the merge
      * @param monitor optional progress monitor for reporting merge status (can be null)
-     * @return MergeResult from JGit if JGit performed the merge (may be clean or conflicting),
-     *         or null if native git performed a clean merge
+     * @return merge outcome containing status and any conflicting paths
      * @throws IOException if the merge command failed
      * @throws GitAPIException if a JGit operation fails
      */
-    public MergeResult mergeBranch(String branchName, String commitMessage, IProgressMonitor monitor) throws IOException, GitAPIException {
+    public MergeOperationResult mergeBranch(String branchName, String commitMessage, IProgressMonitor monitor) throws IOException, GitAPIException {
+        long t0 = System.nanoTime();
+        
         // Phase 1: Try native git merge (dramatically faster for large repos)
         if(isNativeGitEnabled()) {
+            long t1 = System.nanoTime();
             Boolean nativeResult = NativeGitExecutor.mergeWithMessage(getLocalRepositoryFolder(), branchName, commitMessage, monitor);
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, 
+                String.format("[ArchiRepository] NativeGitExecutor.mergeWithMessage took %.1fs", (System.nanoTime() - t1) / 1_000_000_000.0), null);
             
             if(Boolean.TRUE.equals(nativeResult)) {
                 Git.open(getLocalRepositoryFolder()).close();
                 invalidateBranchStatusCache();
-                return null;
+                return new MergeOperationResult(null, Set.of());
             }
             else if(Boolean.FALSE.equals(nativeResult)) {
-                NativeGitExecutor.abortMerge(getLocalRepositoryFolder());
                 Git.open(getLocalRepositoryFolder()).close();
+                invalidateBranchStatusCache();
+                Set<String> conflictingPaths = getConflictingPaths();
+                ModelRepositoryPlugin.getInstance().log(IStatus.INFO,
+                    String.format("[ArchiRepository] Native merge conflicts retained: %d path(s), total mergeBranch %.1fs",
+                        conflictingPaths.size(), (System.nanoTime() - t0) / 1_000_000_000.0), null);
+                return new MergeOperationResult(MergeResult.MergeStatus.CONFLICTING, conflictingPaths);
             }
         }
         
         // Phase 2: JGit merge fallback
+        long t2 = System.nanoTime();
         try(Git git = Git.open(getLocalRepositoryFolder())) {
             ObjectId branchId = git.getRepository().resolve(branchName);
             MergeCommand mergeCommand = git.merge();
@@ -462,7 +534,10 @@ public class ArchiRepository implements IArchiRepository {
             mergeCommand.setMessage(commitMessage);
             MergeResult result = mergeCommand.call();
             invalidateBranchStatusCache();
-            return result;
+            ModelRepositoryPlugin.getInstance().log(IStatus.INFO, 
+                String.format("[ArchiRepository] JGit merge took %.1fs, total mergeBranch %.1fs", 
+                    (System.nanoTime() - t2) / 1_000_000_000.0, (System.nanoTime() - t0) / 1_000_000_000.0), null);
+            return fromJGitMergeResult(result);
         }
     }
     

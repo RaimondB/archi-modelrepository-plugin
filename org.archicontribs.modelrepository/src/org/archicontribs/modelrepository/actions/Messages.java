@@ -186,6 +186,18 @@ public class Messages extends NLS {
 
     public static String RestoreCommitAction_4;
 
+    public static String RestoreCommitAction_5;
+
+    public static String RestoreCommitAction_6;
+
+    public static String RestoreCommitAction_7;
+
+    public static String RestoreCommitAction_8;
+
+    public static String RestoreCommitAction_9;
+
+    public static String RestoreCommitAction_10;
+
     public static String ReviewChangesAction_0;
 
     public static String ReviewChangesAction_1;
@@ -205,6 +217,14 @@ public class Messages extends NLS {
     public static String SwitchBranchAction_0;
 
     public static String SwitchBranchAction_1;
+
+    public static String InteractiveMergeHandler_0;
+
+    public static String InteractiveMergeHandler_1;
+
+    public static String InteractiveMergeHandler_2;
+
+    public static String InteractiveMergeHandler_3;
 
     public static String SwitchBranchAction_2;
 

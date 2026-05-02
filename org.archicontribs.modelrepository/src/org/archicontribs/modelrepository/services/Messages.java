@@ -20,6 +20,7 @@ public class Messages extends NLS {
     public static String RepositoryService_11;
     public static String RepositoryService_12;
     public static String RepositoryService_13;
+    public static String RepositoryService_14;
 
     static {
         NLS.initializeMessages(BUNDLE_NAME, Messages.class);

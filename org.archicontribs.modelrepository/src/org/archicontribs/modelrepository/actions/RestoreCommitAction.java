@@ -7,6 +7,7 @@ package org.archicontribs.modelrepository.actions;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 
 import org.archicontribs.modelrepository.IModelRepositoryImages;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter;
@@ -14,10 +15,14 @@ import org.archicontribs.modelrepository.grafico.GraficoModelLoader;
 import org.archicontribs.modelrepository.grafico.IGraficoConstants;
 import org.archicontribs.modelrepository.grafico.IRepositoryListener;
 import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.dialogs.ProgressMonitorDialog;
+import org.eclipse.jface.operation.IRunnableWithProgress;
+import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.IWorkbenchWindow;
 
 import com.archimatetool.editor.model.IEditorModelManager;
@@ -65,65 +70,111 @@ public class RestoreCommitAction extends AbstractModelAction {
         
         String commitSha = fCommit.getName();
         File repoFolder = getRepository().getLocalRepositoryFolder();
-        
-        // Delete the content folders first
-        try {
-            File modelFolder = new File(repoFolder, IGraficoConstants.MODEL_FOLDER);
-            FileUtils.deleteFolder(modelFolder);
-            modelFolder.mkdirs();
 
-            File imagesFolder = new File(repoFolder, IGraficoConstants.IMAGES_FOLDER);
-            FileUtils.deleteFolder(imagesFolder);
-            imagesFolder.mkdirs();
-        }
-        catch(IOException ex) {
-            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
-            return;
-        }
-        
-        // Restore working tree + index from the commit.
-        // Uses native git if available (dramatically faster for large trees),
-        // falls back to JGit CheckoutCommand.
-        try {
-            getRepository().checkoutPathsFromCommit(commitSha,
-                    IGraficoConstants.MODEL_FOLDER, IGraficoConstants.IMAGES_FOLDER);
-        }
-        catch(Exception ex) {
-            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
-            return;
-        }
-        
-        // Load model from commit tree (skip re-reading files from disk)
-        try(Repository repository = Git.open(repoFolder).getRepository()) {
-            GraficoModelImporter importer = new GraficoModelImporter(repository, fCommit.getTree());
-            IArchimateModel graficoModel = importer.importFromCommit(null);
-            
-            if(graficoModel != null) {
-                new GraficoModelLoader(getRepository()).openModel(graficoModel, importer);
-            }
-            else {
-                getRepository().resetToRef(IGraficoConstants.HEAD);
-                MessageDialog.openError(fWindow.getShell(), Messages.RestoreCommitAction_0, Messages.RestoreCommitAction_2);
-                return;
-            }
-        }
-        catch(Exception ex) {
-            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
-            return;
-        }
-        
-        // Commit changes
-        try {
-            getRepository().commitChanges(Messages.RestoreCommitAction_3 + " '" + fCommit.getShortMessage() + "'", false); //$NON-NLS-1$ //$NON-NLS-2$
+        final Throwable[] failure = new Throwable[1];
+        final boolean[] noModelFound = new boolean[1];
+        final boolean[] success = new boolean[1];
 
-            // Save the checksum
-            getRepository().saveChecksum();
+        ProgressMonitorDialog pmDialog = new ProgressMonitorDialog(null);
+        try {
+            pmDialog.run(true, true, new IRunnableWithProgress() {
+                @Override
+                public void run(org.eclipse.core.runtime.IProgressMonitor monitor)
+                        throws InvocationTargetException, InterruptedException {
+                    SubMonitor progress = SubMonitor.convert(monitor, Messages.RestoreCommitAction_5, 100);
+
+                    try {
+                        progress.subTask(Messages.RestoreCommitAction_6);
+                        File modelFolder = new File(repoFolder, IGraficoConstants.MODEL_FOLDER);
+                        FileUtils.deleteFolder(modelFolder);
+                        modelFolder.mkdirs();
+
+                        File imagesFolder = new File(repoFolder, IGraficoConstants.IMAGES_FOLDER);
+                        FileUtils.deleteFolder(imagesFolder);
+                        imagesFolder.mkdirs();
+                        progress.worked(10);
+
+                        if(progress.isCanceled()) {
+                            throw new InterruptedException();
+                        }
+
+                        progress.subTask(Messages.RestoreCommitAction_7);
+                        getRepository().checkoutPathsFromCommit(commitSha,
+                                IGraficoConstants.MODEL_FOLDER, IGraficoConstants.IMAGES_FOLDER);
+                        progress.worked(10);
+
+                        if(progress.isCanceled()) {
+                            throw new InterruptedException();
+                        }
+
+                        progress.subTask(Messages.RestoreCommitAction_8);
+                        try(Repository repository = Git.open(repoFolder).getRepository()) {
+                            GraficoModelImporter importer = new GraficoModelImporter(repository, fCommit.getTree());
+                            IArchimateModel graficoModel = importer.importFromCommit(progress.split(60));
+
+                            if(graficoModel == null) {
+                                getRepository().resetToRef(IGraficoConstants.HEAD);
+                                noModelFound[0] = true;
+                                return;
+                            }
+
+                            progress.subTask(Messages.RestoreCommitAction_9);
+                            IOException[] openError = new IOException[1];
+                            Display.getDefault().syncExec(() -> {
+                                try {
+                                    new GraficoModelLoader(getRepository()).openModel(graficoModel, importer);
+                                }
+                                catch(IOException ex) {
+                                    openError[0] = ex;
+                                }
+                            });
+
+                            if(openError[0] != null) {
+                                throw openError[0];
+                            }
+                        }
+
+                        if(progress.isCanceled()) {
+                            throw new InterruptedException();
+                        }
+
+                        progress.subTask(Messages.RestoreCommitAction_10);
+                        getRepository().commitChanges(Messages.RestoreCommitAction_3 + " '" + fCommit.getShortMessage() + "'", false); //$NON-NLS-1$ //$NON-NLS-2$
+                        getRepository().saveChecksum();
+                        progress.worked(20);
+
+                        success[0] = true;
+                    }
+                    catch(InterruptedException ex) {
+                        throw ex;
+                    }
+                    catch(Exception ex) {
+                        throw new InvocationTargetException(ex);
+                    }
+                }
+            });
         }
-        catch(Exception ex) {
-            displayErrorDialog(Messages.RestoreCommitAction_0, ex);
+        catch(InvocationTargetException ex) {
+            failure[0] = ex.getCause() != null ? ex.getCause() : ex;
         }
-        
-        notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+        if(failure[0] != null) {
+            displayErrorDialog(Messages.RestoreCommitAction_0, failure[0]);
+            return;
+        }
+
+        if(noModelFound[0]) {
+            MessageDialog.openError(fWindow.getShell(), Messages.RestoreCommitAction_0, Messages.RestoreCommitAction_2);
+            return;
+        }
+
+        if(success[0]) {
+            notifyChangeListeners(IRepositoryListener.HISTORY_CHANGED);
+        }
     }
     
     

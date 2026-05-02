@@ -828,6 +828,41 @@ else if (Boolean.FALSE.equals(nativeResult)) { abortNativeMerge(); }
 If we later optimize `git fetch`, `git push`, or any other operation with native git,
 **every caller benefits automatically** — no changes needed outside ArchiRepository.
 
+### Native Merge Conflicts: Do NOT Abort And Replay In JGit
+
+For conflicting merges, native git must remain the source of truth for the worktree and index.
+Aborting the native merge and replaying the same merge in JGit adds a second full merge cost on
+large repos and can dominate the end-to-end merge time.
+
+The conflict UI does **not** require a full `MergeResult` object. It only needs:
+- merge status
+- the set of conflicting paths
+
+That means the correct pattern is:
+
+```java
+// ✅ CORRECT: keep native conflicting merge state and read conflict paths from git status
+Boolean nativeResult = NativeGitExecutor.mergeWithMessage(repoDir, branchName, message, monitor);
+if (Boolean.FALSE.equals(nativeResult)) {
+    Set<String> conflictingPaths = getConflictingPaths();
+    return new MergeOperationResult(MergeStatus.CONFLICTING, conflictingPaths);
+}
+
+// ❌ WRONG: abort native conflict and pay for the merge a second time in JGit
+if (Boolean.FALSE.equals(nativeResult)) {
+    NativeGitExecutor.abortMerge(repoDir);
+    return jgitMergeAgain();
+}
+```
+
+Why this matters:
+- Native merge already performed the expensive diff/merge computation.
+- `MergeConflictHandler` consumes conflict paths, not rich JGit merge internals.
+- Replaying the merge in JGit turned a ~4s merge step into an ~84s merge step on a large model repo.
+
+If native git is unavailable, JGit remains the fallback. But when native git reports conflicts,
+**preserve that merge state and continue from the conflicting paths directly**.
+
 ---
 
 ## useNativeGit Preference: System Property Precedence

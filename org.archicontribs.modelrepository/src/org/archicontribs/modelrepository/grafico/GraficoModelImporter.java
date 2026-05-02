@@ -229,6 +229,11 @@ public class GraficoModelImporter {
     private static final boolean PERF_LOGGING = Boolean.getBoolean("grafico.perf.logging"); //$NON-NLS-1$
     
     /**
+     * Heartbeat interval for stall diagnostics while waiting for producer/consumer completion.
+     */
+    private static final int STALL_HEARTBEAT_SECONDS = 15;
+    
+    /**
      * Log performance metrics if PERF_LOGGING is enabled.
      */
     private void logPerf(String phase, long startNanos, int itemCount) {
@@ -262,6 +267,26 @@ public class GraficoModelImporter {
     private void logPerfMessage(String message) {
         if (!PERF_LOGGING) return; // Fast path - zero overhead when disabled
         ModelRepositoryPlugin.getInstance().log(IStatus.INFO, "[GRAFICO IMPORT PERF] " + message, null); //$NON-NLS-1$
+    }
+    
+    /**
+     * Log import trace messages that are always visible for hang diagnostics.
+     */
+    private void logTrace(String message) {
+        ModelRepositoryPlugin plugin = ModelRepositoryPlugin.getInstance();
+        if (plugin != null) {
+            plugin.log(IStatus.INFO, "[GRAFICO IMPORT TRACE] " + message, null); //$NON-NLS-1$
+        }
+    }
+    
+    /**
+     * Log warning-level import diagnostics.
+     */
+    private void logTraceWarning(String message) {
+        ModelRepositoryPlugin plugin = ModelRepositoryPlugin.getInstance();
+        if (plugin != null) {
+            plugin.log(IStatus.WARNING, "[GRAFICO IMPORT TRACE] " + message, null); //$NON-NLS-1$
+        }
     }
 
     /**
@@ -341,6 +366,7 @@ public class GraficoModelImporter {
     public IArchimateModel importAsModel(IProgressMonitor monitor) throws IOException {
         long importStart = System.nanoTime();
         logPerfMessage("=== IMPORT START ==="); //$NON-NLS-1$
+        logTrace("importAsModel START (monitorProvided=" + (monitor != null) + ")"); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Use SubMonitor for easier progress reporting
         SubMonitor progress = SubMonitor.convert(monitor, Messages.GraficoModelImporter_0, 100);
@@ -370,6 +396,7 @@ public class GraficoModelImporter {
     	int imageFileCount = GraficoUtils.countFilesInFolder(imagesFolder.toPath());
     	int totalFiles = modelFileCount + imageFileCount;
     	logPerf("File counting", phaseStart, totalFiles); //$NON-NLS-1$
+    	logTrace("File count complete: modelFiles=" + modelFileCount + ", imageFiles=" + imageFileCount + ", total=" + totalFiles); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
     	
     	// Create a SINGLE shared progress reporter for all phases
     	// This ensures only ONE background thread handles UI updates across all phases
@@ -400,8 +427,10 @@ public class GraficoModelImporter {
     	        imageFileCount = (int) allEntries.stream().filter(DirCacheFileEntry::isImageFile).count();
     	        totalFiles = modelFileCount + imageFileCount;
     	        logPerf("DirCache init + collect", phaseStart, allEntries.size()); //$NON-NLS-1$
+    	        logTrace("Using DirCache import path: entries=" + allEntries.size() + ", modelFiles=" + modelFileCount + ", imageFiles=" + imageFileCount); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
     	    } else {
     	        logPerf("DirCache init (fallback to traditional)", phaseStart); //$NON-NLS-1$
+    	        logTrace("Using traditional recursive import path"); //$NON-NLS-1$
     	    }
     	
             // Load the Model from files (it will contain unresolved proxies)
@@ -419,6 +448,7 @@ public class GraficoModelImporter {
     	        fModel = loadModel(modelFolder, modelFileCount);
     	    }
     	    logPerf("Model loading (total)", phaseStart, modelFileCount); //$NON-NLS-1$
+    	    logTrace("Model loading complete: objects indexed=" + (fIDLookup != null ? fIDLookup.size() : -1)); //$NON-NLS-1$
     	
     	    // Check for cancellation
     	    if (fProgressReporter.isCanceled()) {
@@ -467,6 +497,7 @@ public class GraficoModelImporter {
     	    phaseStart = System.nanoTime();
     	    loadImages(imagesFolder, archiveManager, imageFileCount);
     	    logPerf("Load images", phaseStart, imageFileCount); //$NON-NLS-1$
+        logTrace("importAsModel COMPLETE"); //$NON-NLS-1$
     	    
     	    logPerf("=== IMPORT COMPLETE ===", importStart, totalFiles); //$NON-NLS-1$
 
@@ -510,6 +541,7 @@ public class GraficoModelImporter {
         
         long importStart = System.nanoTime();
         logPerfMessage("=== IMPORT FROM COMMIT START ==="); //$NON-NLS-1$
+        logTrace("importFromCommit START (monitorProvided=" + (monitor != null) + ")"); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Use SubMonitor for easier progress reporting
         SubMonitor progress = SubMonitor.convert(monitor, Messages.GraficoModelImporter_0, 100);
@@ -522,6 +554,7 @@ public class GraficoModelImporter {
         int imageFileCount = (int) allEntries.stream().filter(CommitTreeEntry::isImageFile).count();
         int totalFiles = modelFileCount + imageFileCount;
         logPerf("Collect from commit tree", phaseStart, allEntries.size()); //$NON-NLS-1$
+        logTrace("Commit tree collected: entries=" + allEntries.size() + ", modelFiles=" + modelFileCount + ", imageFiles=" + imageFileCount); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         // Create shared progress reporter
         fProgressReporter = new ThrottledProgressReporter(progress.split(100), totalFiles);
@@ -580,6 +613,7 @@ public class GraficoModelImporter {
             phaseStart = System.nanoTime();
             loadImagesFromCommitTree(allEntries, archiveManager, imageFileCount);
             logPerf("Load images from commit", phaseStart, imageFileCount); //$NON-NLS-1$
+            logTrace("importFromCommit COMPLETE"); //$NON-NLS-1$
             
             logPerf("=== IMPORT FROM COMMIT COMPLETE ===", importStart, totalFiles); //$NON-NLS-1$
             
@@ -761,17 +795,21 @@ public class GraficoModelImporter {
             BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
+            final int producerBatchCount = (elementFiles.size() + PRODUCER_BATCH_SIZE - 1) / PRODUCER_BATCH_SIZE;
+            CountDownLatch producerLatch = new CountDownLatch(producerBatchCount);
+            logTrace("CommitTree producer/consumer start: elementFiles=" + elementFiles.size() + ", producerBatches=" + producerBatchCount); //$NON-NLS-1$ //$NON-NLS-2$
             
             final int totalElements = elementFiles.size();
             AtomicInteger elementsProcessed = new AtomicInteger(0);
             AtomicReference<Throwable> consumerException = new AtomicReference<>();
+            AtomicLong nextHeartbeatNanos = new AtomicLong(System.nanoTime() + TimeUnit.SECONDS.toNanos(STALL_HEARTBEAT_SECONDS));
             
             // Start consumer thread
             Thread consumerThread = new Thread(() -> {
                 List<ElementWithFolder> drainBuffer = new ArrayList<>(500);
                 
                 try {
-                    while (elementsProcessed.get() < totalElements) {
+                    while (true) {
                         drainBuffer.clear();
                         int drained = elementQueue.drainTo(drainBuffer, 500);
                         
@@ -807,9 +845,17 @@ public class GraficoModelImporter {
                             // Queue empty, wait a bit
                             ElementWithFolder item = elementQueue.poll(2, TimeUnit.SECONDS);
                             if (item == null) {
-                                // Timeout - check if producers are done
-                                if (remainingElements.get() == 0 && elementQueue.isEmpty()) {
+                                // Timeout - stop when all producer batches finished and queue drained
+                                if (producerLatch.getCount() == 0 && elementQueue.isEmpty()) {
                                     break;  // All done
+                                }
+
+                                long now = System.nanoTime();
+                                if (now >= nextHeartbeatNanos.get()) {
+                                    logTraceWarning("CommitTree consumer heartbeat: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                            ", total=" + totalElements + ", remaining=" + remainingElements.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                                            ", queueSize=" + elementQueue.size() + ", producerBatchesRemaining=" + producerLatch.getCount()); //$NON-NLS-1$ //$NON-NLS-2$
+                                    nextHeartbeatNanos.set(now + TimeUnit.SECONDS.toNanos(STALL_HEARTBEAT_SECONDS));
                                 }
                                 continue;
                             }
@@ -852,17 +898,30 @@ public class GraficoModelImporter {
             for (int i = 0; i < elementFiles.size(); i += PRODUCER_BATCH_SIZE) {
                 final List<CommitTreeEntry> batch = elementFiles.subList(i, Math.min(i + PRODUCER_BATCH_SIZE, elementFiles.size()));
                 fIoExecutor.execute(() -> {
-                    readParseAndQueueFromCommitBatch(batch, elementQueue, remainingElements, producerError, totalModelFiles);
+                    try {
+                        readParseAndQueueFromCommitBatch(batch, elementQueue, remainingElements, producerError, totalModelFiles);
+                    } finally {
+                        producerLatch.countDown();
+                    }
                 });
             }
             
             // Wait for consumer
             try {
-                consumerThread.join();
+                while (consumerThread.isAlive()) {
+                    consumerThread.join(TimeUnit.SECONDS.toMillis(STALL_HEARTBEAT_SECONDS));
+                    if (consumerThread.isAlive()) {
+                        logTraceWarning("Waiting for CommitTree consumer completion: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                ", total=" + totalElements + ", remaining=" + remainingElements.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                                ", queueSize=" + elementQueue.size() + ", producerBatchesRemaining=" + producerLatch.getCount()); //$NON-NLS-1$ //$NON-NLS-2$
+                    }
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Consumer thread interrupted", e); //$NON-NLS-1$
             }
+
+            logTrace("CommitTree producer/consumer complete: processed=" + elementsProcessed.get() + ", producerError=" + producerError.get()); //$NON-NLS-1$ //$NON-NLS-2$
             
             if (consumerException.get() != null) {
                 Throwable ex = consumerException.get();
@@ -947,7 +1006,7 @@ public class GraficoModelImporter {
                         localResults.add(new ElementWithFolder(entry.folderPath(), eObject));
                         processedInBatch++;
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
                     errorFlag.set(true);
                     localResults.add(new ElementWithFolder(entry.folderPath(), null));
                     processedInBatch++;
@@ -1989,6 +2048,9 @@ public class GraficoModelImporter {
             BlockingQueue<ElementWithFolder> elementQueue = new LinkedBlockingQueue<>();
             AtomicInteger remainingElements = new AtomicInteger(elementFiles.size());
             AtomicBoolean producerError = new AtomicBoolean(false);
+            final int producerBatchCount = (elementFiles.size() + PRODUCER_BATCH_SIZE - 1) / PRODUCER_BATCH_SIZE;
+            CountDownLatch producerLatch = new CountDownLatch(producerBatchCount);
+            logTrace("DirCache producer/consumer start: elementFiles=" + elementFiles.size() + ", producerBatches=" + producerBatchCount); //$NON-NLS-1$ //$NON-NLS-2$
             
             // Wire up queue size diagnostics for progress reporter (only if perf logging enabled)
             if (PERF_LOGGING && fProgressReporter != null) {
@@ -2013,6 +2075,7 @@ public class GraficoModelImporter {
             final int totalElements = elementFiles.size();
             AtomicInteger elementsProcessed = new AtomicInteger(0);
             AtomicReference<Throwable> consumerException = new AtomicReference<>();
+            AtomicLong nextHeartbeatNanos = new AtomicLong(System.nanoTime() + TimeUnit.SECONDS.toNanos(STALL_HEARTBEAT_SECONDS));
             
             // Consumer tracking for diagnostics (only if perf logging enabled)
             final AtomicInteger drainOperations = PERF_LOGGING ? new AtomicInteger(0) : null;
@@ -2030,7 +2093,7 @@ public class GraficoModelImporter {
                 List<ElementWithFolder> drainBuffer = new ArrayList<>(500);
                 
                 try {
-                    while (elementsProcessed.get() < totalElements) {
+                    while (true) {
                         long takeStart = PERF_LOGGING ? System.nanoTime() : 0;
                         ElementWithFolder firstItem = elementQueue.poll(2, TimeUnit.SECONDS);
                         if (PERF_LOGGING && totalTakeTime != null) {
@@ -2038,9 +2101,16 @@ public class GraficoModelImporter {
                         }
                         
                         if (firstItem == null) {
-                            // Timeout - check if producers are done
-                            if (remainingElements.get() == 0 && elementQueue.isEmpty()) {
+                            // Timeout - stop when all producer batches finished and queue drained
+                            if (producerLatch.getCount() == 0 && elementQueue.isEmpty()) {
                                 break;  // All done
+                            }
+                            long now = System.nanoTime();
+                            if (now >= nextHeartbeatNanos.get()) {
+                                logTraceWarning("DirCache consumer heartbeat: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                        ", total=" + totalElements + ", remaining=" + remainingElements.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                                        ", queueSize=" + elementQueue.size() + ", producerBatchesRemaining=" + producerLatch.getCount()); //$NON-NLS-1$ //$NON-NLS-2$
+                                nextHeartbeatNanos.set(now + TimeUnit.SECONDS.toNanos(STALL_HEARTBEAT_SECONDS));
                             }
                             if (PERF_LOGGING) {
                                 logPerfMessage("  CONSUMER POLL TIMEOUT: processed=" + elementsProcessed.get() + //$NON-NLS-1$
@@ -2161,6 +2231,7 @@ public class GraficoModelImporter {
                     try {
                         readParseAndQueueBatch(batch, elementQueue, remainingElements, producerError, totalModelFiles);
                     } finally {
+                        producerLatch.countDown();
                         if (PERF_LOGGING && activeBatches != null) {
                             activeBatches.decrementAndGet();
                         }
@@ -2176,11 +2247,20 @@ public class GraficoModelImporter {
             
             // Wait for consumer thread to finish
             try {
-                consumerThread.join();
+                while (consumerThread.isAlive()) {
+                    consumerThread.join(TimeUnit.SECONDS.toMillis(STALL_HEARTBEAT_SECONDS));
+                    if (consumerThread.isAlive()) {
+                        logTraceWarning("Waiting for DirCache consumer completion: processed=" + elementsProcessed.get() + //$NON-NLS-1$
+                                ", total=" + totalElements + ", remaining=" + remainingElements.get() + //$NON-NLS-1$ //$NON-NLS-2$
+                                ", queueSize=" + elementQueue.size() + ", producerBatchesRemaining=" + producerLatch.getCount()); //$NON-NLS-1$ //$NON-NLS-2$
+                    }
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Consumer thread interrupted", e); //$NON-NLS-1$
             }
+
+            logTrace("DirCache producer/consumer complete: processed=" + elementsProcessed.get() + ", producerError=" + producerError.get()); //$NON-NLS-1$ //$NON-NLS-2$
             
             // Check for consumer exception
             if (consumerException.get() != null) {
@@ -2300,7 +2380,7 @@ public class GraficoModelImporter {
                     if (fProgressReporter != null) {
                         fProgressReporter.incrementProduced();
                     }
-                } catch (IOException e) {
+                } catch (Exception e) {
                     errorFlag.set(true);
                     localResults.add(new ElementWithFolder(entry.folderPath(), null));
                     processedInBatch++;

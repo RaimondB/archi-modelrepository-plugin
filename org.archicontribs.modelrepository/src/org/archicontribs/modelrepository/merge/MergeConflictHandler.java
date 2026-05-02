@@ -7,7 +7,14 @@ package org.archicontribs.modelrepository.merge;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -15,6 +22,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
@@ -53,6 +62,11 @@ import com.archimatetool.model.INameable;
  * @author Phillip Beauvoir
  */
 public class MergeConflictHandler {
+
+    private static final long WATCHDOG_INTERVAL_MS = 15000;
+    private static final int WATCHDOG_STACK_DEPTH = 20;
+    private static final DateTimeFormatter WATCHDOG_TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"); //$NON-NLS-1$
+    private static final Path WATCHDOG_FILE = Path.of(System.getProperty("user.home"), "Archi", "interactive-merge-watchdog.log"); //$NON-NLS-1$ //$NON-NLS-2$
     
     /**
      * Represents a detected folder move with its two conflicting locations 
@@ -121,8 +135,35 @@ public class MergeConflictHandler {
     /** Bulk-loaded content cache for conflict paths. Replaces per-file Git.open()+TreeWalk calls. */
     private MergeContentCache fContentCache;
 
+    /**
+     * One-time index of folder.xml IDs to repo-relative folder paths.
+     * Avoids repeated full-tree scans during folder move detection.
+     */
+    private Map<String, List<String>> fFolderDiskIndex;
+
+    /**
+     * Paths still in git conflict state after merge() applies user choices.
+     */
+    private Set<String> fRemainingConflictingPaths = new LinkedHashSet<>();
+
+    /**
+     * Conflicting paths to analyze, regardless of whether conflicts came from native git or JGit.
+     */
+    private Set<String> fConflictPaths;
+
     public MergeConflictHandler(MergeResult mergeResult, String theirRef, IArchiRepository repo, Shell shell) {
         fMergeResult = mergeResult;
+        fConflictPaths = mergeResult != null && mergeResult.getConflicts() != null
+                ? new LinkedHashSet<>(mergeResult.getConflicts().keySet())
+                : new LinkedHashSet<>();
+        fArchiRepo = repo;
+        fTheirRef = theirRef;
+        fShell = shell;
+    }
+
+    public MergeConflictHandler(Set<String> conflictPaths, String theirRef, IArchiRepository repo, Shell shell) {
+        fMergeResult = null;
+        fConflictPaths = conflictPaths != null ? new LinkedHashSet<>(conflictPaths) : new LinkedHashSet<>();
         fArchiRepo = repo;
         fTheirRef = theirRef;
         fShell = shell;
@@ -130,11 +171,11 @@ public class MergeConflictHandler {
     
     public void init(IProgressMonitor pm) throws IOException, GitAPIException {
         long initStart = System.nanoTime();
-        log(IStatus.INFO, "[MergeConflictHandler] init() start - " + fMergeResult.getConflicts().size() + " conflicts"); //$NON-NLS-1$ //$NON-NLS-2$
+        logWatchdog("[MergeConflictHandler] WATCHDOG START phase=init"); //$NON-NLS-1$
+        log(IStatus.INFO, "[MergeConflictHandler] init() start - " + fConflictPaths.size() + " conflicts"); //$NON-NLS-1$ //$NON-NLS-2$
         
-        // This could be null if Rebase is the default behaviour on the repo rather than merge when a Pull is done
-        if(fMergeResult == null) {
-            throw new IOException("MergeResult was null"); //$NON-NLS-1$
+        if(fConflictPaths == null || fConflictPaths.isEmpty()) {
+            throw new IOException("Conflict paths were empty"); //$NON-NLS-1$
         }
         
         fProgressMonitor = pm;
@@ -149,21 +190,23 @@ public class MergeConflictHandler {
         
         // Their model needs to be extracted
         t = System.nanoTime();
-        fTheirModel = extractModel(getTheirRef());
+        fTheirModel = runWithWatchdog("extractModel(" + getTheirRef() + ")", () -> extractModel(getTheirRef())); //$NON-NLS-1$ //$NON-NLS-2$
         log(IStatus.INFO, "[MergeConflictHandler] extractModel(" + getTheirRef() + "): " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         // Bulk-load content for all conflict paths from DirCache (1 read vs N individual TreeWalks)
         t = System.nanoTime();
-        fContentCache = new MergeContentCache(fArchiRepo.getLocalRepositoryFolder(),
-                fMergeResult.getConflicts().keySet(), fArchiRepo, getLocalRef(), getTheirRef());
+        fContentCache = runWithWatchdog("initContentCache", () -> new MergeContentCache(fArchiRepo.getLocalRepositoryFolder(), //$NON-NLS-1$
+            fConflictPaths, fArchiRepo, getLocalRef(), getTheirRef()));
         log(IStatus.INFO, "[MergeConflictHandler] initContentCache: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Create Merge Infos
         t = System.nanoTime();
-        fMergeObjectInfos = new ArrayList<MergeObjectInfo>();
-        for(String xmlPath : fMergeResult.getConflicts().keySet()) {
-            fMergeObjectInfos.add(new MergeObjectInfo(xmlPath, this));
-        }
+        runWithWatchdogVoid("createMergeObjectInfos", () -> { //$NON-NLS-1$
+            fMergeObjectInfos = new ArrayList<MergeObjectInfo>();
+            for(String xmlPath : fConflictPaths) {
+                fMergeObjectInfos.add(new MergeObjectInfo(xmlPath, this));
+            }
+        });
         log(IStatus.INFO, "[MergeConflictHandler] create MergeObjectInfos (" + fMergeObjectInfos.size() + " items): " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         // For items where one side appears "deleted" (null), try to resolve the
@@ -173,25 +216,131 @@ public class MergeConflictHandler {
         // different location). After resolving, both sides are populated and the
         // conflict shows as "Modified" with different locations instead.
         t = System.nanoTime();
-        for(MergeObjectInfo info : fMergeObjectInfos) {
-            info.resolveMovedObject();
-        }
+        runWithWatchdogVoid("resolveMovedObjects", () -> { //$NON-NLS-1$
+            for(MergeObjectInfo info : fMergeObjectInfos) {
+                info.resolveMovedObject();
+            }
+        });
         log(IStatus.INFO, "[MergeConflictHandler] resolveMovedObjects: " + (System.nanoTime() - t) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
         // Detect folder moves among the conflicts and link related items
         t = System.nanoTime();
-        detectFolderMoves();
+        buildFolderDiskIndex();
+        runWithWatchdogVoid("detectFolderMoves", this::detectFolderMoves); //$NON-NLS-1$
         log(IStatus.INFO, "[MergeConflictHandler] detectFolderMoves: " + (System.nanoTime() - t) / 1_000_000 + "ms, groups=" + (fMoveGroups != null ? fMoveGroups.size() : 0)); //$NON-NLS-1$ //$NON-NLS-2$
         
         log(IStatus.INFO, "[MergeConflictHandler] init() total: " + (System.nanoTime() - initStart) / 1_000_000 + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
+        logWatchdog("[MergeConflictHandler] WATCHDOG END phase=init"); //$NON-NLS-1$
+    }
+
+    @FunctionalInterface
+    private interface IoSupplier<T> {
+        T get() throws IOException, GitAPIException;
+    }
+
+    @FunctionalInterface
+    private interface IoRunnable {
+        void run() throws IOException, GitAPIException;
+    }
+
+    private <T> T runWithWatchdog(String phase, IoSupplier<T> supplier) throws IOException, GitAPIException {
+        logWatchdog("[MergeConflictHandler] WATCHDOG START phase=" + phase); //$NON-NLS-1$
+
+        AtomicBoolean done = new AtomicBoolean(false);
+        Thread workerThread = Thread.currentThread();
+        Thread watchdog = createWatchdogThread(phase, workerThread, done);
+        watchdog.start();
+
+        try {
+            return supplier.get();
+        }
+        finally {
+            done.set(true);
+            watchdog.interrupt();
+            logWatchdog("[MergeConflictHandler] WATCHDOG END phase=" + phase); //$NON-NLS-1$
+        }
+    }
+
+    private void runWithWatchdogVoid(String phase, IoRunnable runnable) throws IOException, GitAPIException {
+        runWithWatchdog(phase, () -> {
+            runnable.run();
+            return null;
+        });
+    }
+
+    private Thread createWatchdogThread(String phase, Thread workerThread, AtomicBoolean done) {
+        return new Thread(() -> {
+            ThreadMXBean threadMxBean = ManagementFactory.getThreadMXBean();
+            while(!done.get()) {
+                try {
+                    Thread.sleep(WATCHDOG_INTERVAL_MS);
+                }
+                catch(InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+
+                if(done.get()) {
+                    return;
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("[MergeConflictHandler] WATCHDOG phase=").append(phase); //$NON-NLS-1$
+                sb.append(", workerState=").append(workerThread.getState()); //$NON-NLS-1$
+
+                long[] deadlocked = threadMxBean.findDeadlockedThreads();
+                if(deadlocked != null && deadlocked.length > 0) {
+                    sb.append(", deadlockedThreadIds="); //$NON-NLS-1$
+                    for(int i = 0; i < deadlocked.length; i++) {
+                        if(i > 0) {
+                            sb.append(',');
+                        }
+                        sb.append(deadlocked[i]);
+                    }
+                }
+
+                sb.append("\n  workerTop=").append(compactStack(workerThread.getStackTrace())); //$NON-NLS-1$
+                logWatchdog(sb.toString());
+            }
+        }, "MergeConflictHandler-Watchdog-" + phase); //$NON-NLS-1$
+    }
+
+    private String compactStack(StackTraceElement[] stack) {
+        if(stack == null || stack.length == 0) {
+            return "<empty>"; //$NON-NLS-1$
+        }
+
+        int limit = Math.min(WATCHDOG_STACK_DEPTH, stack.length);
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < limit; i++) {
+            if(i > 0) {
+                sb.append(" | "); //$NON-NLS-1$
+            }
+            StackTraceElement e = stack[i];
+            sb.append(e.getClassName()).append('.').append(e.getMethodName())
+              .append(':').append(e.getLineNumber());
+        }
+        return sb.toString();
+    }
+
+    private static void logWatchdog(String message) {
+        try {
+            Files.createDirectories(WATCHDOG_FILE.getParent());
+            String line = WATCHDOG_TIMESTAMP.format(LocalDateTime.now()) + " " + message + System.lineSeparator(); //$NON-NLS-1$
+            Files.writeString(WATCHDOG_FILE, line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        }
+        catch(IOException ex) {
+            // Ignore file logging errors; regular plugin logs still apply.
+        }
     }
     
     /**
      * Package-private init with explicit models, for testing without an Eclipse workbench.
      */
     void init(IProgressMonitor pm, IArchimateModel ourModel, IArchimateModel theirModel) throws IOException, GitAPIException {
-        if(fMergeResult == null) {
-            throw new IOException("MergeResult was null"); //$NON-NLS-1$
+        if(fConflictPaths == null || fConflictPaths.isEmpty()) {
+            throw new IOException("Conflict paths were empty"); //$NON-NLS-1$
         }
         
         fProgressMonitor = pm;
@@ -200,10 +349,10 @@ public class MergeConflictHandler {
         
         // Bulk-load content for all conflict paths from DirCache
         fContentCache = new MergeContentCache(fArchiRepo.getLocalRepositoryFolder(),
-                fMergeResult.getConflicts().keySet(), fArchiRepo, getLocalRef(), getTheirRef());
+            fConflictPaths, fArchiRepo, getLocalRef(), getTheirRef());
         
         fMergeObjectInfos = new ArrayList<MergeObjectInfo>();
-        for(String xmlPath : fMergeResult.getConflicts().keySet()) {
+        for(String xmlPath : fConflictPaths) {
             fMergeObjectInfos.add(new MergeObjectInfo(xmlPath, this));
         }
         
@@ -444,16 +593,71 @@ public class MergeConflictHandler {
      * @return The relative folder path (from repo root) or null if not found
      */
     private String findFolderOnDisk(String folderId, Set<String> excludePaths) {
-        File modelDir = new File(fArchiRepo.getLocalRepositoryFolder(), IGraficoConstants.MODEL_FOLDER);
-        if(!modelDir.isDirectory()) return null;
-        
+        if(fFolderDiskIndex == null || fFolderDiskIndex.isEmpty()) {
+            return null;
+        }
+
+        List<String> candidatePaths = fFolderDiskIndex.get(folderId);
+        if(candidatePaths == null || candidatePaths.isEmpty()) {
+            return null;
+        }
+
+        for(String candidate : candidatePaths) {
+            if(!excludePaths.contains(candidate)) {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Build a one-time index of all folder.xml IDs on disk.
+     */
+    private void buildFolderDiskIndex() {
+        if(fFolderDiskIndex != null) {
+            return;
+        }
+
+        long start = System.nanoTime();
+        fFolderDiskIndex = new HashMap<>();
+
         File repoRoot = fArchiRepo.getLocalRepositoryFolder();
-        File found = GraficoUtils.findFolderDirById(modelDir, folderId, dir -> {
-            String rel = repoRoot.toPath().relativize(dir.toPath()).toString().replace('\\', '/');
-            return !excludePaths.contains(rel);
-        });
-        if(found == null) return null;
-        return repoRoot.toPath().relativize(found.toPath()).toString().replace('\\', '/');
+        Path modelDir = new File(repoRoot, IGraficoConstants.MODEL_FOLDER).toPath();
+        if(!Files.isDirectory(modelDir)) {
+            return;
+        }
+
+        try(Stream<Path> pathStream = Files.walk(modelDir)) {
+            pathStream
+                .filter(Files::isRegularFile)
+                .filter(path -> IGraficoConstants.FOLDER_XML.equals(path.getFileName().toString()))
+                .forEach(path -> {
+                    try {
+                        byte[] content = Files.readAllBytes(path);
+                        String folderId = GraficoUtils.extractIdFromFolderXml(content);
+                        if(folderId == null) {
+                            return;
+                        }
+
+                        String relativeDir = repoRoot.toPath().relativize(path.getParent()).toString().replace('\\', '/');
+                        fFolderDiskIndex.computeIfAbsent(folderId, key -> new ArrayList<>()).add(relativeDir);
+                    }
+                    catch(IOException ex) {
+                        // Skip unreadable folder.xml files.
+                    }
+                });
+        }
+        catch(IOException ex) {
+            log(IStatus.WARNING, "[MergeConflictHandler] Failed to build folder disk index: " + ex.getMessage()); //$NON-NLS-1$
+        }
+
+        int totalPaths = 0;
+        for(List<String> paths : fFolderDiskIndex.values()) {
+            totalPaths += paths.size();
+        }
+        log(IStatus.INFO, "[MergeConflictHandler] buildFolderDiskIndex: ids=" + fFolderDiskIndex.size() //$NON-NLS-1$
+                + ", paths=" + totalPaths + ", " + ((System.nanoTime() - start) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
     }
     
     private static String stripModelPrefix(String path) {
@@ -550,6 +754,13 @@ public class MergeConflictHandler {
             if(!theirs.isEmpty()) {
                 checkout(git, Stage.THEIRS, theirs);
             }
+            if(!ours.isEmpty() || !theirs.isEmpty()) {
+                Set<String> resolvedPaths = new LinkedHashSet<>();
+                resolvedPaths.addAll(ours);
+                resolvedPaths.addAll(theirs);
+                ((ArchiRepository) fArchiRepo).gitAddPaths(resolvedPaths);
+                log(IStatus.INFO, "[MergeConflictHandler] merge() staged normal resolutions: " + resolvedPaths.size() + " path(s)"); //$NON-NLS-1$ //$NON-NLS-2$
+            }
             if(!deletions.isEmpty()) {
                 resolveToDeleted(git, deletions);
             }
@@ -610,6 +821,7 @@ public class MergeConflictHandler {
     private void logGitStatusAfterMerge() throws IOException, GitAPIException {
         try(Git git = Git.open(fArchiRepo.getLocalRepositoryFolder())) {
             org.eclipse.jgit.api.Status gitStatus = git.status().call();
+            fRemainingConflictingPaths = new LinkedHashSet<>(gitStatus.getConflicting());
             log(IStatus.INFO, "[MergeConflictHandler] merge() git status: clean=" + gitStatus.isClean() //$NON-NLS-1$
                     + ", conflicting=" + gitStatus.getConflicting().size() //$NON-NLS-1$
                     + ", changed=" + gitStatus.getChanged().size() //$NON-NLS-1$
@@ -621,6 +833,13 @@ public class MergeConflictHandler {
                 log(IStatus.WARNING, "[MergeConflictHandler] STILL CONFLICTING: " + gitStatus.getConflicting()); //$NON-NLS-1$
             }
         }
+    }
+
+    /**
+     * @return paths still marked as conflicting in git index after merge(), never null
+     */
+    public Set<String> getRemainingConflictingPaths() {
+        return new LinkedHashSet<>(fRemainingConflictingPaths);
     }
     /**
      * Handle resolvedAsMove elements that are NOT part of a MoveGroup.

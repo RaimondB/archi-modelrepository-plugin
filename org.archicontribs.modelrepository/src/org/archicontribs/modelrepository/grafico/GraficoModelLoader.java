@@ -20,6 +20,7 @@ import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.UIPerfLogger;
 import org.archicontribs.modelrepository.grafico.GraficoModelImporter.UnresolvedObject;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.util.EcoreUtil;
@@ -124,6 +125,8 @@ public class GraficoModelLoader {
      * @throws IOException
      */
     public IArchimateModel loadModel(IProgressMonitor monitor) throws IOException {
+        long loadStart = System.nanoTime();
+        log(IStatus.INFO, "[GraficoModelLoader] loadModel START (monitorProvided=" + (monitor != null) + ", headless=" + bHeadless + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         fRestoredObjects = null;
         
         // Repair missing folder.xml files before import (unless already done by caller).
@@ -158,7 +161,9 @@ public class GraficoModelLoader {
         if(monitor != null) {
             // Use the provided external monitor
             try {
+                log(IStatus.INFO, "[GraficoModelLoader] Starting importer.importAsModel(external monitor)"); //$NON-NLS-1$
                 graficoModel[0] = importer.importAsModel(monitor);
+                log(IStatus.INFO, "[GraficoModelLoader] importer.importAsModel(external monitor) returned"); //$NON-NLS-1$
             }
             catch(IOException ex) {
                 exception[0] = ex;
@@ -176,7 +181,9 @@ public class GraficoModelLoader {
                     @Override
                     public void run(IProgressMonitor pm) throws InvocationTargetException, InterruptedException {
                         try {
+                            log(IStatus.INFO, "[GraficoModelLoader] Starting importer.importAsModel(ProgressMonitorDialog monitor)"); //$NON-NLS-1$
                             graficoModel[0] = importer.importAsModel(pm);
+                            log(IStatus.INFO, "[GraficoModelLoader] importer.importAsModel(ProgressMonitorDialog monitor) returned"); //$NON-NLS-1$
                         }
                         catch(IOException ex) {
                             exception[0] = ex;
@@ -190,7 +197,9 @@ public class GraficoModelLoader {
         } else {
             // Headless mode - no progress
             try {
+                log(IStatus.INFO, "[GraficoModelLoader] Starting importer.importAsModel(headless)"); //$NON-NLS-1$
                 graficoModel[0] = importer.importAsModel();
+                log(IStatus.INFO, "[GraficoModelLoader] importer.importAsModel(headless) returned"); //$NON-NLS-1$
             }
             catch(IOException ex) {
                 exception[0] = ex;
@@ -211,6 +220,7 @@ public class GraficoModelLoader {
         // Resolve missing objects
         List<UnresolvedObject> unresolvedObjects = importer.getUnresolvedObjects();
         if(unresolvedObjects != null) {
+            log(IStatus.INFO, "[GraficoModelLoader] Found unresolved objects after import: " + unresolvedObjects.size()); //$NON-NLS-1$
             graficoModel[0] = restoreProblemObjects(unresolvedObjects);
         }
         
@@ -255,6 +265,7 @@ public class GraficoModelLoader {
             	throw new IOException(errorMessage);
             }
         }
+        log(IStatus.INFO, "[GraficoModelLoader] loadModel COMPLETE in " + ((System.nanoTime() - loadStart) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         
         return graficoModel[0];
     }
@@ -297,58 +308,106 @@ public class GraficoModelLoader {
      * @throws IOException if there's an error saving or opening the model
      */
     public void openModel(IArchimateModel graficoModel, GraficoModelImporter importer) throws IOException {
-        if(graficoModel == null) {
-            return;
-        }
-        
         long tOpen = System.nanoTime();
+        IArchimateModel preparedModel = prepareModelForOpen(graficoModel, importer);
+        savePreparedModel(preparedModel);
+        applyPreparedModelOnUIThread(preparedModel);
+        UIPerfLogger.log("[ModelLoader]", "openModel() total", tOpen); //$NON-NLS-1$ //$NON-NLS-2$
+    }
+
+    /**
+     * Prepare model content for opening by resolving missing objects and running repairs.
+     * This work is CPU-bound and does not require SWT UI thread access.
+     *
+     * @param graficoModel imported model
+     * @param importer importer context (for unresolved object tracking)
+     * @return prepared model
+     * @throws IOException if restore/re-import fails
+     */
+    public IArchimateModel prepareModelForOpen(IArchimateModel graficoModel, GraficoModelImporter importer) throws IOException {
+        if(graficoModel == null) {
+            return null;
+        }
+
+        long tPrepare = System.nanoTime();
         fRestoredObjects = null;
-        
+
         // Set file name on the grafico model so we can locate it
         graficoModel.setFile(fRepository.getTempModelFile());
-        
+
         // Resolve missing objects if any
         List<UnresolvedObject> unresolvedObjects = importer != null ? importer.getUnresolvedObjects() : null;
+        log(IStatus.INFO, "[GraficoModelLoader] prepareModelForOpen: unresolvedObjects=" + (unresolvedObjects != null ? unresolvedObjects.size() : 0)); //$NON-NLS-1$
         if(unresolvedObjects != null) {
+            long t = System.nanoTime();
             graficoModel = restoreProblemObjects(unresolvedObjects);
+            log(IStatus.INFO, "[GraficoModelLoader] prepareModelForOpen: restoreProblemObjects " + ((System.nanoTime() - t) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         }
-        
+
         // Repair connection endpoint mismatches
+        long t = System.nanoTime();
         int repaired = repairConnectionEndpoints(graficoModel);
+        log(IStatus.INFO, "[GraficoModelLoader] prepareModelForOpen: repairConnectionEndpoints repaired=" + repaired + ", " + ((System.nanoTime() - t) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         if(repaired > 0) {
             log(IStatus.INFO, "[GraficoModelLoader] Repaired " + repaired + " mismatched connection endpoint(s)"); //$NON-NLS-1$ //$NON-NLS-2$
         }
-        
+
         // Remove orphaned elements that couldn't be restored
+        t = System.nanoTime();
         int removed = removeOrphanedElements(graficoModel);
+        log(IStatus.INFO, "[GraficoModelLoader] prepareModelForOpen: removeOrphanedElements removed=" + removed + ", " + ((System.nanoTime() - t) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
         if(removed > 0) {
             log(IStatus.INFO, "[GraficoModelLoader] Removed " + removed + " orphaned element(s)"); //$NON-NLS-1$ //$NON-NLS-2$
         }
-        
-        // Save the model
+
+        log(IStatus.INFO, "[GraficoModelLoader] prepareModelForOpen COMPLETE in " + ((System.nanoTime() - tPrepare) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$
+        return graficoModel;
+    }
+
+    /**
+     * Save a prepared model before UI open/close operations.
+     * Must be called from the SWT UI thread because saveModel notifies editor listeners.
+     *
+     * @param graficoModel model to save
+     */
+    public void savePreparedModel(IArchimateModel graficoModel) throws IOException {
+        if(graficoModel == null) {
+            return;
+        }
+
         long t = System.nanoTime();
         IEditorModelManager.INSTANCE.saveModel(graficoModel);
         UIPerfLogger.log("[ModelLoader]", "saveModel", t); //$NON-NLS-1$ //$NON-NLS-2$
-        
-        // Close and re-open the corresponding model if it is already open
+    }
+
+    /**
+     * Apply UI editor operations for an already prepared/saved model.
+     * Must be called from SWT UI thread.
+     *
+     * @param graficoModel model to open
+     */
+    public void applyPreparedModelOnUIThread(IArchimateModel graficoModel) throws IOException {
+        if(graficoModel == null) {
+            return;
+        }
+
         IArchimateModel model = fRepository.locateModel();
         if(model != null) {
             // Store ids of open diagrams
             List<String> openModelIDs = getOpenDiagramModelIdentifiers(model);
-            
-            t = System.nanoTime();
+
+            long t = System.nanoTime();
             IEditorModelManager.INSTANCE.closeModel(model);
             UIPerfLogger.log("[ModelLoader]", "closeModel", t); //$NON-NLS-1$ //$NON-NLS-2$
-            
+
             t = System.nanoTime();
             IEditorModelManager.INSTANCE.openModel(graficoModel);
             UIPerfLogger.log("[ModelLoader]", "openModel", t); //$NON-NLS-1$ //$NON-NLS-2$
-            
+
             t = System.nanoTime();
             reopenEditors(graficoModel, openModelIDs);
             UIPerfLogger.log("[ModelLoader]", "reopenEditors (" + openModelIDs.size() + " diagrams)", t); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         }
-        UIPerfLogger.log("[ModelLoader]", "openModel() total", tOpen); //$NON-NLS-1$ //$NON-NLS-2$
     }
     
     /**
@@ -601,6 +660,8 @@ public class GraficoModelLoader {
      * @throws IOException
      */
     private IArchimateModel restoreProblemObjects(List<UnresolvedObject> unresolvedObjects) throws IOException {
+        long restoreStart = System.nanoTime();
+        log(IStatus.INFO, "[GraficoModelLoader] restoreProblemObjects START unresolvedCount=" + unresolvedObjects.size()); //$NON-NLS-1$
         fRestoredObjects = new ArrayList<IIdentifier>();
         
         List<String> restoredIdentifiers = new ArrayList<String>();
@@ -663,9 +724,14 @@ public class GraficoModelLoader {
             }
         }
         
-        // Then re-import
+        // Then re-import without opening a nested progress dialog.
+        // This method can be called from within an existing load/merge progress flow,
+        // including on the UI thread via openModel(), so importAsModel() must receive
+        // an explicit monitor to avoid creating its own ProgressMonitorDialog.
         GraficoModelImporter importer = new GraficoModelImporter(fRepository.getLocalRepositoryFolder());
-        IArchimateModel graficoModel = importer.importAsModel();
+        log(IStatus.INFO, "[GraficoModelLoader] restoreProblemObjects re-import START (NullProgressMonitor)"); //$NON-NLS-1$
+        IArchimateModel graficoModel = importer.importAsModel(new NullProgressMonitor());
+        log(IStatus.INFO, "[GraficoModelLoader] restoreProblemObjects re-import COMPLETE"); //$NON-NLS-1$
         graficoModel.setFile(fRepository.getTempModelFile()); // do this again
         
         // Collect restored objects
@@ -677,6 +743,8 @@ public class GraficoModelLoader {
                 }
             }
         }
+
+        log(IStatus.INFO, "[GraficoModelLoader] restoreProblemObjects COMPLETE restoredCount=" + fRestoredObjects.size() + " in " + ((System.nanoTime() - restoreStart) / 1_000_000) + "ms"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
         
         return graficoModel;
     }

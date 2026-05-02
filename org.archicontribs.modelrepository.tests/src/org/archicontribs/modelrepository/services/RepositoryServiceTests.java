@@ -469,7 +469,7 @@ public class RepositoryServiceTests {
      * a branch with 234 conflicts resulted in ~9000 deletions vs master.
      * 
      * The test exercises the same code path as RepositoryService.mergeBranch():
-     * 1. ArchiRepository.mergeBranch() → native git (conflicts→abort) → JGit merge
+    * 1. ArchiRepository.mergeBranch() → native git merge with conflicting paths retained
      * 2. git checkout --stage=THEIRS for conflicting paths (handler.merge() equivalent)
      * 3. git add -A + commit (commitChanges() equivalent)
      */
@@ -508,18 +508,17 @@ public class RepositoryServiceTests {
             git.commit().setAuthor("Test", "test@test.com").setMessage("ours: modify shared").call();
 
             // === Step 1: Merge using same sequence as ArchiRepository.mergeBranch() ===
-            // First try native git merge → conflicts → abort
+            // Native git conflicts are retained; no JGit replay is needed.
             IArchiRepository repo = new ArchiRepository(localRepoFolder);
-            org.eclipse.jgit.api.MergeResult mergeResult =
+            ArchiRepository.MergeOperationResult mergeResult =
                     ((ArchiRepository) repo).mergeBranch("theirs-branch", "Merge theirs", new NullProgressMonitor());
 
-            // Should be CONFLICTING (native git aborts, JGit merge returns CONFLICTING)
-            assertNotNull(mergeResult, "JGit merge should produce a result (native git was aborted)");
+            assertNotNull(mergeResult, "mergeBranch should report the native conflicting merge");
             assertEquals(org.eclipse.jgit.api.MergeResult.MergeStatus.CONFLICTING,
-                    mergeResult.getMergeStatus(),
+                    mergeResult.status(),
                     "Merge should conflict on shared.xml");
 
-            // === DIAGNOSTIC: Check if theirs' additions are on disk after JGit merge ===
+            // === DIAGNOSTIC: Check if theirs' additions are on disk after native merge ===
             int presentAfterMerge = 0;
             for(int i = 0; i < additionCount; i++) {
                 File addedFile = new File(localRepoFolder,
@@ -529,13 +528,13 @@ public class RepositoryServiceTests {
                 }
             }
             assertEquals(additionCount, presentAfterMerge,
-                    "After JGit merge (CONFLICTING), all non-conflicting additions from theirs "
+                    "After native merge (CONFLICTING), all non-conflicting additions from theirs "
                     + "should be on disk. Only " + presentAfterMerge + "/" + additionCount + " found.");
 
             // === Step 2: Resolve conflict to THEIRS (same as handler.merge()) ===
             org.eclipse.jgit.api.CheckoutCommand checkout = git.checkout();
             checkout.setStage(org.eclipse.jgit.api.CheckoutCommand.Stage.THEIRS);
-            for(String conflictPath : mergeResult.getConflicts().keySet()) {
+            for(String conflictPath : mergeResult.conflictingPaths()) {
                 checkout.addPath(conflictPath);
             }
             checkout.call();

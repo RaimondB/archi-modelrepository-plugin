@@ -15,12 +15,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 
 import org.archicontribs.modelrepository.GitHelper;
 import org.eclipse.jgit.api.AddCommand;
 import org.eclipse.jgit.api.CommitCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevCommit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -146,6 +149,41 @@ public class ArchiRepositoryTests {
             commitCommand.call();
 
             assertEquals(contents, new String(repo.getFileContents("test.txt", IGraficoConstants.HEAD)));
+        }
+    }
+
+    @Test
+    public void checkoutPathsFromCommit_IgnoresMissingPathsInCommit() throws Exception {
+        File localRepoFolder = new File(GitHelper.getTempTestsFolder(), "checkoutMissingPathRepo");
+        IArchiRepository repo = new ArchiRepository(localRepoFolder);
+
+        try(Repository repos = GitHelper.createNewRepository(localRepoFolder)) {
+            File modelFolder = new File(localRepoFolder, IGraficoConstants.MODEL_FOLDER);
+            assertTrue(modelFolder.mkdirs());
+
+            File modelFile = new File(modelFolder, "test.xml");
+            String content = "<model/>";
+            Files.writeString(modelFile.toPath(), content, StandardCharsets.UTF_8);
+
+            AddCommand addCommand = new AddCommand(repos);
+            addCommand.addFilepattern(".");
+            addCommand.setUpdate(false);
+            addCommand.call();
+
+            CommitCommand commitCommand = Git.wrap(repos).commit();
+            commitCommand.setAuthor("Test", "Test");
+            commitCommand.setMessage("Initial model-only commit");
+            RevCommit commit = commitCommand.call();
+
+            // Simulate a later state where the model content is gone.
+            assertTrue(modelFile.delete());
+
+            // images/ does not exist in this commit; checkout must still succeed.
+            assertTrue(repo.checkoutPathsFromCommit(
+                    commit.getName(), IGraficoConstants.MODEL_FOLDER, IGraficoConstants.IMAGES_FOLDER));
+
+            assertTrue(modelFile.exists());
+            assertEquals(content, Files.readString(modelFile.toPath(), StandardCharsets.UTF_8));
         }
     }
     

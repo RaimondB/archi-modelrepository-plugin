@@ -7,12 +7,22 @@ package org.archicontribs.modelrepository.services;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.archicontribs.modelrepository.ModelRepositoryPlugin;
 import org.archicontribs.modelrepository.authentication.UsernamePassword;
 import org.archicontribs.modelrepository.grafico.ArchiRepository;
+import org.archicontribs.modelrepository.grafico.ArchiRepository.MergeOperationResult;
 import org.archicontribs.modelrepository.grafico.BranchInfo;
 import org.archicontribs.modelrepository.grafico.BranchStatus;
 import org.archicontribs.modelrepository.grafico.GraficoModelExporter;
@@ -25,7 +35,6 @@ import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.MergeResult.MergeStatus;
 import org.eclipse.jgit.api.errors.CanceledException;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -54,6 +63,11 @@ import com.archimatetool.model.IArchimateModel;
  * @see <a href="../../../docs/adr/0006-service-layer.md">ADR-0006: Service Layer</a>
  */
 public class RepositoryService {
+
+    private static final long WATCHDOG_INTERVAL_MS = 15000;
+    private static final int WATCHDOG_STACK_DEPTH = 20;
+    private static final DateTimeFormatter WATCHDOG_TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"); //$NON-NLS-1$
+    private static final Path WATCHDOG_FILE = Path.of(System.getProperty("user.home"), "Archi", "interactive-merge-watchdog.log"); //$NON-NLS-1$ //$NON-NLS-2$
 
     /**
      * Result of a commit operation.
@@ -278,7 +292,7 @@ public class RepositoryService {
 
         // Phase 2: Determine if merge is needed
         phaseStart = System.nanoTime();
-        MergeResult mergeResult = null;
+        MergeOperationResult mergeResult = null;
         String remoteBranch;
 
         try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
@@ -312,16 +326,15 @@ public class RepositoryService {
         // Track conflict count for commit message
         int conflictCount = 0;
 
-        // Merge failure — only possible if JGit merge was used (native merge was either clean or aborted+retried)
-        if(mergeResult != null && mergeResult.getMergeStatus() == MergeStatus.CONFLICTING) {
-            conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+        if(mergeResult != null && mergeResult.status() == MergeStatus.CONFLICTING) {
+            conflictCount = mergeResult.conflictingPaths().size();
             monitor.subTask(NLS.bind(Messages.RepositoryService_2, conflictCount));
 
             // Get the remote ref name
             String remoteRef = branchStatus.getCurrentRemoteBranch().getFullName();
 
             // Try to handle the merge conflict
-            MergeConflictHandler handler = new MergeConflictHandler(mergeResult, remoteRef,
+                MergeConflictHandler handler = new MergeConflictHandler(mergeResult.conflictingPaths(), remoteRef,
                     repo, null); // Shell is null — UI interaction via MergeHandler strategy
 
             try {
@@ -604,24 +617,30 @@ public class RepositoryService {
         long phaseStart;
         int conflictCount = 0;
 
+        logWatchdog("[RepositoryService] WATCHDOG START phase=mergeBranch, branchToMerge=" + branchToMerge.getShortName() + ", currentBranch=" + currentBranch.getShortName()); //$NON-NLS-1$ //$NON-NLS-2$
+
         monitor.subTask(NLS.bind(Messages.RepositoryService_10,
                 branchToMerge.getShortName(), currentBranch.getShortName()));
 
         try(Git git = Git.open(repo.getLocalRepositoryFolder())) {
+            // Resolve refs
+            phaseStart = System.nanoTime();
             ObjectId oursId = git.getRepository().resolve(IGraficoConstants.HEAD);
             ObjectId theirsId = git.getRepository().resolve(branchToMerge.getShortName());
+            logPerf("resolve refs (HEAD and branch)", phaseStart);
 
             String mergeMessage = NLS.bind(Messages.RepositoryService_11,
                     branchToMerge.getShortName(), currentBranch.getShortName());
 
             // Merge — ArchiRepository handles native git / JGit switching
+            logWatchdog("[RepositoryService] WATCHDOG START phase=ArchiRepository.mergeBranch"); //$NON-NLS-1$
             phaseStart = System.nanoTime();
-            MergeResult mergeResult = ((ArchiRepository) repo).mergeBranch(
+                MergeOperationResult mergeResult = ((ArchiRepository) repo).mergeBranch(
                     branchToMerge.getShortName(), mergeMessage, monitor);
-            logPerf("mergeBranch", phaseStart);
+            logPerf("ArchiRepository.mergeBranch", phaseStart);
+            logWatchdog("[RepositoryService] WATCHDOG END phase=ArchiRepository.mergeBranch"); //$NON-NLS-1$
 
-            // null = native git performed a clean merge
-            MergeStatus status = mergeResult != null ? mergeResult.getMergeStatus() : null;
+                MergeStatus status = mergeResult != null ? mergeResult.status() : null;
 
             if(status == MergeStatus.ALREADY_UP_TO_DATE) {
                 return new MergeBranchResult(MergeBranchResult.Status.UP_TO_DATE, 0);
@@ -629,14 +648,14 @@ public class RepositoryService {
 
             // Handle conflicts
             if(status == MergeStatus.CONFLICTING) {
-                conflictCount = mergeResult.getConflicts() != null ? mergeResult.getConflicts().size() : 0;
+                conflictCount = mergeResult.conflictingPaths().size();
                 monitor.subTask(NLS.bind(Messages.RepositoryService_2, conflictCount));
 
-                MergeConflictHandler handler = new MergeConflictHandler(mergeResult,
+                MergeConflictHandler handler = new MergeConflictHandler(mergeResult.conflictingPaths(),
                         branchToMerge.getShortName(), repo, null);
 
                 try {
-                    handler.init(monitor);
+                    runWithWatchdog("RepositoryService.handler.init", () -> handler.init(monitor)); //$NON-NLS-1$
                 }
                 catch(IOException | GitAPIException ex) {
                     handler.resetToLocalState();
@@ -654,6 +673,27 @@ public class RepositoryService {
                 if(resolved) {
                     handler.merge();
                     log(IStatus.INFO, "[RepositoryService] handler.merge() completed (mergeBranch)");
+
+                    Set<String> remainingConflicts = handler.getRemainingConflictingPaths();
+                    if(!remainingConflicts.isEmpty()) {
+                        handler.resetToLocalState();
+
+                        StringBuilder sample = new StringBuilder();
+                        int shown = 0;
+                        for(String path : remainingConflicts) {
+                            if(shown >= 20) {
+                                break;
+                            }
+                            if(shown > 0) {
+                                sample.append(", "); //$NON-NLS-1$
+                            }
+                            sample.append(path);
+                            shown++;
+                        }
+
+                        throw new IOException(NLS.bind(Messages.RepositoryService_14,
+                                Integer.valueOf(remainingConflicts.size()), sample.toString()));
+                    }
                 }
                 else {
                     handler.resetToLocalState();
@@ -729,8 +769,98 @@ public class RepositoryService {
         }
 
         logPerf("=== TOTAL MERGE BRANCH ===", mergeStart);
+        logWatchdog("[RepositoryService] WATCHDOG END phase=mergeBranch"); //$NON-NLS-1$
 
         return new MergeBranchResult(MergeBranchResult.Status.OK, conflictCount);
+    }
+
+    @FunctionalInterface
+    private interface GitIoRunnable {
+        void run() throws IOException, GitAPIException;
+    }
+
+    private static void runWithWatchdog(String phase, GitIoRunnable runnable) throws IOException, GitAPIException {
+        logWatchdog("[RepositoryService] WATCHDOG START phase=" + phase); //$NON-NLS-1$
+
+        AtomicBoolean done = new AtomicBoolean(false);
+        Thread workerThread = Thread.currentThread();
+
+        Thread watchdog = new Thread(() -> {
+            ThreadMXBean threadMxBean = ManagementFactory.getThreadMXBean();
+            while(!done.get()) {
+                try {
+                    Thread.sleep(WATCHDOG_INTERVAL_MS);
+                }
+                catch(InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+
+                if(done.get()) {
+                    return;
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append("[RepositoryService] WATCHDOG phase=").append(phase); //$NON-NLS-1$
+                sb.append(", workerState=").append(workerThread.getState()); //$NON-NLS-1$
+
+                long[] deadlocked = threadMxBean.findDeadlockedThreads();
+                if(deadlocked != null && deadlocked.length > 0) {
+                    sb.append(", deadlockedThreadIds="); //$NON-NLS-1$
+                    for(int i = 0; i < deadlocked.length; i++) {
+                        if(i > 0) {
+                            sb.append(',');
+                        }
+                        sb.append(deadlocked[i]);
+                    }
+                }
+
+                sb.append("\n  workerTop=").append(compactStack(workerThread.getStackTrace())); //$NON-NLS-1$
+                logWatchdog(sb.toString());
+            }
+        }, "RepositoryService-Watchdog-" + phase); //$NON-NLS-1$
+
+        watchdog.setDaemon(true);
+        watchdog.start();
+
+        try {
+            runnable.run();
+        }
+        finally {
+            done.set(true);
+            watchdog.interrupt();
+            logWatchdog("[RepositoryService] WATCHDOG END phase=" + phase); //$NON-NLS-1$
+        }
+    }
+
+    private static String compactStack(StackTraceElement[] stack) {
+        if(stack == null || stack.length == 0) {
+            return "<empty>"; //$NON-NLS-1$
+        }
+
+        int limit = Math.min(WATCHDOG_STACK_DEPTH, stack.length);
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0; i < limit; i++) {
+            if(i > 0) {
+                sb.append(" | "); //$NON-NLS-1$
+            }
+            StackTraceElement e = stack[i];
+            sb.append(e.getClassName()).append('.').append(e.getMethodName())
+              .append(':').append(e.getLineNumber());
+        }
+        return sb.toString();
+    }
+
+    private static void logWatchdog(String message) {
+        try {
+            Files.createDirectories(WATCHDOG_FILE.getParent());
+            String line = WATCHDOG_TIMESTAMP.format(LocalDateTime.now()) + " " + message + System.lineSeparator(); //$NON-NLS-1$
+            Files.writeString(WATCHDOG_FILE, line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        }
+        catch(IOException ex) {
+            // Ignore file logging errors; regular plugin logs still apply.
+        }
     }
 
     // ---- Private helpers ----

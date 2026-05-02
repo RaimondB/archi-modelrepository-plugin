@@ -1755,11 +1755,20 @@ public class MergeConflictHandlerTests {
                 }
                 handler.merge();
 
+                assertTrue(handler.getRemainingConflictingPaths().isEmpty(),
+                        "handler.merge() should clear all conflicted paths, got: "
+                        + handler.getRemainingConflictingPaths());
+                assertTrue(git.status().call().getConflicting().isEmpty(),
+                        "Git index should have no remaining conflicts after handler.merge(), got: "
+                        + git.status().call().getConflicting());
+
                 // Q should exist with B's content
                 assertTrue(qFile.exists(), "Q should exist (user chose to keep B's version)");
                 String content = Files.readString(qFile.toPath());
                 assertTrue(content.contains("name=\"P\""),
                         "Q should have B's renamed content 'P', got: " + content);
+
+                git.commit().setMessage("resolved conflict").call();
             }
         }
     }

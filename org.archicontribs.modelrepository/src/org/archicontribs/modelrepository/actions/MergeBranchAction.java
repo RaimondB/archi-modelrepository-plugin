@@ -132,9 +132,7 @@ public class MergeBranchAction extends AbstractModelAction {
                         merge(currentBranch, branchToMerge, monitor);
                     }
                     catch(Exception ex) {
-                        Display.getDefault().syncExec(() -> {
-                            displayErrorDialog(Messages.MergeBranchAction_1, ex);
-                        });
+                        throw new InvocationTargetException(ex);
                     }
                     finally {
                         Display.getDefault().syncExec(() -> {
@@ -150,8 +148,12 @@ public class MergeBranchAction extends AbstractModelAction {
             });
             UIPerfLogger.log("[MergeBranch]", "ProgressMonitorDialog returned (local), shell.maximized=" + fWindow.getShell().getMaximized(), tLocal); //$NON-NLS-1$
         }
-        catch(InvocationTargetException | InterruptedException ex) {
-            ex.printStackTrace();
+        catch(InvocationTargetException ex) {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            displayErrorDialog(Messages.MergeBranchAction_1, cause);
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
         }
     }
     
@@ -261,9 +263,7 @@ public class MergeBranchAction extends AbstractModelAction {
                         }
                     }
                     catch(Exception ex) {
-                        Display.getDefault().syncExec(() -> {
-                            displayErrorDialog(Messages.MergeBranchAction_1, ex);
-                        });
+                        throw new InvocationTargetException(ex);
                     }
                     finally {
                         try {
@@ -290,8 +290,12 @@ public class MergeBranchAction extends AbstractModelAction {
             });
             UIPerfLogger.log("[MergeBranch]", "ProgressMonitorDialog returned (online), shell.maximized=" + fWindow.getShell().getMaximized(), tOnline); //$NON-NLS-1$
         }
-        catch(InvocationTargetException | InterruptedException ex) {
-            ex.printStackTrace();
+        catch(InvocationTargetException ex) {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            displayErrorDialog(Messages.MergeBranchAction_1, cause);
+        }
+        catch(InterruptedException ex) {
+            Thread.currentThread().interrupt();
         }
     }
     
