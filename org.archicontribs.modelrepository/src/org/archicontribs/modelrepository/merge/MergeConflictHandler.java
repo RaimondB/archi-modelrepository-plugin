@@ -840,6 +840,8 @@ public class MergeConflictHandler {
         File unchosenDir = new File(repoRoot, unchosenPath);
         chosenDir.mkdirs();
         
+        Map<String, MergeObjectInfo> conflictElements = collectConflictElements(group);
+
         // Build set of conflicting element filenames at the unchosen path
         Map<String, MergeObjectInfo> unchosenConflictElements = collectUnchosenConflictElements(group, unchosenPath);
         
@@ -850,12 +852,29 @@ public class MergeConflictHandler {
         resolveConflictsAtChosenPath(repoRoot, group, chosenPath);
         
         // 4. Handle files at the unchosen path: move/copy/delete
-        migrateFilesFromUnchosenPath(unchosenDir, chosenDir, unchosenConflictElements, group);
+        migrateFilesFromUnchosenPath(unchosenDir, chosenDir, conflictElements, group);
         
         // 5. Delete unchosen directory if now empty
         deleteDirectoryIfEmpty(unchosenDir);
     }
     
+    /**
+     * Build a map of filename -> MergeObjectInfo for all conflicting elements in a move group.
+     * This lets consolidation honor per-element content choices even when the chosen
+     * location already contains an auto-merged copy and the conflict is tracked at
+     * the opposite path.
+     */
+    private Map<String, MergeObjectInfo> collectConflictElements(MoveGroup group) {
+        Map<String, MergeObjectInfo> result = new HashMap<>();
+        for(MergeObjectInfo info : group.relatedInfos) {
+            if(info.isFolderXml()) continue;
+            String filename = info.getXMLPath()
+                    .substring(info.getXMLPath().lastIndexOf('/') + 1);
+            result.put(filename, info);
+        }
+        return result;
+    }
+
     /**
      * Build a map of filename → MergeObjectInfo for conflicting elements at the unchosen path.
      */
@@ -939,7 +958,7 @@ public class MergeConflictHandler {
      * unique elements are moved; duplicates are deleted.
      */
     private void migrateFilesFromUnchosenPath(File unchosenDir, File chosenDir,
-            Map<String, MergeObjectInfo> unchosenConflictElements, MoveGroup group) throws IOException {
+            Map<String, MergeObjectInfo> conflictElements, MoveGroup group) throws IOException {
         if(!unchosenDir.isDirectory()) return;
         
         File[] xmlFiles = unchosenDir.listFiles(
@@ -953,12 +972,18 @@ public class MergeConflictHandler {
             }
             
             File dest = new File(chosenDir, f.getName());
-            MergeObjectInfo conflictInfo = unchosenConflictElements.get(f.getName());
+            MergeObjectInfo conflictInfo = conflictElements.get(f.getName());
             
             if(conflictInfo != null) {
                 // Determine which side's content is at the unchosen path (resolved in step 2).
-                int contentAtUnchosen = group.oursIsTheMover
-                        ? MergeObjectInfo.THEIRS : MergeObjectInfo.OURS;
+                boolean oursStageHasContentAtUnchosen = unchosenDir.getPath()
+                    .replace('\\', '/')
+                    .endsWith(group.oursFolderPath);
+                if(group.oursIsTheMover) {
+                    oursStageHasContentAtUnchosen = !oursStageHasContentAtUnchosen;
+                }
+                int contentAtUnchosen = oursStageHasContentAtUnchosen
+                    ? MergeObjectInfo.OURS : MergeObjectInfo.THEIRS;
                 if(conflictInfo.getUserChoice() == contentAtUnchosen) {
                     // User wants the content version that's at the unchosen path.
                     Files.copy(f.toPath(), dest.toPath(),

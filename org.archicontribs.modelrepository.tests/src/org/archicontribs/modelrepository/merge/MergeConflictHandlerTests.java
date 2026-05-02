@@ -1214,6 +1214,126 @@ public class MergeConflictHandlerTests {
         }
     }
 
+        /**
+         * Regression for mixed per-element content choice when the user keeps the
+         * old location. The new location already contains auto-merged copies from
+         * the mover branch, so the chosen old location must still be overwritten
+         * for elements whose content choice comes from the unchosen path.
+         */
+        @Test
+        public void merge_B2a_FolderMoveKeepOldLocation_MixedContentChoice() throws Exception {
+                File repoFolder = new File(GitHelper.getTempTestsFolder(), "b2aKeepOldLocationRepo");
+
+                try(Repository gitRepo = GitHelper.createNewRepository(repoFolder)) {
+                        var helper = new GraficoTestHelper();
+                        IFolder folderX = helper.addFolder(helper.businessFolder(), "FolderX", "id-folderX");
+                        for(int i = 0; i < 5; i++) {
+                                helper.addBusinessActor(folderX, "E" + (i + 1), "id-e" + (i + 1));
+                        }
+                        helper.export(repoFolder);
+
+                        File bizDir = GraficoTestHelper.topFolderDir(repoFolder, FolderType.BUSINESS);
+                        File folderXDir = GraficoTestHelper.folderDir(repoFolder, FolderType.BUSINESS, folderX);
+
+                        try(Git git = new Git(gitRepo)) {
+                                git.add().addFilepattern(".").call();
+                                git.commit().setMessage("initial: folderX with 5 elements").call();
+
+                                git.branchCreate().setName("branchA").call();
+                                git.checkout().setName("branchA").call();
+
+                                File folderZDir = new File(bizDir, "id-folderZ");
+                                File movedFolderXDir = new File(folderZDir, "id-folderX");
+                                GraficoTestHelper.writeFolderXml(folderZDir, "FolderZ", "id-folderZ");
+                                GraficoTestHelper.writeFolderXml(movedFolderXDir, "FolderX", "id-folderX");
+
+                                for(int i = 1; i <= 5; i++) {
+                                        String filename = "BusinessActor_id-e" + i + ".xml";
+                                        Files.copy(new File(folderXDir, filename).toPath(), new File(movedFolderXDir, filename).toPath());
+                                        new File(folderXDir, filename).delete();
+                                }
+                                new File(folderXDir, "folder.xml").delete();
+                                folderXDir.delete();
+
+                                git.add().addFilepattern(".").call();
+                                git.add().addFilepattern(".").setUpdate(true).call();
+                                git.commit().setMessage("branchA: move folderX into folderZ").call();
+
+                                git.checkout().setName("master").call();
+                                git.branchCreate().setName("branchB").call();
+                                git.checkout().setName("branchB").call();
+
+                                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e1.xml"), "E1", "E1-B");
+                                GraficoTestHelper.renameElement(new File(folderXDir, "BusinessActor_id-e2.xml"), "E2", "E2-B");
+
+                                git.add().addFilepattern(".").call();
+                                git.commit().setMessage("branchB: rename E1 and E2").call();
+
+                                MergeResult mergeResult = git.merge()
+                                                .include(gitRepo.resolve("branchA"))
+                                                .setFastForward(MergeCommand.FastForwardMode.NO_FF)
+                                                .call();
+
+                                assertEquals(MergeResult.MergeStatus.CONFLICTING, mergeResult.getMergeStatus(),
+                                                "Should conflict (B modified E1/E2, A deleted)");
+
+                                IArchimateModel ourModel = new GraficoModelImporter(repoFolder).importAsModel();
+                                assertNotNull(ourModel);
+
+                                IArchimateModel theirModel;
+                                ObjectId branchAId = gitRepo.resolve("branchA");
+                                try(RevWalk rw = new RevWalk(gitRepo)) {
+                                        RevCommit branchACommit = rw.parseCommit(branchAId);
+                                        theirModel = new GraficoModelImporter(gitRepo, branchACommit.getTree())
+                                                        .importFromCommit(null);
+                                }
+                                assertNotNull(theirModel);
+
+                                IArchiRepository repo = new ArchiRepository(repoFolder);
+                                MergeConflictHandler handler = new MergeConflictHandler(
+                                                mergeResult, "branchA", repo, null);
+                                handler.init(null, ourModel, theirModel);
+
+                                assertTrue(handler.hasMoveGroups(), "Should detect folder move");
+                                MergeConflictHandler.MoveGroup moveGroup = handler.getMoveGroups().get(0);
+
+                                moveGroup.locationChoice = MergeObjectInfo.OURS;
+
+                                for(MergeObjectInfo info : moveGroup.relatedInfos) {
+                                        if(info.isFolderXml()) continue;
+                                        if(info.getXMLPath().contains("id-e1")) {
+                                                info.setUserChoice(MergeObjectInfo.THEIRS);
+                                        }
+                                        else if(info.getXMLPath().contains("id-e2")) {
+                                                info.setUserChoice(MergeObjectInfo.OURS);
+                                        }
+                                }
+
+                                handler.merge();
+
+                                File oldLocationDir = new File(bizDir, "id-folderX");
+                                File newLocationDir = new File(bizDir, "id-folderZ/id-folderX");
+
+                                File e1Old = new File(oldLocationDir, "BusinessActor_id-e1.xml");
+                                assertTrue(e1Old.exists(), "E1 should remain at the old location");
+                                String e1Content = Files.readString(e1Old.toPath());
+                                assertTrue(e1Content.contains("name=\"E1\""),
+                                                "E1 should use branch A's content at the kept old location, got: " + e1Content);
+
+                                File e2Old = new File(oldLocationDir, "BusinessActor_id-e2.xml");
+                                assertTrue(e2Old.exists(), "E2 should remain at the old location");
+                                String e2Content = Files.readString(e2Old.toPath());
+                                assertTrue(e2Content.contains("name=\"E2-B\""),
+                                                "E2 should use branch B's content at the kept old location, got: " + e2Content);
+
+                                for(int i = 1; i <= 5; i++) {
+                                        assertFalse(new File(newLocationDir, "BusinessActor_id-e" + i + ".xml").exists(),
+                                                        "E" + i + " should not remain at the unchosen new location");
+                                }
+                        }
+                }
+        }
+
     // ========================================================================
     // B2b: Folder move (folder.xml auto-resolved) + element modify — OURS content
     // ========================================================================
