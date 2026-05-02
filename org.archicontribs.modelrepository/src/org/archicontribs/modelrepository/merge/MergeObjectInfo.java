@@ -22,7 +22,7 @@ import com.archimatetool.model.util.ArchimateModelUtils;
  * 
  * @author Phillip Beauvoir
  */
-class MergeObjectInfo {
+public class MergeObjectInfo {
 
     private MergeConflictHandler handler;
 
@@ -244,11 +244,11 @@ class MergeObjectInfo {
         return baseStatus;
     }
     
-    void setUserChoice(int choice) {
+    public void setUserChoice(int choice) {
         userChoice = choice;
     }
     
-    int getUserChoice() {
+    public int getUserChoice() {
         return userChoice;
     }
 

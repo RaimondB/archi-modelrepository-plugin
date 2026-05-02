@@ -31,6 +31,7 @@ import org.archicontribs.modelrepository.services.RepositoryService.SwitchResult
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.MergeResult.MergeStatus;
 import org.eclipse.jgit.lib.Repository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -443,7 +444,149 @@ public class RepositoryServiceTests {
             assertEquals(0, result.conflictCount());
         }
     }
-    
+
+    @Test
+    public void shouldRunCrossPathDeletion_ConflictingMerge_ReturnsFalse() {
+        assertEquals(false, RepositoryService.shouldRunCrossPathDeletion(MergeStatus.CONFLICTING));
+
+        // Sanity checks for non-conflicting states.
+        assertEquals(true, RepositoryService.shouldRunCrossPathDeletion(MergeStatus.MERGED));
+        assertEquals(true, RepositoryService.shouldRunCrossPathDeletion(MergeStatus.FAST_FORWARD));
+        assertEquals(true, RepositoryService.shouldRunCrossPathDeletion(null));
+    }
+
+    /**
+     * REGRESSION TEST: Non-conflicting additions from "theirs" must survive a conflicting merge.
+     * 
+     * Scenario: "theirs" branch adds 50 new files AND modifies a shared file.
+     * "ours" branch also modifies the shared file (conflict).
+     * User resolves all conflicts to THEIRS.
+     * 
+     * Expected: The merge result should contain ALL of theirs' additions plus the
+     * resolved conflict content. No files from theirs should be deleted.
+     * 
+     * This reproduces a real-world bug where merging master (9000+ additions) into
+     * a branch with 234 conflicts resulted in ~9000 deletions vs master.
+     * 
+     * The test exercises the same code path as RepositoryService.mergeBranch():
+     * 1. ArchiRepository.mergeBranch() → native git (conflicts→abort) → JGit merge
+     * 2. git checkout --stage=THEIRS for conflicting paths (handler.merge() equivalent)
+     * 3. git add -A + commit (commitChanges() equivalent)
+     */
+    @Test
+    public void mergeBranch_ConflictResolvedToTheirs_PreservesNonConflictingAdditions() throws Exception {
+        File localRepoFolder = new File(GitHelper.getTempTestsFolder(), "mergePreserveAdditions");
+
+        try(Git git = Git.init().setDirectory(localRepoFolder).call()) {
+            Repository gitRepo = git.getRepository();
+
+            // Initial commit: a shared file that will be modified by both branches
+            createAndStageFile(localRepoFolder, gitRepo, "model/shared.xml", "<element name=\"original\"/>");
+            git.commit().setAuthor("Test", "test@test.com").setMessage("Initial").call();
+
+            // === Create "theirs-branch": adds many new files + modifies shared file ===
+            git.branchCreate().setName("theirs-branch").call();
+            git.checkout().setName("theirs-branch").call();
+
+            // Add 50 new files (simulating master adding thousands of files)
+            int additionCount = 50;
+            for(int i = 0; i < additionCount; i++) {
+                String path = "model/additions/folder" + (i / 10) + "/Element_id-new" + i + ".xml";
+                createAndStageFile(localRepoFolder, gitRepo, path,
+                        "<element name=\"new" + i + "\" id=\"id-new" + i + "\"/>");
+            }
+
+            // Modify the shared file (this will conflict with ours)
+            createAndStageFile(localRepoFolder, gitRepo, "model/shared.xml",
+                    "<element name=\"theirs-modification\"/>");
+            git.commit().setAuthor("Test", "test@test.com").setMessage("theirs: add 50 files + modify shared").call();
+
+            // === Back on main: modify the same shared file differently ===
+            git.checkout().setName("master").call();
+            createAndStageFile(localRepoFolder, gitRepo, "model/shared.xml",
+                    "<element name=\"ours-modification\"/>");
+            git.commit().setAuthor("Test", "test@test.com").setMessage("ours: modify shared").call();
+
+            // === Step 1: Merge using same sequence as ArchiRepository.mergeBranch() ===
+            // First try native git merge → conflicts → abort
+            IArchiRepository repo = new ArchiRepository(localRepoFolder);
+            org.eclipse.jgit.api.MergeResult mergeResult =
+                    ((ArchiRepository) repo).mergeBranch("theirs-branch", "Merge theirs", new NullProgressMonitor());
+
+            // Should be CONFLICTING (native git aborts, JGit merge returns CONFLICTING)
+            assertNotNull(mergeResult, "JGit merge should produce a result (native git was aborted)");
+            assertEquals(org.eclipse.jgit.api.MergeResult.MergeStatus.CONFLICTING,
+                    mergeResult.getMergeStatus(),
+                    "Merge should conflict on shared.xml");
+
+            // === DIAGNOSTIC: Check if theirs' additions are on disk after JGit merge ===
+            int presentAfterMerge = 0;
+            for(int i = 0; i < additionCount; i++) {
+                File addedFile = new File(localRepoFolder,
+                        "model/additions/folder" + (i / 10) + "/Element_id-new" + i + ".xml");
+                if(addedFile.exists()) {
+                    presentAfterMerge++;
+                }
+            }
+            assertEquals(additionCount, presentAfterMerge,
+                    "After JGit merge (CONFLICTING), all non-conflicting additions from theirs "
+                    + "should be on disk. Only " + presentAfterMerge + "/" + additionCount + " found.");
+
+            // === Step 2: Resolve conflict to THEIRS (same as handler.merge()) ===
+            org.eclipse.jgit.api.CheckoutCommand checkout = git.checkout();
+            checkout.setStage(org.eclipse.jgit.api.CheckoutCommand.Stage.THEIRS);
+            for(String conflictPath : mergeResult.getConflicts().keySet()) {
+                checkout.addPath(conflictPath);
+            }
+            checkout.call();
+
+            // === Step 3: Commit (same as ArchiRepository.commitChanges()) ===
+            // Use the same gitAdd() logic: git add -A
+            ((ArchiRepository) repo).commitChanges("Merge with conflicts resolved to theirs", false);
+
+            // === CRITICAL ASSERTION: All 50 additions from theirs must exist after commit ===
+            int missingCount = 0;
+            List<String> missingFiles = new java.util.ArrayList<>();
+            for(int i = 0; i < additionCount; i++) {
+                File addedFile = new File(localRepoFolder,
+                        "model/additions/folder" + (i / 10) + "/Element_id-new" + i + ".xml");
+                if(!addedFile.exists()) {
+                    missingCount++;
+                    if(missingFiles.size() < 5) {
+                        missingFiles.add(addedFile.getName());
+                    }
+                }
+            }
+            assertEquals(0, missingCount,
+                    "Non-conflicting additions from theirs should survive merge. "
+                    + "Missing " + missingCount + " of " + additionCount + " files. "
+                    + "Examples: " + missingFiles);
+
+            // Also verify the conflict was resolved to theirs' content
+            String sharedContent = java.nio.file.Files.readString(
+                    new File(localRepoFolder, "model/shared.xml").toPath());
+            assertTrue(sharedContent.contains("theirs-modification"),
+                    "Conflict should be resolved to theirs content, got: " + sharedContent);
+
+            // Verify the commit tree matches theirs' additions
+            org.eclipse.jgit.revwalk.RevCommit headCommit;
+            try(org.eclipse.jgit.revwalk.RevWalk rw = new org.eclipse.jgit.revwalk.RevWalk(gitRepo)) {
+                headCommit = rw.parseCommit(gitRepo.resolve("HEAD"));
+            }
+            try(org.eclipse.jgit.treewalk.TreeWalk tw = new org.eclipse.jgit.treewalk.TreeWalk(gitRepo)) {
+                tw.addTree(headCommit.getTree());
+                tw.setRecursive(true);
+                tw.setFilter(org.eclipse.jgit.treewalk.filter.PathFilter.create("model/additions/"));
+                int committedAdditions = 0;
+                while(tw.next()) {
+                    committedAdditions++;
+                }
+                assertEquals(additionCount, committedAdditions,
+                        "All " + additionCount + " additions should be in the committed tree");
+            }
+        }
+    }
+
     // ---- Test helpers ----
     
     private void createAndStageFile(File repoFolder, Repository gitRepo, String fileName, String content)
